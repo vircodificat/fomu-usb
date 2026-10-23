@@ -11,6 +11,8 @@ VVP      := vvp
 YOSYS    := yosys
 NEXTPNR  := nextpnr-ice40
 
+SHELL := /bin/bash
+
 # Vendored plain-Verilog USB core + PoC top (the entire PoC DUT).
 USB_SRVS := ext/usb_uart.sv
 TOP_SV   := ext/fomu_top.sv
@@ -41,12 +43,14 @@ test-crc: tools
 	$(VVP) build/tb_crc.vvp
 
 test-usb-phy: tools
-	$(IVERILOG) -g2012 -gspecify -o build/tb_usb_phy.vvp $(USB_SRVS) tb/tb_usb_phy.v
+	$(IVERILOG) -g2012 -gspecify -o build/tb_usb_phy.vvp \
+	    $(USB_SRVS) tb/usb_host_bfm.v tb/tb_usb_phy.v
 	$(VVP) build/tb_usb_phy.vvp
 
 test-usb-serial: tools
 	$(IVERILOG) -g2012 -gspecify -o build/tb_usb_serial.vvp \
-	    $(USB_SRVS) $(TOP_SV) tb/sb_io_sim.v tb/tb_usb_serial.v
+	    $(USB_SRVS) $(TOP_SV) tb/sb_io_sim.v tb/usb_host_bfm.v \
+	    tb/tb_usb_serial.v
 	$(VVP) build/tb_usb_serial.vvp
 
 ## synth — yosys synth_ice40 + nextpnr UP5K at 48 MHz.  Plain tool flow:
@@ -54,8 +58,10 @@ test-usb-serial: tools
 ## not exist as a target.
 synth: tools
 	mkdir -p build
+	set -o pipefail; \
 	$(YOSYS) -p "read_verilog $(USB_SRVS) $(TOP_SV); synth_ice40 -top Top -json build/top.json" \
 	    | tee build/yosys.log
+	set -o pipefail; \
 	$(NEXTPNR) --up5k --package uwg30 --json build/top.json \
 	    --pcf fomu.pcf --asc build/top.asc --freq 48 2>&1 | tee build/nextpnr.log
 
