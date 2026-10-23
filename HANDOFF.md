@@ -14,13 +14,17 @@ State as of the end of this working session. Read together with
   started): `src/top.vir` now carries `export mod Top for ice40::Fomu`,
   the ext module was renamed `Top` → `\top::FomuTop`, and `vir upload`
   builds the full 15-pin Fomu image.  **`vir upload` fails at nextpnr
-  `--freq 48` timing** (the M6 gap).  See "Platform export state" for a
-  **P0 hardware flag** (usb_dp_pu unwired) before anyone flashes.
-- **M6 (timing) this session**: the dt_data payload capture moved OFF
-  the fabric (block RAM + flopped head shadow) — the change that killed
-  the `vir upload` critical path.  Tests all green; timing improved but
-  **still short of 48 MHz** (ext-core band 41–44.7, wrapper band ~40).
-  Remaining bottleneck + options below.
+  `--freq 48` timing** (the M6 gap).
+- **P0 RESOLVED**: the platform export initially left `usb_dp_pu`
+  unwired (wrapper tied it low = hardware-dead image); it — and the
+  heartbeat LEDs — are now wired through the export (verified in
+  build/top.sv).  No P0 hardware flag remains.
+- **M6 (timing)**: dt_data payload capture off the fabric (previous
+  round, killed the `vir upload` critical path) + the registered shared
+  qualify in `usb_rx_packet` (this round, removed the `*_cap` chain
+  from the critical path).  Tests all green; **still short of 48 MHz**:
+  wrapper (vir-equivalent flow) 41.5 MHz, ext-core band 40.3–43.9
+  (abc9 ≈ same).  Next known target + options below.
 
 ## Hard rules (from plan §0 — still binding)
 
@@ -50,32 +54,20 @@ State as of the end of this working session. Read together with
   Reports archived in `build/`.
 - There is deliberately NO upload target.
 
-## Platform export state (P0 FLAG before any hardware bring-up)
+## Platform export state (P0 resolved this session)
 
-`src/top.vir`:
-
-```
-export mod Top for ice40::Fomu {
-    incoming clock : Clock
-    outgoing usb_dp : Bit
-    outgoing usb_dn : Bit
-    mod actual_top of FomuTop { it.clock := clock; usb_dp := it.usb_dp; usb_dn := it.usb_dn }
-}
-```
-
-- **The export wires ONLY clock/usb_dp/usb_dn.**  The generated wrapper
-  (build/top.sv) ties `usb_dp_pu = 1'b0`, `led_* = 1'b1`,
-  `flash_* = 1'b1` (and `vir build` warns: unused actual_top.usb_dp_pu /
-  led_*).  **With usb_dp_pu tied low, the D+ pull-up never engages —
-  a real host would never see the device.  Any image built from the
-  current export is hardware-dead.**  Fix: add `outgoing usb_dp_pu : Bit`
-  (+ led_*) to the export and wire them to `it.usb_dp_pu` / `it.led_*`.
-  The tristate caveat in top.vir's comments (usb_dp/dn as `outgoing`)
+`src/top.vir` now exports `Top for ice40::Fomu` wiring **clock,
+usb_dp, usb_dn, usb_dp_pu, led_red/green/blue** through to the ext core
+(`\top::FomuTop`).  The first cut of the export wired only
+clock/usb_dp/usb_dn, so the wrapper tied `usb_dp_pu = 1'b0` (platform
+default = disconnected) — a hardware-dead image; that P0 is fixed and
+verified in build/top.sv (`assign usb_dp_pu = \actual_top.usb_dp_pu ;`).
+Residual notes:
+- The tristate caveat in top.vir's comments (usb_dp/dn as `outgoing`)
   still stands until Virdant platform tristate support lands.
-- The old comment block in top.vir ("real top pending platform support /
-  ext mod is the top / Verilog Top dies") is now stale and contradicts
-  the live export + rename.  Plan §9's "wrapper replaces ext Top" is
-  half-true: the wrapper exists but ties the core's status pins off.
+- top.vir's header comment block ("real top pending platform support /
+  ext mod is the top / Verilog Top dies") is stale — the live export
+  supersedes it.
 - `ext/fomu_top.sv` module is now `\top::FomuTop` (escaped identifier).
   In yosys scripts the top name is `top::FomuTop` (no backslash!).
 - `fomu.pcf` now constrains the full Fomu (PVT) pin set (touch1-4 =
@@ -109,8 +101,11 @@ export mod Top for ice40::Fomu {
   token router (`tok_v_r`); `lc_cap_r` registered line-coding store;
   rxfifo in block RAM with the 3-stage loopback pipe (`txfifo_cnt<13`
   headroom); rxpkt `nb[4:0]`/`n3[2:0]`/`bc` counters + per-bit
-  `tok_cap/sof_cap/hs_cap/dat_cap` precompute regs; `dat_bc_ok_r`
-  registered byte-count admission.
+  `tok_cap/sof_cap/hs_cap/dat_cap` precompute regs computed from the
+  REGISTERED shared qualify `q_pid_r`/`q_dat_r` (same-cycle pkt_err
+  re-checked inline; same-cycle `bad` sets covered by the inline PID
+  check / the ≥8-clk gap to the next byte boundary — see the decl
+  comment); `dat_bc_ok_r` registered byte-count admission.
 
 ### Byte fetch pipeline (tx side, unchanged — still the confusing part)
 
@@ -168,10 +163,11 @@ the payload-off-fabric move, on the **ext core** (`-top top::FomuTop`,
 | abc9 (vir's flow) | 43.1–44.7 MHz | 44.73 |
 | SA placer st10 | — | 41.7 (worse than HeAP refinement) |
 
-On the **wrapper** (what `vir upload` actually builds — usb_dp_pu/leds
-tied constant, so the POR/pull-up logic is pruned): default 40.60;
-abc9 39.7–40.8 (**the user's failing run: 39.96** — same flow, pre-change
-RTL).
+On the **wrapper** (what `vir upload` actually builds): default
+**41.51** after the qualify fix (was 40.60; the user's failing run:
+39.96).  NB: before this session's P0 fix the wrapper tied usb_dp_pu/
+leds constant, pruning those cones — after the fix they are live, so
+wrapper vs ext-core numbers are now near-equivalent designs.
 
 History of fixes (each re-tested): (1) EP0 route/apply split +
 `p_action`; (2) FIFO caller-gated wr_en; (3) rxfifo→BRAM, 3-stage
@@ -183,15 +179,16 @@ dt_head (this session)** — killed the `vir upload` critical path
 
 ### Remaining critical path (next round's target)
 
-`usb_rx_packet` per-bit capture precompute chain:
-`por_done → br_r → sop_r → tok_cap → dat_cap → hs_cap → hs_pid CEN`
-(~22 ns, 7 ns logic / 15 ns routing — the shared-prefix AND chain of
-the `*_cap` registers; on the wrapper the equivalent is
-`bc → dat_bc_ok_r → bad → CEN`).  Candidate next moves: register the
-shared `!bad && !pkt_err && st==BODY && sec` term (one `body_ok_r` reg
-the caps AND into), or register hs_cap's `pid_new[3:0]==~pid_new[7:4]`
-term.  Beyond that: relaxed `--freq` (user sign-off, plan deviation) —
-the design is now within ~7% of 48 on the ext core.
+The `*_cap` chain is FIXED (gone from the critical path after the
+`q_pid_r`/`q_dat_r` registered qualify).  The new worst path is the
+**EP0 data-accept cone**: `usb_rx_packet`'s registered EOP outputs
+(`dt_len`, `dt_crc_ok`) fan into `usb_ep0`'s accept decisions and
+register enables (`pend_cfg`/`pend_addr`/`dev_addr` CEN, `st`/`tog`/
+`resp_sel`), ~21–24 ns (7–8 ns logic / 15–16 ns routing).  Candidate
+next move: register EP0's data-accept decision one clk after
+dt_valid (the +1 clk is free — turnaround budget ~30–50 clks; the
+usb_serial module already does exactly this with dt_acc/dt_rej).
+Beyond that: relaxed `--freq` (user sign-off, plan deviation).
 
 ## Bugs found and fixed (don't re-derive these)
 
@@ -215,11 +212,8 @@ TB drain accumulator reset; iverilog gotchas (task array ports,
 
 ## Loose ends
 
-- **P0 (hardware)**: platform export leaves usb_dp_pu tied low — image
-  is hardware-dead until the export wires it (+ leds).  See "Platform
-  export state".
-- M6 decision: `--freq 48` still fails (44.7 best / 39.96 in vir's
-  abc9 wrapper flow).  Next round = the `*_cap` chain (above), then
+- M6 decision: `--freq 48` still fails (ext-core band 40.3–43.9,
+  wrapper 41.5).  Next round = the EP0 data-accept cone (above), then
   relaxed `--freq` needs user sign-off.
 - `FOMU_UART_OVER_USB_PLANv2.md` §2/§4/§9 predate: EP2/IAD/EF-class,
   rx-FIFO BRAM depth, the 4-stage EP0 pipeline, the platform export

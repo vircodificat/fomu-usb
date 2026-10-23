@@ -370,6 +370,17 @@ module usb_rx_packet(
     // EOP-edge strobes then close over 2-3 inputs instead of the whole
     // bit-counting tree (48 MHz timing).
     reg        tok_cap, sof_cap, hs_cap, dat_cap;
+    // registered shared qualify for the caps (one clk delayed): the
+    // !bad && !pkt_err && st==ST_BODY prefix ANDed with the section.
+    // Computing it ONCE here keeps the per-bit cap cones at 2-3 shallow
+    // LUTs; a same-cycle pkt_err is re-checked inline (pkt_err is a
+    // register), and same-cycle `bad` sets are covered: the nb==7 PID
+    // check by hs_cap's own inline PID check, the bc==66 overflow by the
+    // ≥8-clk gap to the next data-section byte boundary.  The caps are
+    // consumed only at EOP (≥8 clks after the last bit), so the +1 clk
+    // is free.
+    reg        q_pid_r;     // qualify for the PID-section caps
+    reg        q_dat_r;     // qualify for the data-section cap
     // registered byte-count admission for dat_cap (bc in 1..65: at
     // least 2 bytes total, and one more byte would still fit the
     // 64-byte payload RAM) — keeps the 7-bit compares out of dat_cap's cone
@@ -463,6 +474,8 @@ module usb_rx_packet(
             hs_cap  <= 1'b0;
             dat_cap <= 1'b0;
             dat_bc_ok_r <= 1'b0;
+            q_pid_r <= 1'b0;
+            q_dat_r <= 1'b0;
             tk_valid <= 1'b0;
             dt_valid <= 1'b0;
             hs_valid <= 1'b0;
@@ -485,6 +498,8 @@ module usb_rx_packet(
                 sof_cap <= 1'b0;
                 hs_cap  <= 1'b0;
                 dat_cap <= 1'b0;
+                q_pid_r <= 1'b0;
+                q_dat_r <= 1'b0;
             end else if (eop) begin
                 // capture decision: precomputed at the last bit clk
                 // (tok_cap & friends) — 2-input gates here, not the
@@ -530,17 +545,20 @@ module usb_rx_packet(
                 // dat_bc_ok_r ⇔ 2+ bytes at EOP) and the 64-byte payload
                 // limit holds (bc != 66 ⇔ one more byte would overflow
                 // the 64-byte payload RAM)
-                tok_cap <= !bad && !pkt_err && (st == ST_BODY)
+                // shared qualify, REGISTERED one clk earlier (see decl)
+                q_pid_r <= !bad && !pkt_err && (st == ST_BODY) && !sec;
+                q_dat_r <= !bad && !pkt_err && (st == ST_BODY) && sec;
+                tok_cap <= q_pid_r && !pkt_err
                            && (pid_r[1:0] == 2'b01) && (nb == 5'd23);
-                sof_cap <= !bad && !pkt_err && (st == ST_BODY)
+                sof_cap <= q_pid_r && !pkt_err
                            && (pid_r[1:0] == 2'b01) && (nb == 5'd23)
                            && (pid_r[3:0] == 4'h5);
-                hs_cap  <= !bad && !pkt_err && (st == ST_BODY)
+                hs_cap  <= q_pid_r && !pkt_err
                            && ((pid_r[1:0] == 2'b00)
                                || (pid_r[1:0] == 2'b10))
                            && (nb == 5'd7)
                            && (pid_new[3:0] == ~pid_new[7:4]);
-                dat_cap <= !bad && !pkt_err && (st == ST_BODY) && sec
+                dat_cap <= q_dat_r && !pkt_err
                            && (n3 == 3'd7) && dat_bc_ok_r;
                 dat_bc_ok_r <= (bc != 7'd0) && (bc != 7'd66);
                 if (pkt_err) begin
