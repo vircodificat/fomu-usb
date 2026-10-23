@@ -29,7 +29,16 @@ module \top::FomuTop #(
     output wire usb_dp_pu,    // D+ 1.5k pull-up enable (pin A4)
     output wire led_red,      // active low (pin B5)
     output wire led_green,    // active low (pin A5)
-    output wire led_blue      // active low (pin C5)
+    output wire led_blue,     // active low (pin C5)
+    // Byte-stream interface (plan §2).  The byte-level consumer lives
+    // in Virdant (the echo server, instantiated by the platform top);
+    // this ext module only exposes the USB core's FIFO stream.
+    output wire [7:0] rx_data,   // byte from the host
+    output wire       rx_valid,  // 1-clk strobe per byte
+    output wire       tx_ready,  // tx FIFO has room
+    input  wire [7:0] tx_data,   // byte toward the host
+    input  wire       tx_strobe, // 1-clk push strobe
+    input  wire       rx_ready   // low = consumer full: stop popping
 );
     // ------------------------------------------------------------------
     // Power-on reset: count up to POR_CYCLES, then release core + pull-up
@@ -50,12 +59,10 @@ module \top::FomuTop #(
     assign usb_dp_pu = por_done;
 
     // ------------------------------------------------------------------
-    // The core + the byte-stream loopback glue (plan §2: the milestone
-    // consumer is rx -> tx in hardware)
+    // The core.  The byte stream goes straight out to the ports; the
+    // Virdant echo server (see src/echo.vir / the platform top) sits
+    // between rx and tx.
     // ------------------------------------------------------------------
-    wire [7:0] rx_data;
-    wire       rx_valid;
-    wire       tx_ready;
     wire       dp_tx, dn_tx, oe;
     wire       dp_rx, dn_rx;
 
@@ -69,9 +76,9 @@ module \top::FomuTop #(
         .oe(oe),
         .rx_data(rx_data),
         .rx_valid(rx_valid),
-        // loopback: every popped rx byte goes straight into the tx FIFO
-        .tx_data(rx_data),
-        .tx_strobe(rx_valid),
+        .tx_data(tx_data),
+        .tx_strobe(tx_strobe),
+        .rx_ready(rx_ready),
         .tx_ready(tx_ready),
         .bus_reset_o(),
         .connected_o()

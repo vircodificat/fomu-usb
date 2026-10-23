@@ -1605,6 +1605,8 @@ module usb_uart(
     output wire        rx_valid,      // 1-clk strobe per byte (= FIFO pop)
     input  wire [7:0]  tx_data,
     input  wire        tx_strobe,     // FIFO push strobe
+    input  wire        rx_ready,      // low = the rx consumer is full:
+                                      // stop popping (it NAKs instead)
     output wire        tx_ready,      // FIFO has room
     // status (TB visibility)
     output wire        bus_reset_o,
@@ -1679,7 +1681,14 @@ module usb_uart(
             // gate at the txfifo never drops a popped byte.  A popped
             // byte MUST land in the txfifo — nothing else can re-read
             // it from the rxfifo.
-            rx_pop_d    <= !rxfifo_empty && (txfifo_cnt < 7'd13);
+            // Pop while the rx FIFO has a byte, the tx FIFO keeps the
+            // pipe's headroom, AND the byte-stream consumer signals
+            // room (rx_ready).  With the Virdant echo server as the
+            // consumer, rx_ready throttles the pop rate to the UART's
+            // 115200 baud drain rate: when it goes low the rx FIFO
+            // fills, the serial endpoint NAKs bulk-OUT, and the host
+            // retries -- end-to-end flow control with no byte loss.
+            rx_pop_d    <= !rxfifo_empty && (txfifo_cnt < 7'd13) && rx_ready;
             rx_valid_r  <= rx_pop_d;
             rx_valid_rr <= rx_valid_r;
             // rxfifo_rd (BRAM, registered read) holds the popped byte
@@ -1880,6 +1889,11 @@ module usb_uart(
     (* ram_style = "block" *) reg [7:0] snap [0:63];
     reg       load_run;
     reg [6:0] li, snap_len;
+    // snap_len-1 precomputed at arm time: the loader's termination test
+    // is then a plain equality (li == snap_len_m1).  The old
+    // `li + 7'd1 == snap_len` put a 7-bit carry chain + compare into
+    // li's own clock-enable cone -- the critical path (21.3 ns).
+    reg [6:0] snap_len_m1;
     wire      snap_pop = load_run;
     // sync-read port (BRAM): address held one byte ahead (see producer)
     reg [7:0] snap_q;
@@ -1893,10 +1907,11 @@ module usb_uart(
             if (tx_start && ser_resp_req && ser_resp_fresh) begin
                 li <= 7'd0;
                 snap_len <= tx_len_w;
+                snap_len_m1 <= tx_len_w - 7'd1;  // off the per-cycle path
                 load_run <= (tx_len_w != 7'd0);
             end else if (load_run) begin
                 snap[li] <= txfifo_rd;
-                if (li + 7'd1 == snap_len)
+                if (li == snap_len_m1)   // no carry chain: precomputed at arm
                     load_run <= 1'b0;
                 else
                     li <= li + 7'd1;

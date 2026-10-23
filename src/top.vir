@@ -1,4 +1,5 @@
 import ice40
+import echo
 
 export mod Top for ice40::Fomu {
     incoming clock : Clock
@@ -23,21 +24,37 @@ export mod Top for ice40::Fomu {
         led_green := it.led_green
         led_blue := it.led_blue
     }
+
+    // The echo server: the byte-level consumer of the USB core.  Bytes
+    // from the host are rendered onto the raw UART tx line; bytes read
+    // from the raw rx line go back to the host.  See src/echo.vir.
+    mod echo of echo::EchoServer {
+        it.clock        := clock
+        it.usb_rx_data  := actual_top.rx_data
+        it.usb_rx_valid := actual_top.rx_valid
+        it.usb_tx_ready := actual_top.tx_ready
+    }
+    actual_top.tx_data   := echo.tx_data
+    actual_top.tx_strobe := echo.tx_strobe
+    actual_top.rx_ready  := echo.room
+
+    // The raw UART lines, as internal wires.  This is the point to
+    // consume them: uart_tx_line carries everything the host writes,
+    // rendered at 115200 8N1; uart_rx_line feeds the echo.  The single
+    // assignment below is the loopback jumper that makes the device an
+    // echo server -- replace it (and bring the wires to real pins) to
+    // talk to an external UART instead.
+    wire uart_tx_line : Bit { it := echo.txd }
+    wire uart_rx_line : Bit { it := uart_tx_line }
+    echo.rxd := uart_rx_line
 }
 
 // Fomu UART-over-USB PoC — top declaration.
 //
-// The real Fomu top is pending platform support for bidirectional
-// (tristate) pins — see FOMU_UART_OVER_USB_PLANv2.md §5/§9.  Until then the
-// top is the Verilog ext mod `ext/fomu_top.sv` (`module Top`) and this
-// declaration is the port *contract* for it.  Port names match the Fomu
-// platform pin names so the future real Top keeps the same PCF lines.
-//
-// Contract drift note: Virdant cannot yet express a bidirectional pad, so
-// `usb_dp`/`usb_dn` are declared `outgoing` here while the Verilog Top
-// declares them `inout` (the SB_IO PACKAGE_PIN).  When platform tristate
-// support lands, this declaration is replaced by the real
-// `export mod Top for ice40::Fomu` and the Verilog Top dies (plan §9).
+// The platform export above wires the ext core (\top::FomuTop) to the
+// Fomu pins and instantiates the Virdant echo server (src/echo.vir),
+// which renders the USB byte stream onto internal raw UART wires
+// (115200 8N1) and echoes bytes read from them back to the host.
 ext mod FomuTop {
     //> 48 MHz board clock (pin F4).
     incoming clock : Clock
@@ -51,7 +68,13 @@ ext mod FomuTop {
     outgoing led_red : Bit
     outgoing led_green : Bit
     outgoing led_blue : Bit
+    //> Byte-stream interface of the USB core (plan §2).  The Virdant
+    //> echo server consumes this stream; rx_valid is a 1-clk strobe
+    //> per byte, rx_ready is the consumer's flow control.
+    outgoing rx_data : Word[8]
+    outgoing rx_valid : Bit
+    outgoing tx_ready : Bit
+    incoming tx_data : Word[8]
+    incoming tx_strobe : Bit
+    incoming rx_ready : Bit
 }
-
-// export mod Top for ice40::Fomu { ... }   // pending platform tristate
-//                                          // support; see plan §5/§9

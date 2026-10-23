@@ -1,0 +1,209 @@
+//> UART primitives: a 115200 8N1 transmitter and receiver for the 48 MHz
+//> clock.  Both are adapted from the UART examples in
+//> ~/projects/virdant-examples/uart and ~/projects/virdant-riscv (which
+//> run 9600 baud at 12 MHz); the only arithmetic change is the divisor.
+//>
+//> Bit period: 48_000_000 / 115200 = 416.67, so one bit time is 417
+//> clock cycles (115107 baud, -0.08% error -- far inside the ~2%
+//> tolerance UART allows).  The start-bit detector samples half a bit
+//> after the falling edge (209 cycles), i.e. the middle of the start
+//> bit, and every following bit is sampled on the same phase.
+//>
+//> Frame: idle high, start low, 8 data bits LSB first, stop high.
+//>
+//> # UartSender
+//>
+//> - `clock`      : 48 MHz clock
+//> - `data`       : byte to transmit
+//> - `data_valid` : 1-clk strobe; loads `data` when `ready` is high
+//> - `ready`      : high when idle (a new byte can be loaded)
+//> - `tx`         : the serial line (the raw tx wire)
+//>
+//> # UartReceiver
+//>
+//> - `clock`      : 48 MHz clock
+//> - `uart_rx`    : the serial line (the raw rx wire)
+//> - `data`       : received byte
+//> - `data_valid` : 1-clk strobe when `data` is complete
+
+//> FSM states shared by UartSender and UartReceiver.
+enum type UartFsmState {
+    Idle  = 0b00w2
+    Start = 0b01
+    Data  = 0b10
+    Stop  = 0b11
+}
+
+mod UartSender {
+    //> 48 MHz clock; one bit = 417 cycles (see the file comment).
+    incoming clock      : Clock
+    incoming data       : Word[8]
+    incoming data_valid : Bit
+    wire sender_idle : Bit {
+        it := state == #Idle
+    }
+    outgoing ready      : Bit {
+        it := sender_idle
+    }
+    outgoing tx         : Bit {
+        it := match state {
+            case #Idle  => true
+            case #Start => false
+            case #Data  => data_buf[dyn bit_idx]
+            case #Stop  => true
+        }
+    }
+
+    // A bit time ends when the counter reaches 416; the counter is
+    // zeroed at every state change, so every bit is exactly 417 cycles.
+    wire bit_time_done : Bit {
+        it := baud_counter == 416w10
+    }
+
+    reg state : UartFsmState on clock {
+        initial it <= #Idle
+    }
+
+    reg baud_counter : Word[10] on clock {
+        initial it <= 0w10
+        it <= when {
+            case state == #Idle => 0w10
+            case bit_time_done  => 0w10
+            else                => it + 1w10
+        }
+    }
+
+    reg bit_idx : Word[3] on clock {
+        initial it <= 0w3
+    }
+
+    reg data_buf : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case data_valid && sender_idle => data
+            else                     => it
+        }
+    }
+
+    when {
+        case data_valid && sender_idle match state {
+            case #Idle {
+                state <= #Start
+            }
+        }
+        case bit_time_done match state {
+            case #Start {
+                bit_idx <= 0w3
+                state   <= #Data
+            }
+            case #Data {
+                bit_idx <= bit_idx + 1w3
+                when {
+                    case bit_idx == 7w3 {
+                        state <= #Stop
+                    }
+                }
+            }
+            case #Stop {
+                state <= #Idle
+            }
+        }
+    }
+}
+
+mod UartReceiver {
+    incoming clock      : Clock
+    incoming uart_rx    : Bit
+    outgoing data       : Word[8] {
+        it := shift
+    }
+    outgoing data_valid : Bit {
+        it := state == #Stop && bit_time_done
+    }
+
+    // The counter counts DOWN within each phase; a phase ends when it
+    // reaches 0.
+    wire bit_time_done : Bit {
+        it := baud_counter == 0w10
+    }
+
+    reg state : UartFsmState on clock {
+        initial it <= #Idle
+        it <= when {
+            else match it {
+                case #Idle when {
+                    case uart_rx == false => #Start
+                    else                  => it
+                }
+                case #Start when {
+                    case bit_time_done when {
+                        // A valid start bit is still low at its midpoint;
+                        // a level that bounced back high is a glitch.
+                        case uart_rx == false => #Data
+                        else                  => #Idle
+                    }
+                    else => it
+                }
+                case #Data when {
+                    case bit_time_done && bit_idx == 7w3 => #Stop
+                    else                                 => it
+                }
+                case #Stop when {
+                    case bit_time_done => #Idle
+                    else               => it
+                }
+            }
+        }
+    }
+
+    // Countdown per phase.  Idle holds 0 and watches the line; the
+    // falling edge loads the half-bit time.  Start, Data and Stop each
+    // reload the full bit time when they end.  (A link to an external,
+    // asynchronous UART would shorten the last data bit slightly so the
+    // stop bit is sampled safely inside its cell; on the internal
+    // loopback wire both sides share one clock, so the periods are
+    // exact and no guard is needed.)
+    reg baud_counter : Word[10] on clock {
+        initial it <= 0w10
+        it <= when {
+            else match state {
+                case #Idle when {
+                    case uart_rx == false => 208w10
+                    else                  => 0w10
+                }
+                case #Start when {
+                    case bit_time_done => 416w10
+                    else               => it - 1w10
+                }
+                case #Data when {
+                    case bit_time_done => 416w10
+                    else               => it - 1w10
+                }
+                case #Stop when {
+                    case bit_time_done => 0w10
+                    else               => it - 1w10
+                }
+            }
+        }
+    }
+
+    reg bit_idx : Word[3] on clock {
+        initial it <= 0w3
+        it <= when {
+            case state == #Start && bit_time_done => 0w3
+            case state == #Data && bit_time_done   => it + 1w3
+            else                                   => it
+        }
+    }
+
+    // Bits are captured at each bit boundary and shifted in from the
+    // MSB side, so after eight captures the byte sits with its LSB in
+    // shift[0] (UART sends LSB first).
+    reg shift : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case state == #Data && bit_time_done => word(uart_rx, it[8..1])
+            else                                 => it
+        }
+    }
+}

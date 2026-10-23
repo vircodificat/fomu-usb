@@ -15,6 +15,11 @@ State as of the end of this working session. Read together with
   the ext module was renamed `Top` → `\top::FomuTop`, and `vir upload`
   builds the full 15-pin Fomu image.  **`vir upload` fails at nextpnr
   `--freq 48` timing** (the M6 gap).
+- **EchoFifo sim bug found & fixed (this session)**: the Virdant
+  "conveyor belt" shift-register FIFO was NOT a FIFO — pushes
+  destroyed the head byte, pops emitted stale slots, bytes stranded.
+  Replaced by an `ext mod` 16×8 circular buffer (`ext/echo_fifo.sv`);
+  the echo test (S4/S7) now passes.  See "Bugs found and fixed" #11.
 - **P0 RESOLVED**: the platform export initially left `usb_dp_pu`
   unwired (wrapper tied it low = hardware-dead image); it — and the
   heartbeat LEDs — are now wired through the export (verified in
@@ -22,8 +27,12 @@ State as of the end of this working session. Read together with
 - **M6 CLOSED: `vir bitstream` succeeds end-to-end** (yosys OK /
   nextpnr-ice40 OK / bitstream written) — vir's exact nextpnr
   invocation (default seed, PCF set_frequency, NO --freq) reports
-  **48.06 MHz PASS**; 1583 LC (29%), 4 BRAM.  All three testbenches
-  green.  `vir upload` will build and (operator's call) flash.
+  **48.78 MHz PASS**; 4 BRAM.  All three testbenches green.
+  `vir upload` will build and (operator's call) flash.  RE-CLOSED this
+  session: the EchoFifo fix (below) re-opened it at 46.95 MHz; the
+  snap-loader fix (below) recovered the margin.  The user uploaded the
+  PREVIOUS bitstream (48.06, pre-EchoFifo-fix) — hardware "kinda works
+  with timing errors"; the next upload should rebuild from this tree.
   NOTE: vir's flow constrains timing via the PCF only — the --freq
   flag feeds nextpnr's timing-driven placer and vir does NOT pass it,
   so "seed 1 passes with --freq" does NOT imply vir passes; measure
@@ -82,6 +91,17 @@ Residual notes:
 
 ## What was built (updated this session)
 
+- **`src/echo.vir` + `ext/echo_fifo.sv` (this session)** — the Virdant
+  echo server (src/echo.vir: EchoServer, queue wiring, hold slot) with
+  its FIFO storage as an **ext mod** (`\echo::EchoFifo`, body in
+  ext/echo_fifo.sv): a 16×8 circular buffer (wr/rd pointers, 16:1 read
+  mux, count, room at <12).  Virdant `mod`s cannot express indexed
+  memories, so the storage primitive is ext — the same pattern as the
+  USB core and the riscv project's Rf/Mem.  src/uart.vir holds the
+  UartSender/UartReceiver primitives.  `vir build` copies the whole
+  ext/ dir and its generated script.ys lists each ext file explicitly,
+  so a NEW ext file (echo_fifo.sv) is picked up automatically —
+  verified: vir bitstream's regenerated script.ys includes it.
 - `ext/usb_uart.sv` (~1900 lines) — module inventory per plan §4:
   `usb_crc5`, `usb_crc16`, `usb_fifo16x8` (`RAM=1` = block-RAM storage +
   registered read), `usb_rx_phy`, `usb_rx_packet`, `usb_tx_phy`,
@@ -150,11 +170,25 @@ Also: EP2 response pid NAK not ACK (registered, one clk later).
 - `make test` — **all three TBs ALL TESTS PASSED** (tb_usb_phy's T3/T5
   now exercise BOTH the head window (`dt_head`, shadowed at dt_valid)
   and the payload RAM (streamed out via the `snap_dt` read task)).
-- `make synth` — places at **29% LC (1579 ext / 1542 wrapper), 4 BRAM**
-  (snap, desc_rom, rxfifo, dt_ram), 15 SB_IO (wrapper); **FAILS
-  `--freq 48`**: see the M6 numbers below.
+- `make synth` — places at **4 BRAM** (snap, desc_rom, rxfifo, dt_ram),
+  15 SB_IO (wrapper); **PASSES `--freq 48` at 48.78 MHz** this session
+  (the snap-loader fix — see M6).  vir's flow (abc9, PCF timing) also
+  PASSES end-to-end (bitstream written, `vir bitstream`).
 
 ## M6 status and history
+
+**RE-CLOSED this session**: the EchoFifo ext-mod fix regressed vir's
+flow to 46.95 MHz (default seed) — the thin margin was eaten by the new
+ext FIFO's placement.  The critical path was the **snapshot loader** in
+usb_uart (`li + 7'd1 == snap_len` put a 7-bit carry chain + compare into
+`load_run`'s D cone and then into `li`'s own clock-enable — 21.3 ns,
+flop→adder→compare→enable self-loop, ext/usb_uart.sv ~1908).  Fix:
+precompute `snap_len_m1 = tx_len_w - 1` at arm time (registered, off
+the per-cycle path), making the termination test a plain equality.  The
+`li + 1` increment still exists but now only drives `li`'s D (short
+self-loop).  After the fix: **make synth 48.78 MHz PASS** and **vir
+bitstream end-to-end PASS** (yosys OK / nextpnr OK / bitstream written).
+The hardware image the user uploaded predates both fixes.
 
 Start of previous session: ~34 MHz, 3690 LC (69%). This session, after
 the payload-off-fabric move, on the **ext core** (`-top top::FomuTop`,
@@ -237,6 +271,18 @@ TB drain accumulator reset; iverilog gotchas (task array ports,
 - **#10**: registered txfifo write gate was off-by-one (byte armed at
   cnt 15 lands at 16) → reverted to the comb gate; pop headroom re-derived
   (`<13`).
+- **#11 (this session)**: the Virdant EchoFifo "conveyor belt" was not
+  a FIFO: `queue <= push ? {push_data, queue[127:8]} : ...` inserts the
+  new byte at slot 15 and slides everything down, DESTROYING slot 0's
+  byte on every push; pops read slot 0, which held a stale byte whenever
+  the queue wasn't full (emits garbage, strands bytes mid-conveyor).
+  The echo test failed with "got 0".  Fixed by replacing the Virdant
+  `mod EchoFifo` with an `ext mod` 16×8 circular buffer (wr/rd pointers
+  + 16:1 read mux) in `ext/echo_fifo.sv`; the echo server's flow control
+  in src/echo.vir (room, hold slot, tx_drained) was already correct.
+  Lesson: a fixed-position shift register is a delay line, not a
+  variable-depth FIFO — Virdant has no indexed memory in `mod`s, so
+  indexed storage goes ext (same pattern as Rf/Mem in the riscv project).
 - iverilog `$time` in expressions is in time UNITS (ns) while `%t`
   displays precision units (ps) — a `$time > N` filter written from `%t`
   output is 1000× off.
@@ -245,10 +291,19 @@ TB drain accumulator reset; iverilog gotchas (task array ports,
 
 ## Loose ends
 
-- M6 is CLOSED for vir's flow (see above) but the margin is thin
-  (48.06/48.00 at the default seed; other seeds 44.7–47.9).  If a
-  future RTL change shifts placement, re-run `vir bitstream` — do not
-  assume.  Seed sweeps with `--freq` are NOT equivalent (see flow facts).
+- **This session's fixes are UNCOMMITTED**: Makefile (ECHO_SV in test
+  + synth read lists), ext/echo_fifo.sv (new), src/echo.vir (EchoFifo
+  → ext mod), src/uart.vir (untracked), ext/usb_uart.sv (snap_len_m1
+  fix), ext/fomu_top.sv, src/top.vir, tb/tb_usb_serial.v.  Commit once
+  green — all tests pass and both synth flows close at 48 MHz.
+- **Hardware note**: the uploaded bitstream predates both this
+  session's fixes (broken EchoFifo → the UART echo path emits
+  garbage/strands bytes; snap-loader carry chain → marginal timing).
+  Rebuild with `vir bitstream` and re-upload before judging hardware.
+- M6 is CLOSED for vir's flow (48.78 MHz, re-verified this session
+  after the EchoFifo change).  If a future RTL change shifts placement,
+  re-run `vir bitstream` — do not assume.  Seed sweeps with `--freq`
+  are NOT equivalent (see flow facts).
 - `FOMU_UART_OVER_USB_PLANv2.md` §2/§4/§9 predate: EP2/IAD/EF-class,
   rx-FIFO BRAM depth, the 4-stage EP0 pipeline, the platform export
   (§9 said the ext Top "dies" when the wrapper lands — it half-did).

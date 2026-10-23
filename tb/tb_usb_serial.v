@@ -42,7 +42,41 @@ module tb_usb_serial;
         .clock(clk),
         .usb_dp(usb_dp), .usb_dn(usb_dn),
         .usb_dp_pu(usb_dp_pu),
-        .led_red(led_r), .led_green(led_g), .led_blue(led_b));
+        .led_red(led_r), .led_green(led_g), .led_blue(led_b),
+        // byte-stream interface (the Virdant echo server consumes it,
+        // exactly as the platform top in build/top.sv wires it)
+        .rx_data(echo_rx_data),
+        .rx_valid(echo_rx_valid),
+        .tx_ready(core_tx_ready),
+        .tx_data(echo_tx_data),
+        .tx_strobe(echo_tx_strobe),
+        .rx_ready(echo_room));
+
+    // The Virdant echo server (generated Verilog from src/echo.vir) and
+    // the raw UART loop wires -- mirrors export mod Top in src/top.vir:
+    // host bytes are rendered onto uart_txd at 115200 8N1 and looped
+    // into uart_rxd, and whatever the echo server reads there goes back
+    // to the host.
+    wire [7:0] echo_rx_data;
+    wire       echo_rx_valid;
+    wire       core_tx_ready;
+    wire [7:0] echo_tx_data;
+    wire       echo_tx_strobe;
+    wire       echo_room;
+    wire       uart_txd, uart_rxd;
+
+    \echo::EchoServer echo(
+        .clock(clk),
+        .usb_rx_data (echo_rx_data),
+        .usb_rx_valid(echo_rx_valid),
+        .usb_tx_ready(core_tx_ready),
+        .tx_data     (echo_tx_data),
+        .tx_strobe   (echo_tx_strobe),
+        .room        (echo_room),
+        .txd         (uart_txd),
+        .rxd         (uart_rxd)
+    );
+    assign uart_rxd = uart_txd;   // the loopback jumper (uart_rx_line)
 
     usb_host_bfm host(.clk(clk), .usb_dp(usb_dp), .usb_dn(usb_dn));
 
