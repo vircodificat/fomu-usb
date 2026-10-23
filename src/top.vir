@@ -4,11 +4,24 @@ export mod Top for ice40::Fomu {
     incoming clock : Clock
     outgoing usb_dp : Bit
     outgoing usb_dn : Bit
+    // D+ pull-up enable: MUST be wired through — the platform default is
+    // low (= disconnected), so a wrapper that leaves it unwired produces
+    // an image no host can ever see (the P0 found when the first upload
+    // build tied it to 1'b0).
+    outgoing usb_dp_pu : Bit
+    // heartbeat LEDs (active low on PVT), driven by the ext core
+    outgoing led_red   : Bit
+    outgoing led_green : Bit
+    outgoing led_blue  : Bit
 
     mod actual_top of FomuTop {
         it.clock := clock
         usb_dp := it.usb_dp
         usb_dn := it.usb_dn
+        usb_dp_pu := it.usb_dp_pu
+        led_red := it.led_red
+        led_green := it.led_green
+        led_blue := it.led_blue
     }
 }
 
