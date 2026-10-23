@@ -19,12 +19,12 @@ State as of the end of this working session. Read together with
   unwired (wrapper tied it low = hardware-dead image); it — and the
   heartbeat LEDs — are now wired through the export (verified in
   build/top.sv).  No P0 hardware flag remains.
-- **M6 (timing)**: dt_data payload capture off the fabric (previous
-  round, killed the `vir upload` critical path) + the registered shared
-  qualify in `usb_rx_packet` (this round, removed the `*_cap` chain
-  from the critical path).  Tests all green; **still short of 48 MHz**:
-  wrapper (vir-equivalent flow) 41.5 MHz, ext-core band 40.3–43.9
-  (abc9 ≈ same).  Next known target + options below.
+- **M6 (timing)**: dt_data payload off the fabric, registered shared
+  qualify, and (latest) the registered EP0 data strobe — tests all
+  green; **still short of 48 MHz but close**: wrapper (vir-equivalent
+  flow, abc9) band 40.3–**45.84**, default seed 44.79 (user's failing
+  run: 39.96).  Next target = the rx reset/clear distribution chain
+  (below).
 
 ## Hard rules (from plan §0 — still binding)
 
@@ -179,16 +179,24 @@ dt_head (this session)** — killed the `vir upload` critical path
 
 ### Remaining critical path (next round's target)
 
-The `*_cap` chain is FIXED (gone from the critical path after the
-`q_pid_r`/`q_dat_r` registered qualify).  The new worst path is the
-**EP0 data-accept cone**: `usb_rx_packet`'s registered EOP outputs
-(`dt_len`, `dt_crc_ok`) fan into `usb_ep0`'s accept decisions and
-register enables (`pend_cfg`/`pend_addr`/`dev_addr` CEN, `st`/`tog`/
-`resp_sel`), ~21–24 ns (7–8 ns logic / 15–16 ns routing).  Candidate
-next move: register EP0's data-accept decision one clk after
-dt_valid (the +1 clk is free — turnaround budget ~30–50 clks; the
-usb_serial module already does exactly this with dt_acc/dt_rej).
-Beyond that: relaxed `--freq` (user sign-off, plan deviation).
+Round A (registered EP0 data strobe, `ep0_dt_valid_r`, +1 clk) removed
+the EP0 data-accept cone.  The remaining tail is the **rx reset/clear
+distribution chain** — the same disease the FIFO CE fix cured, now on
+control terms: `por_done → br_r (bus_reset) → sop_r → tk_valid
+reset-mux → tok_cap → dat_cap → hs_cap → hs_pid CEN`, ~21.8 ns
+(7.1 logic / 14.7 routing): `bus_reset` and `sop` clear-muxes fan
+into every rxpkt register, chaining shared LUTs from the PHY side into
+the handshake-capture enable.  Candidate fix (same free +1 clk trick):
+register the token/handshake capture one clk AFTER EOP (the router
+consumes hs_valid/tk_* within the ~30–50 clk turnaround window), or
+pipeline `bus_reset` into rxpkt as a registered local reset.  Beyond
+that: relaxed `--freq` (user sign-off, plan deviation).
+
+Round A numbers (8-seed grid, --freq 48): wrapper default 44.79
+(was 41.51); wrapper+abc9 40.30/42.28/44.73/45.84; ext core
+38.75–43.40 median 41.69 (before: 40.25–43.88 median 42.40 —
+statistically flat: the EP0 cone was co-critical with the reset chain,
+which Round A does not touch).
 
 ## Bugs found and fixed (don't re-derive these)
 
@@ -212,8 +220,8 @@ TB drain accumulator reset; iverilog gotchas (task array ports,
 
 ## Loose ends
 
-- M6 decision: `--freq 48` still fails (ext-core band 40.3–43.9,
-  wrapper 41.5).  Next round = the EP0 data-accept cone (above), then
+- M6 decision: `--freq 48` still fails (wrapper abc9 band 40.3–45.84).
+  Next round = the rx reset/clear distribution chain (above), then
   relaxed `--freq` needs user sign-off.
 - `FOMU_UART_OVER_USB_PLANv2.md` §2/§4/§9 predate: EP2/IAD/EF-class,
   rx-FIFO BRAM depth, the 4-stage EP0 pipeline, the platform export

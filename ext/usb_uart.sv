@@ -1585,7 +1585,7 @@ module usb_uart(
     usb_ep0 u_ep0(
         .clk(clk), .rst(rst), .bus_reset(bus_reset),
         .tk_setup(ep0_tk_setup), .tk_in(ep0_tk_in), .tk_out(ep0_tk_out),
-        .dt_valid(ep0_dt_valid), .dt_pid(dt_pid), .dt_len(dt_len),
+        .dt_valid(ep0_dt_valid_r), .dt_pid(dt_pid), .dt_len(dt_len),
         .dt_head(dt_head), .dt_crc_ok(dt_crc_ok),
         .hs_ack(ep0_hs_ack),
         .resp_req(ep0_resp_req), .resp_pid(ep0_resp_pid),
@@ -1633,8 +1633,24 @@ module usb_uart(
     wire ep2_tk_in    = tok_v_r && (tk_pid == PID_IN)    && (tk_endp == 4'd2);
     wire ep2_tk_out   = tok_v_r && (tk_pid == PID_OUT)   && (tk_endp == 4'd2);
 
-    // data packet router: the module expecting a data packet owns it
-    wire ep0_dt_valid = dt_valid && ep0_busy;
+    // data packet router: the module expecting a data packet owns it.
+    // EP0's strobe is REGISTERED one clk after arrival: the rxpkt EOP
+    // outputs (dt_len = bc-2, dt_crc_ok = 16-bit CRC-residual compare)
+    // carry wide cones in their D-terms, and fanning them into EP0's
+    // accept enables in the ARRIVAL cycle was the critical path.  Every
+    // field EP0 reads (dt_head / dt_pid / dt_len / dt_crc_ok) is a
+    // register that HOLDS until the next packet's EOP, so the delayed
+    // read is bit-identical; the +1 clk is free (device turnaround
+    // budget ~30-50 clks, the core uses ~20).  usb_serial keeps the
+    // arrival-cycle strobe: its accept decision is already registered
+    // one clk later (dt_acc/dt_rej), so its cone was never critical.
+    // No token can land in the 1-clk strobe delay: the inter-packet
+    // gap is >= 2 bit times = 8 clks.
+    wire ep0_dt_gate = dt_valid && ep0_busy;
+    reg  ep0_dt_valid_r;
+    always @(posedge clk)
+        if (rst || bus_reset) ep0_dt_valid_r <= 1'b0;
+        else                  ep0_dt_valid_r <= ep0_dt_gate;
     wire ser_dt_valid = dt_valid && !ep0_busy && ser_busy;
 
     // handshake router: the module with a response in flight owns it
