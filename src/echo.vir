@@ -34,9 +34,11 @@ ext mod EchoFifo {
     //> the echo server itself stays Virdant).  The interface contract:
     //>
     //> - `push_valid` pushes `push_data` onto the tail on that clk edge.
-    //> - `pop_en` consumes the head byte on that clk edge; `pop_data`
-    //>   is valid exactly while a byte is being consumed, so the
-    //>   sender can load it combinationally on the same edge.
+    //> - `pop_en` consumes the head byte on that clk edge; the popped
+    //>   byte appears on `pop_data` on the NEXT clk (registered read
+    //>   inside the fifo), paired with the one-clk-delayed pop strobe
+    //>   below.  Pops are always >= 2 clks apart, so pop_data is the
+    //>   current head whenever a pop fires.
     //> - `count` is the number of stored bytes; `room` is low when the
     //>   queue is nearly full, throttling the USB core's pop path (the
     //>   couple of in-flight bytes in the core's pop pipeline always
@@ -84,10 +86,24 @@ mod EchoServer {
     // Hand the head of the queue to the sender whenever it is idle,
     // the queue has a byte, and the echo side has drained the previous
     // received byte (tx_drained, below).
+    //
+    // The fifo's head mux is REGISTERED (see the EchoFifo contract):
+    // pop_en at cycle N consumes the head, and the byte appears on
+    // pop_data during cycle N+1 -- so the sender's load strobe is the
+    // registered pop_r, not fifo_pop.  !pop_r in the pop condition
+    // keeps exactly one byte in flight between the pop and the load
+    // (without it the still-idle sender would trigger a second pop one
+    // cycle after the first and strand the byte it just popped).
     wire fifo_pop : Bit {
-        it := (fifo.count != 0w5) && sender.ready && tx_drained
+        it := (fifo.count != 0w5) && sender.ready && tx_drained && !pop_r
     }
-    sender.data_valid := fifo_pop
+
+    reg pop_r : Bit on clock {
+        initial it <= false
+        it <= fifo_pop
+    }
+
+    sender.data_valid := pop_r
 
     txd := sender.tx
 

@@ -13,8 +13,8 @@ State as of the end of this working session. Read together with
 - **Platform export landed mid-session** (in-tree when this session
   started): `src/top.vir` now carries `export mod Top for ice40::Fomu`,
   the ext module was renamed `Top` → `\top::FomuTop`, and `vir upload`
-  builds the full 15-pin Fomu image.  **`vir upload` fails at nextpnr
-  `--freq 48` timing** (the M6 gap).
+  builds the full 15-pin Fomu image.  (The old "upload fails timing"
+  note is historical — M6 is CLOSED, see below.)
 - **EchoFifo sim bug found & fixed (this session)**: the Virdant
   "conveyor belt" shift-register FIFO was NOT a FIFO — pushes
   destroyed the head byte, pops emitted stale slots, bytes stranded.

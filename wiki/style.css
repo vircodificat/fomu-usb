@@ -1,0 +1,144 @@
+/* wiki/style.css — shared stylesheet for the rendered HTML pages.
+   `make html` renders wiki/*.md to build/html/*.html with this CSS. */
+
+:root {
+    color-scheme: dark;
+    --bg: #0e1116;
+    --fg: #d8dee4;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --border: #2d333b;
+    --code-bg: #161b22;
+    --code-fg: #c9d1d9;
+}
+
+html {
+    font-size: 16px;
+    background: var(--bg);
+}
+
+body {
+    max-width: 52rem;
+    margin: 0 auto;
+    padding: 2rem 1.5rem 4rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica,
+        Arial, sans-serif;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+}
+
+header#title-block-header {
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+}
+
+h1, h2, h3, h4 {
+    line-height: 1.25;
+    margin-top: 1.8em;
+    margin-bottom: 0.6em;
+}
+
+h1 {
+    font-size: 1.9rem;
+    margin-top: 0;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+}
+
+h2 {
+    font-size: 1.4rem;
+}
+
+h3 {
+    font-size: 1.15rem;
+}
+
+a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+/* Without this rule, visited links fall back to the browser default
+   (dark purple #551a8b) — near-invisible on --bg. Keep them visible
+   but distinct from unvisited links. */
+a:visited {
+    color: #d2a8ff;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+code {
+    font-family: "SF Mono", "Consolas", "Liberation Mono", Menlo, monospace;
+    font-size: 0.875em;
+    background: var(--code-bg);
+    padding: 0.15em 0.35em;
+    border-radius: 3px;
+}
+
+pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+}
+
+pre code {
+    background: none;
+    padding: 0;
+    font-size: 0.85rem;
+}
+
+table {
+    border-collapse: collapse;
+    margin: 1rem 0;
+    display: block;
+    overflow-x: auto;
+    max-width: 100%;
+}
+
+th, td {
+    border: 1px solid var(--border);
+    padding: 0.4rem 0.8rem;
+    text-align: left;
+}
+
+th {
+    background: var(--code-bg);
+}
+
+blockquote {
+    border-left: 4px solid var(--border);
+    color: var(--muted);
+    padding-left: 1rem;
+    margin-left: 0;
+}
+
+hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2rem 0;
+}
+
+/* Mermaid blocks (rendered as code in pandoc; keep them readable) */
+pre.mermaid {
+    background: var(--code-bg);
+}
+
+/* Simple footer nav hint */
+footer {
+    margin-top: 3rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 0.85rem;
+}
+
+footer a {
+    color: var(--accent);
+}

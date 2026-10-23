@@ -20,9 +20,26 @@ export mod Top for ice40::Fomu {
         usb_dp := it.usb_dp
         usb_dn := it.usb_dn
         usb_dp_pu := it.usb_dp_pu
-        led_red := it.led_red
         led_green := it.led_green
         led_blue := it.led_blue
+    }
+
+    reg led_buffer : Bit on clock {
+        it <= actual_top.led_red
+    }
+
+    reg led_counter : Word[32] on clock {
+        initial it <= 0
+
+        when {
+            case it > 0 {
+                it <= it - 1
+            }
+            case led_buffer {
+                it <= 0x100000
+            }
+        }
+        led_red := it > 0
     }
 
     // The echo server: the byte-level consumer of the USB core.  Bytes
@@ -45,8 +62,16 @@ export mod Top for ice40::Fomu {
     // echo server -- replace it (and bring the wires to real pins) to
     // talk to an external UART instead.
     wire uart_tx_line : Bit { it := echo.txd }
-    wire uart_rx_line : Bit { it := uart_tx_line }
-    echo.rxd := uart_rx_line
+    // The loopback jumper is REGISTERED: the raw wire made
+    // sender.data_buf -> bit_idx mux -> txd -> rxd -> receiver.state /
+    // baud_counter decode one combinational path, which was the
+    // vir-flow critical path (22.3 ns, 15 ns of it routing).  One clk
+    // of loop latency is 1/417 of a UART bit time -- invisible to the
+    // 8N1 receiver (mid-bit sampling shifts by one cycle of 417).
+    reg uart_rx_reg : Bit on clock {
+        it <= uart_tx_line
+    }
+    echo.rxd := uart_rx_reg
 }
 
 // Fomu UART-over-USB PoC — top declaration.

@@ -8,12 +8,16 @@
 // Interface contract (mirrors the old shift-register version, but is
 // actually a correct FIFO):
 //   push_valid: push_data enters the tail on this clk edge.
-//   pop_en:     pop_data (the head) is consumed this cycle; the next
-//               byte becomes the head on the clk edge.
-//   pop_data is the head byte, valid whenever count != 0.  It changes
-//   only on the edge that consumes it, so a pop strobe and the byte it
-//   delivers are coincident (the sender loads pop_data combinationally
-//   on the same edge).
+//   pop_en:     the head is consumed on this clk edge; the popped byte
+//               appears on pop_data on the NEXT cycle (registered read),
+//               paired with the one-clk-delayed pop strobe the echo
+//               server raises.  Pops are always >= 2 clks apart (the
+//               sender holds busy ~417 clks per byte), so pop_data is
+//               the current head whenever a pop fires.
+//   pop_data:   registered head byte; the 16:1 mux ends at its own
+//               flop instead of riding into the sender's data_buf
+//               enable cone (that mux + cone was the vir-flow critical
+//               path, 21.0 ns against a 20.83 ns budget).
 //   count: number of bytes currently stored (0..16).
 //   room:  count < 12 -- flow control for the USB core's rx pop path,
 //          sized so the couple of in-flight bytes in the core's
@@ -94,7 +98,17 @@ module \echo::EchoFifo (
         endcase
     end
 
-    assign pop_data = rd_mux;
+    // Registered read of the head mux: captured with the OLD rd_ptr on
+    // every edge (non-blocking), so on a pop edge pop_data_q takes the
+    // byte being consumed and presents it one clk later, together with
+    // the echo server's delayed pop strobe.  Between pops the capture
+    // keeps pop_data_q equal to the current head (rd_ptr is static).
+    reg [7:0] pop_data_q;
+    initial   pop_data_q = 8'd0;
+    always @(posedge clock)
+        pop_data_q <= rd_mux;
+
+    assign pop_data = pop_data_q;
     assign count    = count_q;
     assign room     = (count_q < 5'd12);
 

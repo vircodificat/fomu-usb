@@ -16,8 +16,8 @@
 //   4. bulk loopback: 512 bytes written in 64-byte packets (both toggle
 //      phases, NAK-retry + IN-drain interleaving) echo back byte-identical
 //      and in order, with DATA0/DATA1 toggling checked both directions
-//   5. CDC control traffic: SET_LINE_CODING / GET_LINE_CODING round-trip,
-//      SET_CONTROL_LINE_STATE
+//   5. CDC control traffic: SET_LINE_CODING / GET_LINE_CODING are
+//      stripped from the core and must STALL; SET_CONTROL_LINE_STATE
 //   6. SOF tokens interleaved between every transaction
 //   7. bus reset mid-stream -> device returns to address 0 ->
 //      re-enumerate (addr 7) -> echo still works
@@ -525,23 +525,72 @@ module tb_usb_serial;
             end
 
         // ---------------------------------------------------------------
-        // 5. CDC control traffic
+        // 5. CDC control traffic.  SET_LINE_CODING / GET_LINE_CODING are
+        // stripped (the echo server never reads line coding): both must
+        // STALL.  Linux cdc_acm tolerates the SET side failing.
         // ---------------------------------------------------------------
-        $display("--- S5: SET_LINE_CODING (115200 8N1)");
+        $display("--- S5: SET_LINE_CODING (stripped: expect STALL)");
         req[0] = 8'h21; req[1] = 8'h20; req[2] = 8'h00; req[3] = 8'h00;
         req[4] = 8'h01; req[5] = 8'h00; req[6] = 8'h07; req[7] = 8'h00;
         payload[0] = 8'h00; payload[1] = 8'hC2; payload[2] = 8'h01;
         payload[3] = 8'h00; payload[4] = 8'h00; payload[5] = 8'h00;
         payload[6] = 8'h08;
-        ctrl_write(7'd42, 7);
+        ctrl_setup(7'd42);
+        send_sof;
+        for (i = 0; i < 7; i = i + 1)
+            host.host_data_bytes[i] = payload[i];
+        host.host_data_len = 7'd7;
+        host.host_send_token(PID_OUT, 7'd42, 4'd0);
+        host.host_send_data1;
+        wait_hs(4'hE, 8192, ok);              // STALL, not ACK
+        if (!ok) begin
+            errors = errors + 1;
+            $display("FAIL: S5: SET_LINE_CODING not STALLed");
+        end
 
-        $display("--- S5: GET_LINE_CODING round-trip");
+        $display("--- S5: GET_LINE_CODING (stripped: expect STALL)");
         req[0] = 8'hA1; req[1] = 8'h21; req[2] = 8'h00; req[3] = 8'h00;
         req[4] = 8'h01; req[5] = 8'h00; req[6] = 8'h07; req[7] = 8'h00;
-        ctrl_read(7'd42, 7);
-        check(got[0] === 8'h00 && got[1] === 8'hC2 && got[2] === 8'h01,
-              "S5: line coding dwDTERate");
-        check(got[6] === 8'h08, "S5: line coding bDataBits");
+        ctrl_setup(7'd42);
+        send_sof;
+        host.host_send_token(PID_IN, 7'd42, 4'd0);
+        wait_hs(4'hE, 8192, ok);              // STALL, not data
+        if (!ok) begin
+            errors = errors + 1;
+            $display("FAIL: S5: GET_LINE_CODING not STALLed");
+        end
+
+        // ---------------------------------------------------------------
+        // 5b. bulk traffic while EP0 is STALLed (regression: the data
+        // router once handed EVERY data packet to a stalled EP0,
+        // STALLing the host's bulk-OUT writes and killing the echo
+        // after the connect script's SET_LINE_CODING stalled).  No
+        // SETUP intervenes here, so the device stays in EP_STALL for
+        // the whole exchange; the SET_CONTROL_LINE_STATE below (a
+        // SETUP) is what clears it.
+        // ---------------------------------------------------------------
+        $display("--- S5b: bulk loopback while EP0 is STALLed");
+        begin : s5b_bulk_during_stall
+            reg acked;
+            reg [7:0] expb;
+            integer k;
+            got_n = 0;
+            for (k = 0; k < 8; k = k + 1)
+                out_buf[k] = 8'h40 + k;
+            bulk_out_try(7'd42, 8, acked);
+            check(acked, "S5b: bulk OUT ACKed while EP0 stalled");
+            drain_in(7'd42, 8);
+            check(got_n === 8, "S5b: echoed 8 bytes while EP0 stalled");
+            for (k = 0; k < 8; k = k + 1) begin
+                expb = 8'h40 + k;
+                if (got[k] !== expb) begin
+                    errors = errors + 1;
+                    $display("FAIL: S5b: echo[%0d] = %h expected %h",
+                             k, got[k], expb);
+                    k = 8;
+                end
+            end
+        end
 
         $display("--- S5: SET_CONTROL_LINE_STATE (DTR|RTS)");
         req[0] = 8'h21; req[1] = 8'h22; req[2] = 8'h03; req[3] = 8'h00;

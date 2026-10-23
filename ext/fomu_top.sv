@@ -53,10 +53,22 @@ module \top::FomuTop #(
                 por_cnt <= por_cnt + 24'd1;
         end
     end
-    wire core_rst = ~por_done;   // sync, active high
-
     // Attach: pull-up released only after POR (plan §2)
     assign usb_dp_pu = por_done;
+
+    // The core reset is REGISTERED one clk behind por_done: the por_done
+    // flop must sit next to the usb_dp_pu pad (its dominant load), and a
+    // pad-adjacent flop sourcing the core-wide reset forced the placer to
+    // route the reset OUT of the IO region and back into the fabric
+    // (the 4.9 ns first hop of the vir-flow critical path, then a ~6-LUT
+    // chain through the EP0 register reset muxes to resp_pid's clock
+    // enable).  A dedicated flop with no IO load is placed in the core
+    // region instead.  +1 clk of reset assertion at a ~175 ms POR is
+    // free; the core still leaves reset before it can drive the bus
+    // (oe is gated by the in-reset core).
+    reg por_rst = 1'b0;
+    always @(posedge clock) por_rst <= por_done;
+    wire core_rst = ~por_rst;   // sync, active high
 
     // ------------------------------------------------------------------
     // The core.  The byte stream goes straight out to the ports; the
