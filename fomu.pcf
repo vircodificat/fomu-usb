@@ -1,7 +1,10 @@
-# Fomu PoC pin constraints — subset of the platform-emitted
-# build/fomu-usb.pcf, limited to the ports `module Top` (ext/fomu_top.sv)
-# actually declares.  When the real Virdant top replaces the ext mod,
-# this file goes back to being platform-emitted (plan §9).
+# Fomu PoC pin constraints — the full Fomu (PVT) pin set that the
+# platform wrapper `module Top` (build/top.sv, from src/top.vir's
+# `export mod Top for ice40::Fomu`) declares.  The ext core
+# (\top::FomuTop) drives clock + usb_* + led_*; touch*/flash_* are the
+# platform's standard pins (inputs dangling / outputs tied in the
+# wrapper) and must still be constrained or nextpnr errors out.
+# Pin map cross-checked against ~/repos/fomu-workshop/pcf/fomu-pvt.pcf.
 set_io clock F4
 set_io usb_dp A1
 set_io usb_dn A2
@@ -9,4 +12,12 @@ set_io usb_dp_pu A4
 set_io led_red B5
 set_io led_green A5
 set_io led_blue C5
+set_io touch1 E4
+set_io touch2 D5
+set_io touch3 E5
+set_io touch4 F5
+set_io flash_cs C1
+set_io flash_clk D1
+set_io flash_mosi F1
+set_io flash_miso E1
 set_frequency clock 48.0

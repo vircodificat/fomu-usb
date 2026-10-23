@@ -20,7 +20,7 @@
 // POR_CYCLES is overridable so testbenches can shorten power-on.
 `timescale 1ns/1ps
 
-module Top #(
+module \top::FomuTop #(
     parameter [23:0] POR_CYCLES = 24'd8_400_000   // ~175 ms @ 48 MHz
 )(
     input  wire clock,        // 48 MHz board clock (pin F4)

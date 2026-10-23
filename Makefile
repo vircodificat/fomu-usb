@@ -1,9 +1,9 @@
 # Fomu UART-over-USB PoC — build / test / synth flow.
 #
 # HARD RULE (plan §0 rule 5, §6): there is NO upload/flash target in this
-# Makefile and there must never be one.  `vir bitstream`/`vir upload` fail by
-# construction in this repo (the ext-mod Top has no platform `for` clause),
-# and nothing in this file calls any flashing tool.
+# Makefile and there must never be one.  `vir upload` now builds a
+# bitstream (src/top.vir carries the platform export) but flashing/
+# hardware bring-up is the operator's call — nothing here runs it.
 
 VIR      := $(HOME)/.local/virdant/bin/vir
 IVERILOG := iverilog
@@ -26,13 +26,17 @@ TB_SIM_BFM_INC := tb/usb_host_bfm.v
 
 all: build test synth
 
-## build — Virdant-side green check only.  The ext-mod Top emits no Verilog
-## body, so build/top.sv must come out empty (a non-empty file means the
-## port contract in src/top.vir drifted into codegen — fail loudly).
+## build — Virdant-side green check.  src/top.vir now carries a real
+## `export mod Top for ice40::Fomu` (platform wrapper), so vir build
+## emits the wrapper `module Top` (instantiating the ext mod
+## \top::FomuTop) into build/top.sv plus the manifest.  The check is
+## that the wrapper EXISTS — the old "top.sv must stay empty"
+## invariant guarded against the ext mod drifting into codegen and
+## died with the platform export.
 build:
 	$(VIR) build
-	@test ! -s build/top.sv || { \
-	    echo 'FAIL: build/top.sv is not empty — ext mod Top emitted a body'; \
+	@test -s build/top.sv || { \
+	    echo 'FAIL: build/top.sv is empty — no platform wrapper emitted'; \
 	    exit 1; }
 
 ## test — the PoC's primary acceptance: all iverilog testbenches pass.
@@ -53,13 +57,14 @@ test-usb-serial: tools
 	    tb/tb_usb_serial.v
 	$(VVP) build/tb_usb_serial.vvp
 
-## synth — yosys synth_ice40 + nextpnr UP5K at 48 MHz.  Plain tool flow:
-## `vir bitstream` cannot run here (ext-mod Top has no platform) and must
-## not exist as a target.
-synth: tools
+## synth — yosys synth_ice40 + nextpnr UP5K at 48 MHz on the same design
+## `vir upload` would flash: the platform wrapper (build/top.sv) + the
+## ext core + the descriptor/FIFO BRAMs.  Plain tool flow for timing
+## measurement; still NO upload target (see header).
+synth: build tools
 	mkdir -p build
 	set -o pipefail; \
-	$(YOSYS) -p "read_verilog $(USB_SRVS) $(TOP_SV); synth_ice40 -top Top -json build/top.json" \
+	$(YOSYS) -p "read_verilog $(USB_SRVS) $(TOP_SV) build/top.sv; synth_ice40 -top Top -json build/top.json" \
 	    | tee build/yosys.log
 	set -o pipefail; \
 	$(NEXTPNR) --up5k --package uwg30 --json build/top.json \

@@ -2,9 +2,13 @@
 // Part of ~/projects/fomu-usb (see FOMU_UART_OVER_USB_PLANv2.md §7).
 // Hand-written Verilog-2005 for iverilog.
 //
-// Instantiates `module Top` (ext/fomu_top.sv, with sb_io_sim for the
-// pads) on a dp/dn net pair with the BFM, and exercises the plan's
-// acceptance sequence:
+// Instantiates the ext core `\top::FomuTop` directly (ext/fomu_top.sv,
+// with sb_io_sim for the pads): the Virdant platform wrapper (the
+// generated build/top.sv `module Top`, from src/top.vir's
+// `export mod Top for ice40::Fomu`) ties usb_dp_pu/led_* constant and
+// has no POR_CYCLES parameter, so the full-device acceptance runs
+// against the ext core, not the wrapper — on a dp/dn net pair with
+// the BFM, exercising the plan's acceptance sequence:
 //   1. reset; wait for usb_dp_pu (connect)
 //   2. enumerate (device descriptor, SET_ADDRESS(42), config descriptor,
 //      strings, SET_CONFIGURATION(1))
@@ -34,7 +38,7 @@ module tb_usb_serial;
     // DUT (short POR for sim; hardware default is ~175 ms)
     // ------------------------------------------------------------------
     wire usb_dp_pu, led_r, led_g, led_b;
-    Top #(.POR_CYCLES(24'd200)) dut(
+    \top::FomuTop #(.POR_CYCLES(24'd200)) dut(
         .clock(clk),
         .usb_dp(usb_dp), .usb_dn(usb_dn),
         .usb_dp_pu(usb_dp_pu),
