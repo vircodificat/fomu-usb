@@ -170,13 +170,22 @@ endmodule
 // ===========================================================================
 // usb_rx_phy — pad -> unstuffed decoded bit stream + packet/reset flags.
 //
-// 4x oversampling clock recovery: a 2-bit phase counter re-aligns to 0 on
-// ANY dp/dn transition; bits are sampled mid-bit (phase==2).  NRZI: same
-// level as the previous bit sample -> 1, change -> 0.  Bit unstuffing: the
-// bit after six consecutive decoded 1s is dropped (a stuffed 0); a 1 there
-// is a violation.  EOP = SE0 held >= 2 bit times (8 clks).  Bus reset =
-// SE0 held >= 2.5 us (120 clks @ 48 MHz; USB 2.0 §7.1.7.5).  SE1 is an
-// error: the packet is flagged bad and abandoned.
+// 4x oversampling clock recovery: a sample timer is re-armed to fire 2 clks
+// after EVERY dp/dn transition visible in the synchronized sample stage,
+// then re-fires every 4 clks until the next transition (runs of 1s).  The
+// capture lands 2-3 clks after the transition reaches sdp -- safely inside
+// the bit's visibility window for EVERY achievable quantized window width
+// (3, 4 or 5 clks: the wire bit period is 4.000 clks nominal, but each
+// transition is asynchronous to the 48 MHz clock, so ceil()-quantization
+// plus the host's ±0.25% rate tolerance makes consecutive sdp switch gaps
+// vary; a free-running fixed-phase sampler loses/duplicates a bit each
+// time the gap is 3).  NRZI: same level as the previous bit sample -> 1,
+// change -> 0.  Bit unstuffing: the bit after six consecutive decoded 1s
+// is dropped (a stuffed 0); a 1 there is a violation.  EOP = SE0 held
+// >= 7 clks (~1.75 bit times; a spec-fast host's 2-bit EOP is 7.98 clks
+// and can present only 7 samplable cycles).  Bus reset = SE0 held >= 2.5 us
+// (120 clks @ 48 MHz; USB 2.0 §7.1.7.5).  SE1 is an error: the packet is
+// flagged bad and abandoned.
 // J = (dp=1,dn=0), K = (dp=0,dn=1), idle = J (D+ pull-up).
 // ===========================================================================
 module usb_rx_phy(
@@ -261,10 +270,13 @@ module usb_rx_phy(
                     perr <= 1'b1;
                     act  <= 1'b0;
                 end else if (se0) begin
-                    // SE0: EOP after >= 2 bit times (8 clks) — stay armed
+                    // SE0: EOP after ~1.75 bit times (7 clks) — stay armed
                     // until then (act drops WITH the eop pulse); bus reset
-                    // is detected by the standalone SE0 timer below.
-                    if (se0_cnt == 7'd7) begin
+                    // is detected by the standalone SE0 timer below.  A
+                    // spec-fast host's 2-bit EOP is 7.98 clks, which can
+                    // present only 7 samplable cycles, so 8 would miss it
+                    // and leave `act` stuck high (PHY deaf until reset).
+                    if (se0_cnt == 7'd6) begin
                         eop_r <= 1'b1;
                         act <= 1'b0;
                     end
@@ -274,8 +286,20 @@ module usb_rx_phy(
                         ph <= 2'd0;      // clock recovery: re-align on edge
                     else
                         ph <= ph + 2'd1;
-                    if (ph == 2'd2) begin
-                        // mid-bit sample: NRZI decode + unstuff
+                    if (ph == 2'd1) begin
+                        // sample: NRZI decode + unstuff.  The realign makes
+                        // the counter read 0 one clk after the transition
+                        // reaches sdp, so phase 1 captures sdp 2-3 clks after
+                        // the switch -- inside the bit's visibility window
+                        // for EVERY achievable quantized window width (3, 4
+                        // or 5 clks: each transition is asynchronous to the
+                        // 48 MHz clock, so ceil()-quantization plus the
+                        // host's ±0.25% rate tolerance varies the gap; the
+                        // old phase-2 capture landed in the window's LAST
+                        // cycle and a 3-clk window lost/duplicated a bit).
+                        // The re-align at every switch also guarantees one
+                        // sample per bit window for run windows of any
+                        // length (4n-1/4n/4n+1 clks all yield n captures).
                         lev_d <= sdp;
                         lev_n <= sdn;
                         bit_r <= bit_val;
