@@ -19,12 +19,15 @@ State as of the end of this working session. Read together with
   unwired (wrapper tied it low = hardware-dead image); it — and the
   heartbeat LEDs — are now wired through the export (verified in
   build/top.sv).  No P0 hardware flag remains.
-- **M6 (timing)**: dt_data payload off the fabric, registered shared
-  qualify, and (latest) the registered EP0 data strobe — tests all
-  green; **still short of 48 MHz but close**: wrapper (vir-equivalent
-  flow, abc9) band 40.3–**45.84**, default seed 44.79 (user's failing
-  run: 39.96).  Next target = the rx reset/clear distribution chain
-  (below).
+- **M6 CLOSED: `vir bitstream` succeeds end-to-end** (yosys OK /
+  nextpnr-ice40 OK / bitstream written) — vir's exact nextpnr
+  invocation (default seed, PCF set_frequency, NO --freq) reports
+  **48.06 MHz PASS**; 1583 LC (29%), 4 BRAM.  All three testbenches
+  green.  `vir upload` will build and (operator's call) flash.
+  NOTE: vir's flow constrains timing via the PCF only — the --freq
+  flag feeds nextpnr's timing-driven placer and vir does NOT pass it,
+  so "seed 1 passes with --freq" does NOT imply vir passes; measure
+  with vir's exact command (see M6).
 
 ## Hard rules (from plan §0 — still binding)
 
@@ -177,26 +180,48 @@ store; (6) registered token router; (7) **dt_data → dt_ram (BRAM) +
 dt_head (this session)** — killed the `vir upload` critical path
 (bc → carry chain → 64-way byte-enable decode → 512 flops, 25 ns).
 
-### Remaining critical path (next round's target)
+### M6 closing history (final round)
 
-Round A (registered EP0 data strobe, `ep0_dt_valid_r`, +1 clk) removed
-the EP0 data-accept cone.  The remaining tail is the **rx reset/clear
-distribution chain** — the same disease the FIFO CE fix cured, now on
-control terms: `por_done → br_r (bus_reset) → sop_r → tk_valid
-reset-mux → tok_cap → dat_cap → hs_cap → hs_pid CEN`, ~21.8 ns
-(7.1 logic / 14.7 routing): `bus_reset` and `sop` clear-muxes fan
-into every rxpkt register, chaining shared LUTs from the PHY side into
-the handshake-capture enable.  Candidate fix (same free +1 clk trick):
-register the token/handshake capture one clk AFTER EOP (the router
-consumes hs_valid/tk_* within the ~30–50 clk turnaround window), or
-pipeline `bus_reset` into rxpkt as a registered local reset.  Beyond
-that: relaxed `--freq` (user sign-off, plan deviation).
+After Round A the whack-a-mole continued; each fix re-verified with
+make test.  The closing sequence (vir-flow Fmax at its default seed in
+parentheses): flattened rxpkt output strobes (the if/else-if priority
+tree was SHARED by abc9 across tk/dt/hs_valid D-cones AND the captured
+fields' clock enables — hs_pid's enable was literally hs_valid's D
+cone; the caps are mutually exclusive so the priority was redundant);
+registered bc_is_66_r + per-cause hit pulses (pid_bad_r/bc66_hit_r) +
+flat-D sticky `bad` (its clock-enable cone ingested the bc==66 compare
+via the carry chain) + pre-registered CRC residual compares; EP0
+data-stage accepts registered (req_acc_r/rcd_acc_r/sto_acc_r); STALL
+response registered; FULL token strobes registered (pid/endp decode was
+still combinational off tok_v_r); tx-engine (s < total_bits_r) compare
+registered one cycle ahead (s changes only at btc==3 edges — exact);
+descriptor remain min() precomputed in EP_SETUP with a shrunk 7-bit
+compare (desc_len <= 75 < 128).  A flat priority-mux rewrite of
+resp_pid/resp_len was tried and REVERTED — measured regression (the
+wide mux became a new abc9 sharing hub); their per-branch-constant
+clock enables are deliberately kept.
 
-Round A numbers (8-seed grid, --freq 48): wrapper default 44.79
-(was 41.51); wrapper+abc9 40.30/42.28/44.73/45.84; ext core
-38.75–43.40 median 41.69 (before: 40.25–43.88 median 42.40 —
-statistically flat: the EP0 cone was co-critical with the reset chain,
-which Round A does not touch).
+KEY FLOW FACTS (cost real debugging time — do not re-derive):
+- **vir build does NOT copy ext/*.sv into build/**, but vir's generated
+  script.ys reads build/usb_uart.sv + build/fomu_top.sv.  The manual
+  copies went STALE once — `vir upload` then synthesized OLD RTL (the
+  first upload run showed the pre-BRAM dt_data design).  `make build`
+  now refreshes the copies; ALWAYS `make build` before vir
+  bitstream/upload.
+- **vir does NOT pass --freq to nextpnr** (flags: --up5k --top --json
+  --pcf --asc --package); timing comes from the PCF `set_frequency`.
+  --freq additionally feeds nextpnr's TIMING-DRIVEN PLACER, so
+  seed-1-passes-with---freq does NOT imply vir passes: measure with
+  vir's exact command.  The passing margin is thin (48.06 @ 48.00);
+  other seeds land 44.7–47.9, so do not change the flow or netlist
+  without re-running vir bitstream.
+- Replicate vir's flow exactly: `make build && yosys -s
+  build/script.ys && nextpnr-ice40 --up5k --top Top --json
+  build/fomu-usb.json --pcf build/fomu-usb.pcf --asc <path>
+  --package uwg30` (no --freq, no --seed).
+- -noabc9 is much worse (36.5–39.2): abc9 is load-bearing.
+- vir swallows nextpnr's stdout on SUCCESS — grep the frequency from a
+  manual re-run, not from vir's log.
 
 ## Bugs found and fixed (don't re-derive these)
 
@@ -220,9 +245,10 @@ TB drain accumulator reset; iverilog gotchas (task array ports,
 
 ## Loose ends
 
-- M6 decision: `--freq 48` still fails (wrapper abc9 band 40.3–45.84).
-  Next round = the rx reset/clear distribution chain (above), then
-  relaxed `--freq` needs user sign-off.
+- M6 is CLOSED for vir's flow (see above) but the margin is thin
+  (48.06/48.00 at the default seed; other seeds 44.7–47.9).  If a
+  future RTL change shifts placement, re-run `vir bitstream` — do not
+  assume.  Seed sweeps with `--freq` are NOT equivalent (see flow facts).
 - `FOMU_UART_OVER_USB_PLANv2.md` §2/§4/§9 predate: EP2/IAD/EF-class,
   rx-FIFO BRAM depth, the 4-stage EP0 pipeline, the platform export
   (§9 said the ext Top "dies" when the wrapper lands — it half-did).

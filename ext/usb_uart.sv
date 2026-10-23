@@ -385,6 +385,20 @@ module usb_rx_packet(
     // least 2 bytes total, and one more byte would still fit the
     // 64-byte payload RAM) — keeps the 7-bit compares out of dat_cap's cone
     reg        dat_bc_ok_r;
+    // registered helpers (see the always blocks below): bc_is_66_r
+    // decouples the (bc == 66) compare from the bc+1 carry chain (the
+    // compare shared the adder's carry LUTs, chaining bc's D-cone into
+    // dat_bc_ok_r's D and bad's enable cones — the critical path);
+    // pid_bad_r / bc66_hit_r are registered per-cause error hits so the
+    // sticky `bad` flag's D is a 3-input OR of REGISTERS (no clock
+    // enable: an E-gated bad ingested the same compare tree); the CRC
+    // residual compares are registered so the 16-bit equality tree ends
+    // at its own register instead of riding dt_crc_ok's D-cone.
+    reg        bc_is_66_r;
+    reg        pid_bad_r;
+    reg        bc66_hit_r;
+    reg        crc5_res_r;
+    reg        crc16_res_r;
 
     wire [4:0]  c5;
     wire [15:0] c16;
@@ -405,6 +419,45 @@ module usb_rx_packet(
         .adv(bit_valid && (st == ST_BODY) && sec),
         .din(bit_i),
         .crc(c16));
+
+    // registered helpers: shallow independent cones, each ending at its
+    // OWN register (see the declaration comment).  crc*_res_r are
+    // computed every cycle — the residual is only SAMPLED at EOP (when
+    // the LFSR has consumed the whole packet), so mid-packet values are
+    // harmless.  bc_is_66_r is read one clk after bc reaches 66; bc
+    // holds between byte completes, so the delay is exact.
+    always @(posedge clk) begin
+        if (rst || bus_reset) begin
+            bc_is_66_r  <= 1'b0;
+            pid_bad_r   <= 1'b0;
+            bc66_hit_r  <= 1'b0;
+            crc5_res_r  <= 1'b0;
+            crc16_res_r <= 1'b0;
+        end else begin
+            bc_is_66_r  <= (bc[6:3] == 4'b0100) && (bc[2:0] == 3'b010);
+            pid_bad_r   <= bit_valid && (st == ST_BODY) && !sec
+                           && (nb == 5'd7)
+                           && (pid_new[3:0] != ~pid_new[7:4]);
+            bc66_hit_r  <= bit_valid && (st == ST_BODY) && sec
+                           && (n3 == 3'd7) && (bc == 7'd66);
+            crc5_res_r  <= (c5 == 5'h0C);
+            crc16_res_r <= (c16 == 16'h800D);
+        end
+    end
+
+    // bad: FLAT sticky error — plain D, no clock enable (see the decl
+    // comment).  The +1 clk on the set (hits are registered) is covered
+    // by the documented redundancy: q_pid_r/q_dat_r re-check pkt_err
+    // inline, hs_cap re-checks the PID inline, and dat_bc_ok_r gates
+    // the overflow via bc_is_66_r.
+    always @(posedge clk) begin
+        if (rst || bus_reset)
+            bad <= 1'b0;
+        else
+            bad <= sop ? 1'b0
+                 : (bad || (bit_valid && pkt_err)
+                        || pid_bad_r || bc66_hit_r);
+    end
 
     // PID capture value on this cycle
     wire [7:0] pid_new = {bit_i, pid_r[7:1]};
@@ -467,7 +520,6 @@ module usb_rx_packet(
             tk_sh   <= 11'd0;
             bshift  <= 8'd0;
             bc      <= 7'd0;
-            bad     <= 1'b0;
             sec     <= 1'b0;
             tok_cap <= 1'b0;
             sof_cap <= 1'b0;
@@ -476,13 +528,7 @@ module usb_rx_packet(
             dat_bc_ok_r <= 1'b0;
             q_pid_r <= 1'b0;
             q_dat_r <= 1'b0;
-            tk_valid <= 1'b0;
-            dt_valid <= 1'b0;
-            hs_valid <= 1'b0;
         end else begin
-            tk_valid <= 1'b0;
-            dt_valid <= 1'b0;
-            hs_valid <= 1'b0;
 
             if (sop) begin
                 st     <= ST_SYNC;
@@ -492,7 +538,6 @@ module usb_rx_packet(
                 tk_sh  <= 11'd0;
                 bshift <= 8'd0;
                 bc     <= 7'd0;
-                bad    <= 1'b0;
                 sec    <= 1'b0;
                 tok_cap <= 1'b0;
                 sof_cap <= 1'b0;
@@ -502,34 +547,9 @@ module usb_rx_packet(
                 q_dat_r <= 1'b0;
             end else if (eop) begin
                 // capture decision: precomputed at the last bit clk
-                // (tok_cap & friends) — 2-input gates here, not the
-                // bit-counting tree
-                if (tok_cap) begin
-                    // token: exactly 24 bits after the sync
-                    tk_valid  <= 1'b1;
-                    tk_pid    <= pid_r[3:0];
-                    tk_crc_ok <= (c5 == 5'h0C);
-                    if (sof_cap) begin
-                        // SOF: 11-bit frame number
-                        tk_frame <= tk_sh;
-                    end else begin
-                        // token bits b8..b18 land at tk_sh[0..10]
-                        // (shift-up capture): addr = tk_sh[6:0],
-                        // endp = tk_sh[10:7]
-                        tk_addr <= tk_sh[6:0];
-                        tk_endp <= tk_sh[10:7];
-                    end
-                end else if (dat_cap) begin
-                    // data: n = payload bits + 16 crc bits
-                    dt_valid  <= 1'b1;
-                    dt_pid    <= pid_r[3:0];
-                    dt_len    <= (bc >= 7'd2) ? (bc - 7'd2) : 7'd0;
-                    dt_crc_ok <= (c16 == 16'h800D);
-                end else if (hs_cap) begin
-                    // handshake: nothing after the PID byte
-                    hs_valid <= 1'b1;
-                    hs_pid   <= pid_r[3:0];
-                end
+                // (tok_cap & friends).  The strobes + captured fields
+                // live in the FLAT always block below — this branch
+                // only retires the FSM state and clears the caps.
                 st <= ST_IDLE;
                 tok_cap <= 1'b0;
                 sof_cap <= 1'b0;
@@ -560,10 +580,8 @@ module usb_rx_packet(
                            && (pid_new[3:0] == ~pid_new[7:4]);
                 dat_cap <= q_dat_r && !pkt_err
                            && (n3 == 3'd7) && dat_bc_ok_r;
-                dat_bc_ok_r <= (bc != 7'd0) && (bc != 7'd66);
-                if (pkt_err) begin
-                    bad <= 1'b1;
-                end else begin
+                dat_bc_ok_r <= (bc != 7'd0) && !bc_is_66_r;
+                if (!pkt_err) begin
                     case (st)
                     ST_IDLE: ;
                     ST_SYNC: begin
@@ -589,8 +607,8 @@ module usb_rx_packet(
                             if ((nb >= 5'd8) && (nb <= 5'd18))
                                 tk_sh <= {bit_i, tk_sh[10:1]};
                             if (nb == 5'd7) begin
-                                if (pid_new[3:0] != ~pid_new[7:4])
-                                    bad <= 1'b1;
+                                // PID check failure is registered upstream
+                                // (pid_bad_r -> bad, +1 clk)
                                 if (pid_new[1:0] == 2'b11) begin
                                     sec <= 1'b1;    // data section
                                     n3  <= 3'd0;
@@ -614,14 +632,78 @@ module usb_rx_packet(
                             bshift <= {bit_i, bshift[7:1]};
                             if (n3 == 3'd7) begin
                                 // byte complete (the store strobe is
-                                // dt_wr, in the storage block above)
+                                // dt_wr, in the storage block above;
+                                // the >64-byte overflow is registered
+                                // upstream: bc66_hit_r -> bad)
                                 bc <= bc + 7'd1;
-                                if (bc == 7'd66)
-                                    bad <= 1'b1;   // > 64 payload bytes
                             end
                         end
                     end
                     endcase
+                end
+            end
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // Output strobes + captured fields — FLAT equations, own always
+    // block.  These used to live inside the FSM's if/else-if chain
+    // above; synthesis then shared the priority-mux tree across
+    // tk_valid/dt_valid/hs_valid's D-cones AND the captured fields'
+    // clock enables (hs_pid's enable was literally the same LUTs as
+    // hs_valid's D), chaining sop/eop/reset terms LUT-to-LUT from the
+    // PHY into hs_pid's enable — the 23 ns critical path.  The caps are
+    // MUTUALLY EXCLUSIVE by construction (tok: nb==23 in the PID
+    // section; hs: nb==7 in the PID section; dat: data section), so the
+    // else-if priority was redundant: each strobe is now one 2-input
+    // AND of registers, and each capture enable is eop AND its cap.
+    // Reading the caps AT the eop edge is safe (same edge clears them;
+    // nonblocking semantics see the pre-edge values).
+    // ------------------------------------------------------------------
+    always @(posedge clk) begin
+        if (rst || bus_reset) begin
+            tk_valid  <= 1'b0;
+            dt_valid  <= 1'b0;
+            hs_valid  <= 1'b0;
+            tk_pid    <= 4'h0;
+            tk_addr   <= 7'h0;
+            tk_endp   <= 4'h0;
+            tk_frame  <= 11'h0;
+            tk_crc_ok <= 1'b0;
+            dt_pid    <= 4'h0;
+            dt_len    <= 7'h0;
+            dt_crc_ok <= 1'b0;
+            hs_pid    <= 4'h0;
+        end else begin
+            tk_valid <= eop && tok_cap;
+            dt_valid <= eop && dat_cap;
+            hs_valid <= eop && hs_cap;
+
+            if (eop) begin
+                if (tok_cap) begin
+                    tk_pid    <= pid_r[3:0];
+                    tk_crc_ok <= crc5_res_r;
+                end
+                if (tok_cap && sof_cap) begin
+                    // SOF: 11-bit frame number
+                    tk_frame <= tk_sh;
+                end
+                if (tok_cap && !sof_cap) begin
+                    // token bits b8..b18 land at tk_sh[0..10]
+                    // (shift-up capture): addr = tk_sh[6:0],
+                    // endp = tk_sh[10:7]
+                    tk_addr <= tk_sh[6:0];
+                    tk_endp <= tk_sh[10:7];
+                end
+                if (dat_cap) begin
+                    // data: bc = payload bits + 16 crc bits
+                    dt_pid    <= pid_r[3:0];
+                    dt_len    <= (bc >= 7'd2) ? (bc - 7'd2) : 7'd0;
+                    dt_crc_ok <= crc16_res_r;
+                end
+                if (hs_cap) begin
+                    // handshake: nothing after the PID byte
+                    hs_pid <= pid_r[3:0];
                 end
             end
         end
@@ -684,6 +766,13 @@ module usb_tx_phy(
     // {3'b0, len_r, 3'b0} adder would otherwise sit inside the
     // raw-bit comparison path)
     reg [9:0] payload_end_r, total_bits_r;
+    // (s < total_bits_r) REGISTERED one cycle ahead: the 10-bit compare
+    // is a carry chain, and it fed cur_stuff's D-cone every bit time
+    // (the tx-engine critical path).  s changes only at btc==3 edges, so
+    // the flag captured at the previous cycle is exact at the decision
+    // edge — +0 clk latency, the compare cone now ends at its own
+    // register.
+    reg       s_lt_end_r;
 
     // producer byte pipeline: tx_addr leads the engine's read by one
     // bit time (s advances at the btc==3 edge, the byte is stable for
@@ -775,8 +864,10 @@ module usb_tx_phy(
             cur_stuff <= 1'b0;
             oe_r <= 1'b0;
             done_r <= 1'b0;
+            s_lt_end_r <= 1'b0;
         end else begin
             done_r <= 1'b0;
+            s_lt_end_r <= (s < total_bits_r);
 
             case (state)
             S_IDLE: begin
@@ -817,8 +908,9 @@ module usb_tx_phy(
                         stuff_pending <= 1'b0;
                         ones <= 3'd0;
                         cur_stuff <= 1'b1;
-                    end else if (s < total_bits_r) begin
-                        // raw bit time s
+                    end else if (s_lt_end_r) begin
+                        // raw bit time s (flag registered 1 clk ahead —
+                        // exact, see the declaration comment)
                         lvl <= raw_bit_r ? lvl : ~lvl;
                         if (s == 10'd8)
                             ones <= 3'd0;    // run counter fresh at the PID
@@ -883,6 +975,14 @@ endmodule
 //   registered)  ->  EP_SETUP route flags into the one-hot p_action
 //   ->  EP_ARM apply p_action (datapath + state).  The request case
 //   tree never reaches a datapath register enable combinationally.
+// Data-stage accepts are REGISTERED (req_acc_r / rcd_acc_r /
+// sto_acc_r, one clk after the router's data strobe): the three
+// accept condition trees otherwise all feed st's next-state mux
+// directly, making it a 3-level LUT cone (the critical path).  The
+// FSM reacts to the registered accepts one clk later; every field
+// they read (dt_head/dt_pid/dt_len/dt_crc_ok) holds between packets,
+// so the delayed reaction is bit-identical (+1 clk is free: the
+// turnaround budget is ~30-50 clks).
 // ===========================================================================
 module usb_ep0(
     input  wire         clk,
@@ -953,6 +1053,12 @@ module usb_ep0(
     // applies it with shallow decodes only, so the request routing never
     // reaches datapath register enables combinationally)
     reg [2:0]  p_action;    // 0 STALL 1 STATUS_I 2 GET_STATUS 3 RCV_DATA
+    // descriptor data-stage length, min(wLength, desc_len) PRECOMPUTED in
+    // EP_SETUP: the 15-bit compare against desc_len(p_sel) was a full
+    // carry chain ending at remain's clock enable (the vir-flow critical
+    // path).  desc_len <= 75 < 128, so the compare only needs the low
+    // bits: wLength >= 128 ⇒ the descriptor length wins outright.
+    reg [6:0]  p_dremain_r;
                            // 4 SEND_LC 5 SEND_DESC
     reg        p_wlen0;     // request wLength == 0
     reg        p_desc_in;   // GET_DESCRIPTOR direction (rq0[7])
@@ -966,6 +1072,15 @@ module usb_ep0(
     // accept compare tree (that cone rode a global clock-enable buffer
     // and was the critical path)
     reg        lc_cap_r;
+    // registered data-stage accepts (see the header comment): each is
+    // an independent shallow cone (state decode + packet-field
+    // compares) that lands on its OWN register — st's next-state then
+    // keys off one clean registered bit instead of three condition
+    // trees
+    reg        req_acc_r;   // SETUP request packet accepted
+    reg        rcd_acc_r;   // OUT data-stage packet accepted
+    reg        sto_acc_r;   // status-stage ZLP accepted
+    reg        stall_resp_r;  // STALL handshake response due (+1 clk)
 
     reg [3:0] st;
     reg       tog;                   // 1 => next device data pid = DATA1
@@ -1036,16 +1151,15 @@ module usb_ep0(
 
     // SET_LINE_CODING data capture: a REGISTERED pulse one clk after the
     // accepted OUT data packet (dt_head is stable by then; recv_cnt/rq1
-    // are sampled at the same edge as the accept compare), so the 56
-    // line_coding byte clock enables see one REGISTER, not the accept
-    // compare tree.
+    // are sampled at the same edge as the FSM's rcd_acc_r reaction —
+    // pre-update values), so the 56 line_coding byte clock enables see
+    // one REGISTER, not the accept compare tree.
     always @(posedge clk) begin
         if (rst || bus_reset) begin
             lc_cap_r     <= 1'b0;
         end else begin
-            lc_cap_r     <= (st == EP_RCV_DATA) && dt_valid && dt_crc_ok
-                           && (dt_pid == (tog ? PID_DATA1 : PID_DATA0))
-                           && (recv_cnt == 7'd0) && (rq1 == 8'h20);
+            lc_cap_r     <= rcd_acc_r && (recv_cnt == 7'd0)
+                           && (rq1 == 8'h20);
             if (lc_cap_r) begin
                 // SET_LINE_CODING: store all 7 bytes (all in the head
                 // window)
@@ -1057,6 +1171,40 @@ module usb_ep0(
                 line_coding[5*8 +: 8] <= dt_head[5*8 +: 8];
                 line_coding[6*8 +: 8] <= dt_head[6*8 +: 8];
             end
+        end
+    end
+
+    // registered data-stage accepts: independent shallow cones, one
+    // register each (see the header comment)
+    // NOTE: resp_pid/resp_len deliberately KEEP their clock enables
+    // (per-branch constant D values).  A flat priority mux into their D
+    // was tried and was a measured REGRESSION (vir-flow band 47.9-48.7
+    // -> 44.2-46.0): the wide mux cone became a new abc9 sharing hub.
+    // Their enable terms are all registered strobes, which is what
+    // keeps the cones shallow.
+    always @(posedge clk) begin
+        if (rst || bus_reset) begin
+            req_acc_r <= 1'b0;
+            rcd_acc_r <= 1'b0;
+            sto_acc_r <= 1'b0;
+            stall_resp_r <= 1'b0;
+        end else begin
+            req_acc_r <= (st == EP_RCV_REQ) && dt_valid
+                         && (dt_pid == PID_DATA0) && dt_crc_ok
+                         && (dt_len == 7'd8);
+            rcd_acc_r <= (st == EP_RCV_DATA) && dt_valid && dt_crc_ok
+                         && (dt_pid == (tog ? PID_DATA1 : PID_DATA0));
+            sto_acc_r <= (st == EP_STATUS_O) && dt_valid
+                         && (dt_len == 7'd0) && dt_crc_ok;
+            // the STALL response is the ONLY resp_* branch still keyed
+            // on the raw token decode (tk_pid/tk_endp compares) — every
+            // other branch keys off a registered strobe.  Left
+            // unregistered it dragged the token-decode chain into
+            // resp_pid's clock-enable cone (the last 21+ ns path).
+            // SETUP preempts via the pre-case branch (different pid, so
+            // the two can never fire together); a token at cycle t gets
+            // its STALL at t+2, well inside the turnaround budget.
+            stall_resp_r <= (st == EP_STALL) && (tk_in || tk_out);
         end
     end
 
@@ -1102,8 +1250,7 @@ module usb_ep0(
                     // one clk later from the registered bytes (the whole
                     // request-decode tree from dt_head is too long for
                     // one 48 MHz cycle)
-                    if (dt_valid && (dt_pid == PID_DATA0) && dt_crc_ok
-                            && (dt_len == 7'd8)) begin
+                    if (req_acc_r) begin
                         rq0 <= dt_head[0*8 +: 8];
                         rq1 <= dt_head[1*8 +: 8];
                         rq2 <= dt_head[2*8 +: 8];
@@ -1160,6 +1307,9 @@ module usb_ep0(
                     // the tree out of every other register's cone.
                     p_wlen0   <= (w_length == 16'd0);
                     p_desc_in <= rq0[7];
+                    p_dremain_r <= (|p_wlen[14:7]) ? desc_len(p_sel)
+                                 : ((p_wlen[6:0] < desc_len(p_sel))
+                                    ? p_wlen[6:0] : desc_len(p_sel));
                     p_action  <= (!p_valid) ? 3'd0
                                : (p_is_set_addr || p_is_set_cfg || p_is_cls
                                   || ((p_is_set_lc || p_is_get_lc)
@@ -1208,9 +1358,7 @@ module usb_ep0(
                         end else begin
                             st  <= EP_SEND;
                             base <= 10'd0;
-                            remain <= (p_wlen[14:0]
-                                        < {8'd0, desc_len(p_sel)})
-                                     ? p_wlen[6:0] : desc_len(p_sel);
+                            remain <= p_dremain_r;   // precomputed in EP_SETUP
                         end
                     end
                     default: st <= EP_STALL;    // 3'd0: unsupported
@@ -1258,9 +1406,9 @@ module usb_ep0(
                 EP_RCV_DATA: begin
                     // host->device data stage: DATA packets after OUT.
                     // The line_coding byte store lives in its own
-                    // always block above (lc_cap_r, +1 clk).
-                    if (dt_valid && dt_crc_ok
-                            && (dt_pid == (tog ? PID_DATA1 : PID_DATA0))) begin
+                    // always block above (lc_cap_r).  Reacts to the
+                    // REGISTERED accept one clk after arrival.
+                    if (rcd_acc_r) begin
                         resp_req <= 1'b1;             // ACK the data
                         resp_pid <= PID_ACK;
                         resp_len <= 7'd0;
@@ -1289,7 +1437,9 @@ module usb_ep0(
                     // status stage (control read): host OUT + DATA1 ZLP;
                     // ACK it and complete.  Lenient on the data pid
                     // (hosts sending DATA0 here are accepted).
-                    if (dt_valid && (dt_len == 7'd0) && dt_crc_ok) begin
+                    // Reacts to the REGISTERED accept one clk after
+                    // arrival.
+                    if (sto_acc_r) begin
                         resp_req <= 1'b1;
                         resp_pid <= PID_ACK;
                         resp_len <= 7'd0;
@@ -1301,7 +1451,8 @@ module usb_ep0(
                     end
                 end
                 EP_STALL: begin
-                    if (tk_in || tk_out) begin
+                    // reacts to the REGISTERED token decode (+1 clk)
+                    if (stall_resp_r) begin
                         resp_req <= 1'b1;
                         resp_pid <= PID_STALL;
                         resp_len <= 7'd0;
@@ -1625,13 +1776,43 @@ module usb_uart(
         else
             tok_v_r <= tk_valid && tk_crc_ok && (tk_addr == dev_addr);
     end
-    wire ep0_tk_setup = tok_v_r && (tk_pid == PID_SETUP) && (tk_endp == 4'd0);
-    wire ep0_tk_in    = tok_v_r && (tk_pid == PID_IN)    && (tk_endp == 4'd0);
-    wire ep0_tk_out   = tok_v_r && (tk_pid == PID_OUT)   && (tk_endp == 4'd0);
-    wire ser_tk_in    = tok_v_r && (tk_pid == PID_IN)    && (tk_endp == 4'd1);
-    wire ser_tk_out   = tok_v_r && (tk_pid == PID_OUT)   && (tk_endp == 4'd1);
-    wire ep2_tk_in    = tok_v_r && (tk_pid == PID_IN)    && (tk_endp == 4'd2);
-    wire ep2_tk_out   = tok_v_r && (tk_pid == PID_OUT)   && (tk_endp == 4'd2);
+    // The FULL token strobes are REGISTERED (+1 clk on top of tok_v_r):
+    // the pid/endp decode otherwise stays combinational off tok_v_r and
+    // every consumer's register-enable cone ingests it (tk_pid -> decode
+    // -> resp_*/pkt_len CEN was the last long path family).  tk_pid/
+    // tk_endp hold their values between packets, so decoding them one
+    // clk later is exact; the +1 clk on token strobes is free (turnaround
+    // budget ~30-50 clks; inter-packet gap >= 2 bit times = 8 clks, so
+    // no subsequent packet can outrun the delayed strobe).
+    reg ep0_tk_setup_r, ep0_tk_in_r, ep0_tk_out_r;
+    reg ser_tk_in_r,  ser_tk_out_r;
+    reg ep2_tk_in_r,  ep2_tk_out_r;
+    always @(posedge clk) begin
+        if (rst || bus_reset) begin
+            ep0_tk_setup_r <= 1'b0;
+            ep0_tk_in_r    <= 1'b0;
+            ep0_tk_out_r   <= 1'b0;
+            ser_tk_in_r    <= 1'b0;
+            ser_tk_out_r   <= 1'b0;
+            ep2_tk_in_r    <= 1'b0;
+            ep2_tk_out_r   <= 1'b0;
+        end else begin
+            ep0_tk_setup_r <= tok_v_r && (tk_pid == PID_SETUP) && (tk_endp == 4'd0);
+            ep0_tk_in_r    <= tok_v_r && (tk_pid == PID_IN)    && (tk_endp == 4'd0);
+            ep0_tk_out_r   <= tok_v_r && (tk_pid == PID_OUT)   && (tk_endp == 4'd0);
+            ser_tk_in_r    <= tok_v_r && (tk_pid == PID_IN)    && (tk_endp == 4'd1);
+            ser_tk_out_r   <= tok_v_r && (tk_pid == PID_OUT)   && (tk_endp == 4'd1);
+            ep2_tk_in_r    <= tok_v_r && (tk_pid == PID_IN)    && (tk_endp == 4'd2);
+            ep2_tk_out_r   <= tok_v_r && (tk_pid == PID_OUT)   && (tk_endp == 4'd2);
+        end
+    end
+    wire ep0_tk_setup = ep0_tk_setup_r;
+    wire ep0_tk_in    = ep0_tk_in_r;
+    wire ep0_tk_out   = ep0_tk_out_r;
+    wire ser_tk_in    = ser_tk_in_r;
+    wire ser_tk_out   = ser_tk_out_r;
+    wire ep2_tk_in    = ep2_tk_in_r;
+    wire ep2_tk_out   = ep2_tk_out_r;
 
     // data packet router: the module expecting a data packet owns it.
     // EP0's strobe is REGISTERED one clk after arrival: the rxpkt EOP
@@ -1671,7 +1852,7 @@ module usb_uart(
     reg ep2_nak_req;
     always @(posedge clk)
         if (rst)        ep2_nak_req <= 1'b0;
-        else            ep2_nak_req <= ep2_tk_in || ep2_tk_out;
+        else            ep2_nak_req <= ep2_tk_in_r || ep2_tk_out_r;
     wire tx_start = ep0_resp_req || ser_resp_req || ep2_nak_req;
 
     reg [1:0] tx_owner;   // 0 none, 1 ep0, 2 serial, 3 ep2

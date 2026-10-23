@@ -1,0 +1,12 @@
+Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+Bus 001 Device 003: ID 27c6:609c Shenzhen Goodix Technology Co.,Ltd. Goodix Fingerprint USB Device
+Bus 002 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
+Bus 003 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+Bus 003 Device 006: ID 32ac:001c Framework Laptop Webcam Module (2nd Gen)
+Bus 003 Device 007: ID 0e8d:0717 MediaTek Inc. Wireless_Device
+Bus 003 Device 044: ID 1209:5bf0 Generic Fomu PVT running DFU Bootloader v2.0.3
+Bus 004 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
+Bus 005 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+Bus 006 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
+Bus 007 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+Bus 008 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
