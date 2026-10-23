@@ -1,0 +1,12 @@
+# Fomu PoC pin constraints — subset of the platform-emitted
+# build/fomu-usb.pcf, limited to the ports `module Top` (ext/fomu_top.sv)
+# actually declares.  When the real Virdant top replaces the ext mod,
+# this file goes back to being platform-emitted (plan §9).
+set_io clock F4
+set_io usb_dp A1
+set_io usb_dn A2
+set_io usb_dp_pu A4
+set_io led_red B5
+set_io led_green A5
+set_io led_blue C5
+set_frequency clock 48.0

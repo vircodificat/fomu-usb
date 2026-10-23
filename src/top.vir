@@ -1,0 +1,32 @@
+import ice40
+
+// Fomu UART-over-USB PoC — top declaration.
+//
+// The real Fomu top is pending platform support for bidirectional
+// (tristate) pins — see FOMU_UART_OVER_USB_PLANv2.md §5/§9.  Until then the
+// top is the Verilog ext mod `ext/fomu_top.sv` (`module Top`) and this
+// declaration is the port *contract* for it.  Port names match the Fomu
+// platform pin names so the future real Top keeps the same PCF lines.
+//
+// Contract drift note: Virdant cannot yet express a bidirectional pad, so
+// `usb_dp`/`usb_dn` are declared `outgoing` here while the Verilog Top
+// declares them `inout` (the SB_IO PACKAGE_PIN).  When platform tristate
+// support lands, this declaration is replaced by the real
+// `export mod Top for ice40::Fomu` and the Verilog Top dies (plan §9).
+ext mod Top {
+    //> 48 MHz board clock (pin F4).
+    incoming clock : Clock
+    //> USB D+ pad (pin A1) — driven via SB_IO inside the ext module.
+    outgoing usb_dp : Bit
+    //> USB D− pad (pin A2) — driven via SB_IO inside the ext module.
+    outgoing usb_dn : Bit
+    //> USB D+ pull-up enable (pin A4); low = disconnected from host.
+    outgoing usb_dp_pu : Bit
+    //> Heartbeat (active-low on PVT).
+    outgoing led_red : Bit
+    outgoing led_green : Bit
+    outgoing led_blue : Bit
+}
+
+// export mod Top for ice40::Fomu { ... }   // pending platform tristate
+//                                          // support; see plan §5/§9
