@@ -321,7 +321,11 @@ endmodule
 // every position compare is then 2-3 LUTs, never a carry chain (48 MHz
 // timing — the wide compares rode the capture cones last synthesis).  Emits 1-clk registered pulses tk_*/dt_*/hs_*;
 // bad packets are silent.
-// dt_data byte i occupies bits [8*i +: 8], wire order (LSB first).
+// Payload capture (bytes, wire order LSB first): dt_head = packet bytes
+// 0..7 (flopped — the EP0 request / line-coding window), dt_ram = payload
+// bytes 0..63 in block RAM (sync read: present dt_rd_addr, the byte is
+// on dt_rd_data the next clk).  Why the payload store is off the fabric:
+// see the storage block below the port list.
 // ===========================================================================
 module usb_rx_packet(
     input  wire         clk,
@@ -341,7 +345,9 @@ module usb_rx_packet(
     output reg          dt_valid,
     output reg  [3:0]   dt_pid,
     output reg  [6:0]   dt_len,
-    output reg  [511:0] dt_data,
+    output reg  [63:0]  dt_head,
+    output reg  [7:0]   dt_rd_data,
+    input  wire [5:0]   dt_rd_addr,
     output reg          dt_crc_ok,
     output reg          hs_valid,
     output reg  [3:0]   hs_pid
@@ -366,7 +372,7 @@ module usb_rx_packet(
     reg        tok_cap, sof_cap, hs_cap, dat_cap;
     // registered byte-count admission for dat_cap (bc in 1..65: at
     // least 2 bytes total, and one more byte would still fit the
-    // 512-bit capture) — keeps the 7-bit compares out of dat_cap's cone
+    // 64-byte payload RAM) — keeps the 7-bit compares out of dat_cap's cone
     reg        dat_bc_ok_r;
 
     wire [4:0]  c5;
@@ -391,6 +397,55 @@ module usb_rx_packet(
 
     // PID capture value on this cycle
     wire [7:0] pid_new = {bit_i, pid_r[7:1]};
+
+    // ------------------------------------------------------------------
+    // Payload capture storage — OFF THE FABRIC (48 MHz timing): 512
+    // payload flops put the bc->byte-enable decode (64-way, riding the
+    // bc+1 carry chain) AND the 64:1 read mux (into the usb_uart rx
+    // push) in the critical path.  Instead:
+    //   dt_ram  64x8 block RAM: payload bytes 0..63.  ONE write port
+    //           with a REGISTERED address (bc) and one enable — no
+    //           decode tree, no per-byte enable fanout; the sync read
+    //           (dt_rd_addr -> dt_rd_data) replaces the mux.
+    //   dt_head 8 flopped bytes: packet bytes 0..7 — consumers that
+    //           need several bytes AT ONCE (usb_ep0: the rq* request
+    //           latch, the SET_LINE_CODING capture) can't use a RAM
+    //           port, so the head window stays flopped (its enable
+    //           decode is 3 bits, not 7).
+    // Writes beyond byte 63 (over-length packets) are dropped — the
+    // 512-flop version's out-of-range part-select writes did nothing;
+    // those packets set bad (bc==66) and dt_valid stays 0, so no
+    // consumer ever sees a dropped byte.  A bad packet's payload is
+    // still written (same as the flop version).  Read-during-write to
+    // one address returns the OLD byte (nonblocking): the rx push of
+    // packet N reads packet N's bytes (written long before the push
+    // starts), never a byte of a concurrently-arriving packet N+1.
+    // ------------------------------------------------------------------
+    (* ram_style = "block" *) reg [7:0] dt_ram [0:63];
+
+    // byte completing on this bit clk (bit_i = the byte MSB,
+    // bshift[7:1] = the earlier 7 bits, LSB first)
+    wire [7:0] dt_byte_new = {bit_i, bshift[7:1]};
+
+    // byte-complete write strobe (registered inputs only: n3/st/sec/bc
+    // are regs; bit_valid/pkt_err are registered upstream in usb_rx_phy)
+    wire dt_wr = bit_valid && !pkt_err && (st == ST_BODY) && sec
+                 && (n3 == 3'd7);
+
+    always @(posedge clk) begin
+        if (dt_wr && !bc[6])            // bc >= 64: drop (no RAM slot)
+            dt_ram[bc[5:0]] <= dt_byte_new;
+        dt_rd_data <= dt_ram[dt_rd_addr];  // free-running registered read
+    end
+
+    // head shadow (bytes 0..7): flopped copy in its own always block so
+    // the 64 byte clock enables stay out of the FSM's cones
+    always @(posedge clk) begin
+        if (rst || bus_reset)
+            dt_head <= 64'd0;
+        else if (dt_wr && (bc[6:3] == 4'd0))      // bc < 8: head window
+            dt_head[8*bc[2:0] +: 8] <= dt_byte_new;
+    end
 
     always @(posedge clk) begin
         if (rst || bus_reset) begin
@@ -474,7 +529,7 @@ module usb_rx_packet(
                 // visible yet); dat: byte-aligned last bit (n3==7 with
                 // dat_bc_ok_r ⇔ 2+ bytes at EOP) and the 64-byte payload
                 // limit holds (bc != 66 ⇔ one more byte would overflow
-                // the 512-bit capture)
+                // the 64-byte payload RAM)
                 tok_cap <= !bad && !pkt_err && (st == ST_BODY)
                            && (pid_r[1:0] == 2'b01) && (nb == 5'd23);
                 sof_cap <= !bad && !pkt_err && (st == ST_BODY)
@@ -528,21 +583,20 @@ module usb_rx_packet(
                             end else
                                 nb <= nb + 5'd1;
                         end else begin
-                            // data section: byte assembly from the raw
-                            // stream; bc counts payload bytes AND the
-                            // 2 trailing crc16 wire bytes (subtracted at
-                            // EOP — same scheme the BFM receiver uses and
-                            // T8/T9 proved on 64 B packets).  No delay
-                            // line: the end is only known at EOP.
-                            // n3 wraps mod 8 (3 bits, no compare).
+                            // data section: byte COUNTING only — the
+                            // payload STORE is off-fabric (dt_ram /
+                            // dt_head above).  bc counts payload bytes
+                            // AND the 2 trailing crc16 wire bytes
+                            // (subtracted at EOP — same scheme the BFM
+                            // receiver uses and T8/T9 proved on 64 B
+                            // packets).  No delay line: the end is only
+                            // known at EOP.  n3 wraps mod 8 (3 bits, no
+                            // compare); bshift feeds dt_byte_new.
                             n3     <= n3 + 3'd1;
                             bshift <= {bit_i, bshift[7:1]};
                             if (n3 == 3'd7) begin
-                                // byte complete: bit_i is this clk's bit
-                                // (the byte MSB), bshift[7:1] holds bits
-                                // n-7..n-1 (LSB first)
-                                dt_data[8*bc +: 8]
-                                    <= {bit_i, bshift[7:1]};
+                                // byte complete (the store strobe is
+                                // dt_wr, in the storage block above)
                                 bc <= bc + 7'd1;
                                 if (bc == 7'd66)
                                     bad <= 1'b1;   // > 64 payload bytes
@@ -824,7 +878,10 @@ module usb_ep0(
     input  wire         dt_valid,
     input  wire  [3:0]  dt_pid,
     input  wire  [6:0]  dt_len,
-    input  wire  [511:0] dt_data,
+    // payload head window: packet bytes 0..7 (usb_rx_packet's flopped
+    // shadow — EP0 only ever needs the request / line-coding window,
+    // never the RAM bytes 8..63)
+    input  wire [63:0]  dt_head,
     input  wire         dt_crc_ok,
     // handshake strobe (router-gated: EP0's response was ACKed)
     input  wire         hs_ack,
@@ -907,7 +964,7 @@ module usb_ep0(
     wire [55:0] lc_default = {8'h08, 8'h00, 8'h00, 8'h00,
                               8'h00, 8'hC2, 8'h01};
 
-    // request bytes as seen THIS cycle (dt_data is stable during the
+    // request bytes as seen THIS cycle (dt_head is stable during the
     // request packet's dt_valid strobe); rq* registers hold them for
     // later stages (EP_RCV_DATA)
     // wLength from the REGISTERED request bytes (the parse runs one
@@ -960,7 +1017,7 @@ module usb_ep0(
     endfunction
 
     // SET_LINE_CODING data capture: a REGISTERED pulse one clk after the
-    // accepted OUT data packet (dt_data is stable by then; recv_cnt/rq1
+    // accepted OUT data packet (dt_head is stable by then; recv_cnt/rq1
     // are sampled at the same edge as the accept compare), so the 56
     // line_coding byte clock enables see one REGISTER, not the accept
     // compare tree.
@@ -972,14 +1029,15 @@ module usb_ep0(
                            && (dt_pid == (tog ? PID_DATA1 : PID_DATA0))
                            && (recv_cnt == 7'd0) && (rq1 == 8'h20);
             if (lc_cap_r) begin
-                // SET_LINE_CODING: store all 7 bytes
-                line_coding[0*8 +: 8] <= dt_data[0*8 +: 8];
-                line_coding[1*8 +: 8] <= dt_data[1*8 +: 8];
-                line_coding[2*8 +: 8] <= dt_data[2*8 +: 8];
-                line_coding[3*8 +: 8] <= dt_data[3*8 +: 8];
-                line_coding[4*8 +: 8] <= dt_data[4*8 +: 8];
-                line_coding[5*8 +: 8] <= dt_data[5*8 +: 8];
-                line_coding[6*8 +: 8] <= dt_data[6*8 +: 8];
+                // SET_LINE_CODING: store all 7 bytes (all in the head
+                // window)
+                line_coding[0*8 +: 8] <= dt_head[0*8 +: 8];
+                line_coding[1*8 +: 8] <= dt_head[1*8 +: 8];
+                line_coding[2*8 +: 8] <= dt_head[2*8 +: 8];
+                line_coding[3*8 +: 8] <= dt_head[3*8 +: 8];
+                line_coding[4*8 +: 8] <= dt_head[4*8 +: 8];
+                line_coding[5*8 +: 8] <= dt_head[5*8 +: 8];
+                line_coding[6*8 +: 8] <= dt_head[6*8 +: 8];
             end
         end
     end
@@ -1024,16 +1082,16 @@ module usb_ep0(
                     // SETUP data stage: DATA0 with the 8 request bytes.
                     // Only LATCH the request and ACK here; the parse runs
                     // one clk later from the registered bytes (the whole
-                    // request-decode tree from dt_data is too long for
+                    // request-decode tree from dt_head is too long for
                     // one 48 MHz cycle)
                     if (dt_valid && (dt_pid == PID_DATA0) && dt_crc_ok
                             && (dt_len == 7'd8)) begin
-                        rq0 <= dt_data[0*8 +: 8];
-                        rq1 <= dt_data[1*8 +: 8];
-                        rq2 <= dt_data[2*8 +: 8];
-                        rq3 <= dt_data[3*8 +: 8];
-                        rq6 <= dt_data[6*8 +: 8];
-                        rq7 <= dt_data[7*8 +: 8];
+                        rq0 <= dt_head[0*8 +: 8];
+                        rq1 <= dt_head[1*8 +: 8];
+                        rq2 <= dt_head[2*8 +: 8];
+                        rq3 <= dt_head[3*8 +: 8];
+                        rq6 <= dt_head[6*8 +: 8];
+                        rq7 <= dt_head[7*8 +: 8];
                         resp_req  <= 1'b1;         // ACK the request
                         resp_pid  <= PID_ACK;
                         resp_len  <= 7'd0;
@@ -1402,7 +1460,12 @@ module usb_uart(
     wire [6:0]  tk_addr, dt_len;
     wire [3:0]  tk_endp;
     wire [10:0] tk_frame;
-    wire [511:0] dt_data;
+    // rx packet payload capture (off-fabric, see usb_rx_packet): the
+    // flopped head window + the payload RAM's registered read.  The RAM
+    // read address is the rx-push byte index push_i (declared with the
+    // rx-push block below).
+    wire [63:0] dt_head;
+    wire [7:0]  dt_rd_data;
     usb_rx_packet u_rxpkt(
         .clk(clk), .rst(rst), .bus_reset(bus_reset),
         .bit_i(rx_bit), .bit_valid(rx_bit_v),
@@ -1410,7 +1473,8 @@ module usb_uart(
         .tk_valid(tk_valid), .tk_pid(tk_pid), .tk_addr(tk_addr),
         .tk_endp(tk_endp), .tk_frame(tk_frame), .tk_crc_ok(tk_crc_ok),
         .dt_valid(dt_valid), .dt_pid(dt_pid), .dt_len(dt_len),
-        .dt_data(dt_data), .dt_crc_ok(dt_crc_ok),
+        .dt_head(dt_head), .dt_rd_data(dt_rd_data),
+        .dt_rd_addr(push_i[5:0]), .dt_crc_ok(dt_crc_ok),
         .hs_valid(hs_valid), .hs_pid(hs_pid));
 
     assign bus_reset_o = bus_reset;
@@ -1457,7 +1521,7 @@ module usb_uart(
 
     usb_fifo16x8 #(.DEPTH(64), .AW(6), .RAM(1)) u_rxfifo(
         .clk(clk), .rst(rst || bus_reset),
-        .wr_en(rx_push_run_d), .wr_data(rx_push_byte),
+        .wr_en(rx_push_run_d), .wr_data(dt_rd_data),
         .rd_en(rx_pop_d), .rd_data(rxfifo_rd),
         .count(rxfifo_cnt), .full(rxfifo_full), .empty(rxfifo_empty));
     assign rx_data  = rx_data_d;
@@ -1504,7 +1568,7 @@ module usb_uart(
         .clk(clk), .rst(rst), .bus_reset(bus_reset),
         .tk_setup(ep0_tk_setup), .tk_in(ep0_tk_in), .tk_out(ep0_tk_out),
         .dt_valid(ep0_dt_valid), .dt_pid(dt_pid), .dt_len(dt_len),
-        .dt_data(dt_data), .dt_crc_ok(dt_crc_ok),
+        .dt_head(dt_head), .dt_crc_ok(dt_crc_ok),
         .hs_ack(ep0_hs_ack),
         .resp_req(ep0_resp_req), .resp_pid(ep0_resp_pid),
         .resp_len(ep0_resp_len), .resp_sel(ep0_resp_sel),
@@ -1626,17 +1690,25 @@ module usb_uart(
     end
 
     // ------------------------------------------------------------------
-    // rx push: accepted bulk-OUT payloads stream from dt_data into the rx
-    // FIFO, one byte per clk (dt_data holds until the next packet).
-    // One register stage (rx_push_byte) splits the 64:1 dt_data mux out
-    // of the FIFO write path; wr_en is pipelined with it so byte i is
-    // written exactly once.
+    // rx push: accepted bulk-OUT payloads stream from the rx packet's
+    // payload RAM into the rx FIFO, one byte per clk.  The 64:1 payload
+    // mux the old rx_push_byte register closed over is GONE (the payload
+    // store is off-fabric, see usb_rx_packet): usb_rx_packet registers
+    // dt_ram[push_i] into dt_rd_data one clk after the index holds it,
+    // so the 1-stage rx_push_run_d strobe pairs index and byte exactly
+    // (byte i written at the C(2+i)->C(3+i) posedge, once, in order):
+    //     ser_accept during C0: push_i<-0, rx_push_run<-1
+    //     C1: dt_rd_addr=0 -> posedge: dt_rd_data=byte0 during C2,
+    //                            rx_push_run_d <- run(C1)=1 during C2
+    //     posedge C2: FIFO writes byte0 (wr_en=run_d, wr_data=rd_data)
+    // wr_en is pre-gated with !full inside rx_push_run's own D (the
+    // serial accept already required cnt+dt_len <= 64), so the rxfifo
+    // write port sees two clean registers.
     // ------------------------------------------------------------------
     reg       rx_push_run;
     reg [6:0] push_i;
     reg [6:0] dt_len_hold;
     reg       rx_push_run_d;
-    reg [7:0] rx_push_byte;
     wire ser_accept = ser_resp_req && (ser_resp_pid == 4'h2); // ACK
 
     always @(posedge clk) begin
@@ -1647,15 +1719,9 @@ module usb_uart(
             dt_len_hold <= 7'd0;
         end else begin
             rx_push_run_d <= rx_push_run;
-            rx_push_byte  <= dt_data[8*push_i +: 8];
             if (ser_accept) begin
                 push_i      <= 7'd0;
                 dt_len_hold <= dt_len;
-                // full-gated HERE (inside the producing register), so
-                // the rxfifo wr_en port is a clean 1-bit register and
-                // the full compare stays out of the byte clock enables.
-                // In practice the serial accept already required
-                // cnt + dt_len <= 64, so this never blocks.
                 rx_push_run <= (dt_len != 7'd0) && !rxfifo_full;
             end else if (rx_push_run) begin
                 if (push_i + 7'd1 >= dt_len_hold)

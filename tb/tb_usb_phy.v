@@ -38,7 +38,13 @@ module tb_usb_phy;
     wire [6:0] tk_addr, dt_len;
     wire [3:0] tk_endp;
     wire [10:0] tk_frame;
-    wire [511:0] dt_data;
+    // rx packet payload capture (off-fabric interface): flopped head
+    // window + payload RAM read port; the TB drives the read address
+    // (reg) and streams the RAM out into s_dt_data for the payload
+    // checks (snap_dt task)
+    wire [63:0] dt_head;
+    wire [7:0]  dt_rd_data;
+    reg  [5:0]  dt_rd_addr = 6'd0;
     usb_rx_packet rxpkt(
         .clk(clk), .rst(rst), .bus_reset(rx_breset),
         .bit_i(rx_bit), .bit_valid(rx_bitv),
@@ -46,7 +52,8 @@ module tb_usb_phy;
         .tk_valid(tk_valid), .tk_pid(tk_pid), .tk_addr(tk_addr),
         .tk_endp(tk_endp), .tk_frame(tk_frame), .tk_crc_ok(tk_crc_ok),
         .dt_valid(dt_valid), .dt_pid(dt_pid), .dt_len(dt_len),
-        .dt_data(dt_data), .dt_crc_ok(dt_crc_ok),
+        .dt_head(dt_head), .dt_rd_data(dt_rd_data),
+        .dt_rd_addr(dt_rd_addr), .dt_crc_ok(dt_crc_ok),
         .hs_valid(hs_valid), .hs_pid(hs_pid));
 
     // ------------------------------------------------------------------
@@ -90,7 +97,8 @@ module tb_usb_phy;
     reg [3:0]  s_tk_endp;
     reg [10:0] s_tk_frame;
     reg        s_tk_crc, s_dt_crc;
-    reg [511:0] s_dt_data;
+    reg [511:0] s_dt_data;      // streamed from the payload RAM (snap_dt)
+    reg [63:0]  s_dt_head;      // flopped head window, shadowed at dt_valid
     reg [3:0]  s_cap_pid;
     reg        s_cap_is_data, s_cap_crc;
     reg [6:0]  s_cap_len;
@@ -109,7 +117,7 @@ module tb_usb_phy;
         s_dt_pid  <= dt_pid;
         s_dt_len  <= dt_len;
         s_dt_crc  <= dt_crc_ok;
-        s_dt_data <= dt_data;
+        s_dt_head <= dt_head;
     end
     integer cb;
     always @(posedge clk) if (host.cap_valid) begin
@@ -157,6 +165,21 @@ module tb_usb_phy;
         for (t = 0; t < timeout; t = t + 1) begin
             @(posedge clk); #1;
             if (saw_cap === 1'b1) begin ok = 1; disable wait_cap; end
+        end
+    end
+    endtask
+
+    // stream the rx packet payload RAM out into s_dt_data (the payload
+    // capture is off-fabric now): present dt_rd_addr = i, sample the
+    // registered read dt_rd_data one clk later
+    task snap_dt;
+        integer i;
+    begin
+        for (i = 0; i < 64; i = i + 1) begin
+            @(posedge clk); #1;
+            dt_rd_addr = i;
+            @(posedge clk); #1;
+            s_dt_data[8*i +: 8] = dt_rd_data;
         end
     end
     endtask
@@ -229,6 +252,12 @@ module tb_usb_phy;
             check(s_dt_pid === 4'h3, "T3: dt_pid DATA0");
             check(s_dt_len === 7'd8, "T3: dt_len");
             check(s_dt_crc === 1'b1, "T3: dt_crc_ok");
+            // head window (flopped bytes 0..7 — what usb_ep0 latches)
+            for (i = 0; i < 8; i = i + 1)
+                check(s_dt_head[8*i +: 8] === host.host_data_bytes[i],
+                      "T3: payload head byte");
+            // payload RAM (streamed out via the read port)
+            snap_dt;
             for (i = 0; i < 8; i = i + 1)
                 check(s_dt_data[8*i +: 8] === host.host_data_bytes[i],
                       "T3: payload byte");
@@ -270,6 +299,7 @@ module tb_usb_phy;
             check(s_dt_len === 7'd16, "T5: core RX len");
             check(s_dt_crc === 1'b1, "T5: core RX crc");
             check(s_dt_pid === 4'hB, "T5: core RX pid");
+            snap_dt;
             for (i = 0; i < 16; i = i + 1)
                 check(s_dt_data[8*i +: 8] === (8'h41 + i),
                       "T5: core RX byte");
