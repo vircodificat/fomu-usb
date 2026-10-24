@@ -1,26 +1,22 @@
-// UsbPads — ext body for src/usb.vir (module \usb::UsbPads).
-// Part of ~/projects/fomu-usb (see FOMU_UART_OVER_USB_PLANv2.md §2/§5).
-// Hand-written Verilog-2005, vendored as an ext mod (plan §0 rules 1-3).
-//
-// The minimal `inout` module: the ONLY bidirectional thing in the
-// design.  Two iCE40 SB_IO tristate pad cells (PIN_TYPE 6'b101001),
-// exactly the lowering migen performs for a 1-bit Tristate on iCE40
-// and which valentyusb rides on real Fomu hardware:
-//   migen/build/lattice/common.py (LatticeiCE40TristateImpl):
-//     Instance("SB_IO", p_PIN_TYPE=0b101001, io_PACKAGE_PIN=io,
-//              i_OUTPUT_ENABLE=oe, i_D_OUT_0=o, o_D_IN_0=i)
+// UsbPads -- ext body of usb::UsbPads (src/usb.vir): the design's only
+// bidirectional nets.  Two iCE40 SB_IO tristate pad cells (PIN_TYPE
+// 6'b101001), exactly the lowering migen performs for a 1-bit Tristate
+// on iCE40 (migen/build/lattice/common.py, LatticeiCE40TristateImpl:
+//   Instance("SB_IO", p_PIN_TYPE=0b101001, io_PACKAGE_PIN=io,
+//            i_OUTPUT_ENABLE=oe, i_D_OUT_0=o, o_D_IN_0=i))
 // No clock, no reset, no state: pure pad plumbing.  Everything around
-// this — POR, pull-up enable, the USB core itself — is unidirectional
-// and lives in Virdant (src/usb.vir); the POR is usb::UsbPor there.
+// this -- the POR (usb::UsbPor), the D+ pull-up enable (usb_dp_pu,
+// driven by the POR in src/top.vir), the USB core itself -- is
+// unidirectional and lives in Virdant (src/usb.vir, src/top.vir).
 //
 // Port contract note: the Virdant ext mod declaration (src/usb.vir)
 // types the pad side `outgoing Bit` because Virdant cannot express a
 // bidirectional pad; the `inout` below is the Verilog-side plumbing
-// that gets the SB_IO PACKAGE_PIN nets out to the Top ports / PCF
-// pins.  The platform wrapper reads these nets with plain `assign`s
-// (`assign usb_dp = \pads.usb_dp ;`), exactly the proven glue the old
-// \top::UsbController used — the bidirectionality never crosses the
-// Virdant boundary.
+// that gets the SB_IO PACKAGE_PIN nets out to the Top ports (wired in
+// src/top.vir's export mod Top: usb_dp := pads.usb_dp etc.) and
+// constrained to the physical pins in fomu.pcf (usb_dp = A1,
+// usb_dn = A2).  The bidirectionality never crosses the Virdant
+// boundary.
 `timescale 1ns/1ps
 
 module \usb::UsbPads (

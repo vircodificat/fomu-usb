@@ -1,30 +1,55 @@
 //> UART primitives: a 115200 8N1 transmitter and receiver for the 48 MHz
-//> clock.  Both are adapted from the UART examples in
-//> ~/projects/virdant-examples/uart and ~/projects/virdant-riscv (which
-//> run 9600 baud at 12 MHz); the only arithmetic change is the divisor.
+//> clock.  EchoServer (src/echo.vir) instantiates both; the raw `txd`
+//> and `rxd` lines are wired together at the top level (src/top.vir),
+//> so everything a receiver byte sees came from this same sender.
 //>
-//> Bit period: 48_000_000 / 115200 = 416.67, so one bit time is 417
-//> clock cycles (115107 baud, -0.08% error -- far inside the ~2%
-//> tolerance UART allows).  The start-bit detector samples half a bit
-//> after the falling edge (209 cycles), i.e. the middle of the start
-//> bit, and every following bit is sampled on the same phase.
+//> Bit period: 48_000_000 / 115200 = 416.67, rounded up to 417 clock
+//> cycles per bit -> 115107 baud, a -0.08% error, far inside the ~2%
+//> tolerance UART allows.  Start, each data bit and stop are each timed
+//> by their own 417-cycle phase, so the error does not accumulate
+//> within a frame.
 //>
 //> Frame: idle high, start low, 8 data bits LSB first, stop high.
+//> Both modules share the UartFsmState enum below (Idle/Start/Data/Stop).
+//>
+//> Receiver resynchronization: the falling start-bit edge is detected
+//> on the first clock edge where the line reads low; the line is then
+//> re-checked 209 cycles later (half of a 417-cycle bit, i.e. the
+//> middle of the start bit), and each following bit is sampled 417
+//> cycles after the previous sample -- every bit is sampled at its
+//> center.  `uart_rx` is sampled directly with no synchronizer
+//> flip-flops; that is exact on the same-clock loopback wire but means
+//> an externally driven `rxd` would be unsynchronized.
 //>
 //> # UartSender
 //>
 //> - `clock`      : 48 MHz clock
-//> - `data`       : byte to transmit
-//> - `data_valid` : 1-clk strobe; loads `data` when `ready` is high
-//> - `ready`      : high when idle (a new byte can be loaded)
+//> - `data`       : byte to transmit; must be valid on the `data_valid`
+//>                  cycle (echo.vir wires it to the FIFO head, which is
+//>                  stable then)
+//> - `data_valid` : 1-clk strobe.  Only sampled while `ready` is high:
+//>                  at that clock edge `data` is latched into the shift
+//>                  buffer and the frame begins (the start bit is driven
+//>                  the next cycle).  Strobes while busy are ignored;
+//>                  there is no input buffering.
+//> - `ready`      : high exactly while the sender is idle, so a new
+//>                  byte can be loaded on any such cycle.  It rises
+//>                  again on the first cycle after the stop bit, so
+//>                  frames can be sent back to back.
 //> - `tx`         : the serial line (the raw tx wire)
 //>
 //> # UartReceiver
 //>
 //> - `clock`      : 48 MHz clock
 //> - `uart_rx`    : the serial line (the raw rx wire)
-//> - `data`       : received byte
-//> - `data_valid` : 1-clk strobe when `data` is complete
+//> - `data`       : the received byte; stable from the last data-bit
+//>                  sample through the `data_valid` pulse (and until
+//>                  the next frame's samples begin)
+//> - `data_valid` : 1-clk pulse at the center of the stop bit, when the
+//>                  byte is complete; the consumer (the hold register
+//>                  in src/echo.vir) registers `data` on that same
+//>                  edge.  The stop bit's level is not checked -- the
+//>                  Stop phase is a plain 417-cycle wait.
 
 //> FSM states shared by UartSender and UartReceiver.
 enum type UartFsmState {
@@ -54,8 +79,10 @@ mod UartSender {
         }
     }
 
-    // A bit time ends when the counter reaches 416; the counter is
-    // zeroed at every state change, so every bit is exactly 417 cycles.
+    // Within a bit phase the counter counts 0..416 (417 cycles);
+    // bit_time_done fires on the 417th cycle, and the counter reloads
+    // to 0 on that same edge (and is held at 0 in Idle), so the start
+    // bit, every data bit and the stop bit are each exactly 417 cycles.
     wire bit_time_done : Bit {
         it := baud_counter == 416w10
     }
@@ -85,6 +112,8 @@ mod UartSender {
         }
     }
 
+    // Load + start: on a strobe while idle, latch `data` and move to
+    // Start (tx drops to the start bit on the next cycle).
     when {
         case data_valid && sender_idle match state {
             case #Idle {
@@ -117,12 +146,18 @@ mod UartReceiver {
     outgoing data       : Word[8] {
         it := shift
     }
+    // 1-clk pulse during the final cycle of the Stop phase (roughly the
+    // stop bit's center); `data` has been stable since the last
+    // data-bit sample.
     outgoing data_valid : Bit {
         it := state == #Stop && bit_time_done
     }
 
-    // The counter counts DOWN within each phase; a phase ends when it
-    // reaches 0.
+    // The counter counts DOWN within each phase; the phase ends on the
+    // cycle where it reaches 0.  In Idle the counter is held at 0, so
+    // bit_time_done is constantly true there -- harmless, because it is
+    // only consumed in the Start/Data/Stop arms below and in data_valid
+    // (which also requires state == #Stop).
     wire bit_time_done : Bit {
         it := baud_counter == 0w10
     }
@@ -137,8 +172,11 @@ mod UartReceiver {
                 }
                 case #Start when {
                     case bit_time_done when {
-                        // A valid start bit is still low at its midpoint;
-                        // a level that bounced back high is a glitch.
+                        // 209 cycles after the falling edge moved
+                        // Idle->Start (half of a 417-cycle bit, the
+                        // middle of the start bit), the line must still
+                        // be low; a level that has bounced back high is
+                        // a glitch and the frame is aborted to Idle.
                         case uart_rx == false => #Data
                         else                  => #Idle
                     }
@@ -156,13 +194,17 @@ mod UartReceiver {
         }
     }
 
-    // Countdown per phase.  Idle holds 0 and watches the line; the
-    // falling edge loads the half-bit time.  Start, Data and Stop each
-    // reload the full bit time when they end.  (A link to an external,
-    // asynchronous UART would shorten the last data bit slightly so the
-    // stop bit is sampled safely inside its cell; on the internal
-    // loopback wire both sides share one clock, so the periods are
-    // exact and no guard is needed.)
+    // Countdown per phase.  Idle holds 0 and watches the line; on the
+    // cycle where the line first reads low (the falling-edge detect)
+    // the counter loads 208, so the Start phase runs 209 cycles (208
+    // down to 0) -- half a bit.  When Start or Data ends the counter
+    // reloads 416, making each Data phase 417 cycles (one full bit);
+    // Stop also runs 417 cycles and then reloads 0 for Idle.  After a
+    // glitch abort the counter briefly sits at 416 in Idle, but Idle
+    // overwrites it (0, or 208 on a new falling edge) the next cycle.
+    // All periods assume uart_rx is in the same clock domain as clock
+    // -- true on the top-level loopback wire in src/top.vir; there is
+    // no resynchronization for an external source.
     reg baud_counter : Word[10] on clock {
         initial it <= 0w10
         it <= when {
@@ -196,9 +238,12 @@ mod UartReceiver {
         }
     }
 
-    // Bits are captured at each bit boundary and shifted in from the
-    // MSB side, so after eight captures the byte sits with its LSB in
-    // shift[0] (UART sends LSB first).
+    // At the end of each 417-cycle Data phase (each bit's center)
+    // uart_rx is shifted in at the MSB side: word() places its first
+    // argument in the MSBs, so the first bit on the wire (the LSB,
+    // UART sends LSB first) keeps shifting right and after eight
+    // captures the byte sits with its LSB in shift[0].  The byte then
+    // holds through the Stop phase, which is when data_valid pulses.
     reg shift : Word[8] on clock {
         initial it <= 0w8
         it <= when {

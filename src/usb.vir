@@ -1,12 +1,14 @@
 import ice40
 
-//> The USB controller, in Virdant.
-//>
-//> This is the "rest of the USB controller" half of the Virdant/Verilog
-//> split (see wiki/top-vir.md and HANDOFF.md): everything between the
-//> byte stream and the pads except the one thing Virdant cannot
-//> express -- the bidirectional USB pads (UsbPads, ext; the only
-//> `inout` in the design).
+//> The USB core in Virdant: everything between the byte stream and the
+//> USB pads.  This file holds the pad interface (UsbPads), the power-on
+//> reset (UsbPor), the serial CRC LFSRs (Crc5/Crc16), the RX PHY and
+//> packet/token decoder (RxPhy/RxPacket), EP0, the serial byte pipeline
+//> (Serial), the TX PHY (TxPhy), and the core tops (UsbUart, wrapped by
+//> UsbController).  Only what Virdant cannot express stays vendored in
+//> ext/usb_uart.sv and ext/usb_pads.sv: the indexed memories
+//> (\usb::TxFifo / \usb::RxFifo / \usb::DescRom) and the bidirectional
+//> USB pads (UsbPads, the only `inout` in the design).
 //>
 //> Topology (wired by export mod Top in src/top.vir):
 //>
@@ -20,51 +22,60 @@ import ice40
 
 //> The two USB D+/D- tristate pad cells (iCE40 SB_IO, PIN_TYPE
 //> 6'b101001) -- the one ext mod that touches a bidirectional net.
-//> Body in ext/usb_pads.sv.  From Virdant's point of view every wire
-//> here is unidirectional: we drive the pad via dp_tx/dn_tx gated by
-//> output_enable, and sample it back via dp_rx/dn_rx; the electrical
+//> Body in ext/usb_pads.sv: two SB_IO instances, one per line, sharing
+//> a single output_enable (the core drives both lines together or
+//> neither).  From Virdant's point of view every wire here is
+//> unidirectional: we drive the pads via dp_tx/dn_tx gated by
+//> output_enable, and sample them back via dp_rx/dn_rx; the electrical
 //> bidirectionality never crosses this boundary (the ext body's
 //> `inout` port declarations are the Verilog-side plumbing that gets
 //> the SB_IO PACKAGE_PIN nets out to the Top ports / PCF pins).
 ext mod UsbPads {
-    //> USB D+ pad side, out to the Top port (PCF pin A1); electrically
-    //> bidirectional, driven by the SB_IO cell inside the ext body.
+    //> USB D+ pad side, out to the Top port (PCF pin A1 in fomu.pcf);
+    //> electrically bidirectional, driven/sampled by the SB_IO cell
+    //> inside the ext body.
     outgoing usb_dp : Bit
-    //> USB D- pad side, out to the Top port (PCF pin A2); ditto.
+    //> USB D- pad side, out to the Top port (PCF pin A2 in fomu.pcf);
+    //> ditto.
     outgoing usb_dn : Bit
-    //> D+ drive level into the pads (SB_IO D_OUT_0).
+    //> D+ drive level into the pads (SB_IO D_OUT_0): driven onto the
+    //> wire only while output_enable is high; ignored otherwise.
     incoming dp_tx         : Bit
-    //> D- drive level into the pads (SB_IO D_OUT_0).
+    //> D- drive level into the pads (SB_IO D_OUT_0): same gating as
+    //> dp_tx.
     incoming dn_tx         : Bit
-    //> Tristate control: drive the bus while high; low = listen (the
-    //> pads float to the idle J state held by the host and the D+
-    //> 1.5k pull-up).
+    //> Tristate control from the core: drive the bus while high; low =
+    //> listen (the pads release the bus, which idles in the J state
+    //> held by the host and the D+ 1.5k pull-up).
     incoming output_enable : Bit
-    //> D+ sample out of the pads (SB_IO D_IN_0).
+    //> D+ sample out of the pads (SB_IO D_IN_0, registered inside the
+    //> pad cell).
     outgoing dp_rx : Bit
-    //> D- sample out of the pads (SB_IO D_IN_0).
+    //> D- sample out of the pads (SB_IO D_IN_0, registered inside the
+    //> pad cell).
     outgoing dn_rx : Bit
 }
 
-//> Power-on reset: counts 8.4M cycles at 48 MHz (~175 ms), then
-//> releases `por_done`.  The count is the USB attach delay: how long
-//> the device waits before releasing the D+ pull-up and attaching to
-//> the host.
+//> Power-on reset / USB attach delay: counts 8_400_000 cycles at
+//> 48 MHz (~175 ms), then raises `por_done` and holds it high.  The
+//> count is the USB attach delay: how long the device waits before
+//> releasing the D+ pull-up and attaching to the host.
 //>
-//> NB: the POR count is inlined -- there is no parameter.  The old ext
-//> body kept `POR_CYCLES` as a hand-written Verilog `parameter` so the
-//> sim TB could shorten it, but a plain Virdant mod must bake the
-//> constant into generated code the TB cannot reach, so the sim now
-//> eats the full ~175 ms attach delay.
+//> NB: the count is inlined -- there is no parameter -- and the
+//> literal 8_400_000 appears in BOTH regs below, so change them
+//> together.  The sim TB (tb/tb_usb_serial.v) therefore eats the full
+//> ~175 ms attach delay.
 mod UsbPor {
     //> 48 MHz board clock.
     incoming clock  : Clock
-    //> High once the POR count completes: gates the D+ pull-up
-    //> (attach) at the top and, registered once more in UsbController,
-    //> the core reset.
+    //> High (sticky) once the POR count completes.  Consumed at the
+    //> top (src/top.vir): wired directly to the usb_dp_pu pad (the D+
+    //> pull-up = attach), and into UsbController, where it is
+    //> registered once more (por_rst) to form the core-wide reset.
     outgoing por_done : Bit
 
-    // 24 bits suffice: 8_400_000 < 2^24 = 16_777_216.
+    // 24 bits suffice: 8_400_000 < 2^24 = 16_777_216.  Counts up
+    // while por_done_r is still low; holds at the terminal count.
     reg por_cnt : Word[24] on clock {
         initial it <= 0
         it <= when {
@@ -73,6 +84,7 @@ mod UsbPor {
         }
     }
 
+    // Sticky flag: set when the count completes, never cleared.
     reg por_done_r : Bit on clock {
         initial it <= false
         it <= when {
@@ -96,33 +108,42 @@ mod UsbPor {
 //> limitation that keeps \echo::EchoFifo in ext/); \usb::UsbPads
 //> stays ext for the other Virdant gap, the design's only `inout`.
 
-//> Serial CRC LFSRs (USB 2.0 §8.3.5), migrated out of ext/usb_uart.sv.
-//> Both advance one serial WIRE bit per clk when `adv` is high (wire
-//> order = LSB first); the checker convention feeds the received wire
-//> CRC bits too and compares the residual (token CRC5: 5'h0C, data
-//> CRC16: 16'h800D).  Known-answer vectors live in tb/tb_crc.v,
-//> cross-checked against valentyusb.
+//> Serial CRC LFSRs (USB 2.0 §8.3.5).  Both advance one serial WIRE
+//> bit per clk while `adv` is high (wire order = LSB first).  The
+//> checker convention feeds the received wire CRC bits through the
+//> LFSR too and compares the final state against the residual (token
+//> CRC5: 5'h0C, data CRC16: 16'h800D) -- see the residual compares in
+//> RxPacket.  Known-answer vectors live in tb/tb_crc.v, cross-checked
+//> against valentyusb.  In this design Crc5 is receive-side only (the
+//> device never transmits tokens); Crc16 also generates the TX data
+//> CRC in TxPhy.
 //>
-//> Wire-bit convention (ext/usb_uart.sv header): TX emits
-//> crc_wire[i] = ~crc[W-1-i] (complement + bit reverse).
+//> Wire-bit convention (see the header of ext/usb_uart.sv): the
+//> transmitted CRC stream is the complement of the register shifted
+//> out MSB-first, i.e. crc_wire[i] = ~crc[W-1-i] with i = 0 the first
+//> bit on the wire (complement + bit reverse).
 
-//> CRC5, poly x^5+x^2+1, seed 0x1F -- token CRC (addr+endp).
+//> CRC5, poly x^5+x^2+1, seed 0x1F -- the token CRC over
+//> addr[6:0] + endp[3:0].  Used receive-side only: RxPacket advances
+//> it over the token bits and checks the residual.
 mod Crc5 {
     //> 48 MHz clock.
     incoming clk : Clock
-    //> Synchronous reset: re-seed the LFSR to 0x1F.
+    //> Synchronous reset: re-seed the LFSR to 0x1F (RxPacket asserts
+    //> it at sop / bus reset / core reset).
     incoming rst : Bit
     //> Advance one serial wire bit on this clk edge.
     incoming adv : Bit
     //> Serial input bit, wire order (LSB first).
     incoming din : Bit
-    //> Current LFSR state: the generator output, or the checker
-    //> residual (0x0C after a good token stream incl. its CRC bits).
+    //> Current LFSR state.  In this checker-only role the caller
+    //> compares it against the residual 5'h0C, which is what remains
+    //> after a good token stream incl. its received CRC bits.
     outgoing crc : Word[5] {
         it := r
     }
 
-    //> feedback: new bit = din ^ tap
+    //> Feedback bit: din XOR the x^5 tap (r[4]).
     wire inv : Bit {
         it := din ^ r[4]
     }
@@ -139,7 +160,8 @@ mod Crc5 {
     }
 }
 
-//> CRC16, poly x^16+x^15+x^2+1, seed 0xFFFF -- data-payload CRC.
+//> CRC16, poly x^16+x^15+x^2+1, seed 0xFFFF -- the data-payload CRC:
+//> checker in RxPacket, generator for TX data packets in TxPhy.
 mod Crc16 {
     //> 48 MHz clock.
     incoming clk : Clock
@@ -149,14 +171,19 @@ mod Crc16 {
     incoming adv : Bit
     //> Serial input bit, wire order (LSB first).
     incoming din : Bit
-    //> Current LFSR state: the generator output (wire bytes are the
-    //> complement + bit-reverse, low byte first), or the checker
-    //> residual (0x800D after a good payload incl. its CRC bits).
+    //> Current LFSR state.  As a generator (TxPhy): the transmitted
+    //> wire stream is ~crc shifted out MSB-first, i.e. crc_wire[i] =
+    //> ~crc[15-i] with i = 0 the first bit on the wire (the ext
+    //> header's "complement + bit-reverse, low byte first"
+    //> convention; TxPhy realizes it by loading crc_shift with
+    //> crc ^ 0xFFFF and shifting MSB-first).  As a checker
+    //> (RxPacket): after a good payload incl. its received CRC bits
+    //> the state is the residual 16'h800D.
     outgoing crc : Word[16] {
         it := r
     }
 
-    //> feedback: new bit = din ^ tap
+    //> Feedback bit: din XOR the x^16 tap (r[15]).
     wire inv : Bit {
         it := din ^ r[15]
     }

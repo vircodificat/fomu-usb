@@ -1,7 +1,7 @@
 import uart
 
 //> The echo server: the bridge between the USB core's byte stream and
-//> the raw UART wires.
+//> the raw UART wires (wired up in src/top.vir).
 //>
 //> Data path (the echo):
 //>
@@ -11,38 +11,46 @@ import uart
 //>     host <--USB-- tx_data/tx_strobe <-- hold slot <-- UartReceiver <-- rxd
 //>
 //> Bytes from the host are *rendered* onto the raw `txd` line at
-//> 115200 8N1; bytes read from the raw `rxd` line are pushed back to
-//> the host unmodified.  The loop that turns this into an echo lives at
-//> the top level (`txd` wired to `rxd`), so the lines stay consumable:
-//> cut that one wire and drive `rxd` from something else.
+//> 115200 8N1 (src/uart.vir); bytes read from the raw `rxd` line are
+//> pushed back to the host unmodified.  The loop that turns this into
+//> an echo lives at the top level (`txd` registered into `rxd`), so
+//> the lines stay consumable: cut that one wire and drive `rxd` from
+//> something else.
 //>
 //> Flow control, end to end (nothing in this chain can drop a byte):
 //>
-//> - `room` tells the USB core to stop popping bytes out of its rx FIFO
-//>   while the queue is filling up; the core then NAKs bulk-OUT packets
-//>   and the host retries.
+//> - `room` is low once the EchoFifo holds 12 bytes; the USB core then
+//>   stops popping its rx FIFO and NAKs bulk-OUT packets, and the host
+//>   retries.
 //> - The sender only starts a new byte once the previously *received*
-//>   byte has been handed to the USB core (`tx_drained`), so the
-//>   receive slot can never be overwritten.
+//>   byte has been handed to the USB core (`tx_drained`), so the hold
+//>   slot can never be overwritten by a later received byte.
 //> - Bytes are only pushed into the USB core's tx FIFO when it has
 //>   room (`usb_tx_ready`).
 
 ext mod EchoFifo {
     //> A 16x8 circular FIFO (storage in ext/echo_fifo.sv -- Virdant
     //> cannot express indexed memories inside a plain `mod`, so the
-    //> storage primitive lives in Verilog next to the USB core, while
-    //> the echo server itself stays Virdant).  The interface contract:
+    //> storage primitive is Verilog while the echo server stays
+    //> Virdant).  Interface contract:
     //>
-    //> - `push_valid` pushes `push_data` onto the tail on that clk edge.
-    //> - `pop_en` consumes the head byte on that clk edge; the popped
-    //>   byte appears on `pop_data` on the NEXT clk (registered read
-    //>   inside the fifo), paired with the one-clk-delayed pop strobe
-    //>   below.  Pops are always >= 2 clks apart, so pop_data is the
-    //>   current head whenever a pop fires.
-    //> - `count` is the number of stored bytes; `room` is low when the
-    //>   queue is nearly full, throttling the USB core's pop path (the
-    //>   couple of in-flight bytes in the core's pop pipeline always
-    //>   fit above the room threshold).
+    //> - `push_valid` pushes `push_data` onto the tail on that clk
+    //>   edge.  There is no push-side backpressure; the `room` throttle
+    //>   below is what keeps the queue from overflowing.
+    //> - `pop_en` consumes the head byte on that clk edge.  `pop_data`
+    //>   is a registered read: the head mux is captured on every clk
+    //>   edge, so the byte consumed at cycle N appears on `pop_data`
+    //>   during cycle N+1 (and pop_data tracks the new head again from
+    //>   cycle N+2 on).  The echo server pairs its registered sender
+    //>   load strobe (`pop_r`, below) with exactly that one-clk-later
+    //>   byte; it pops at most one byte per sender frame (~4170 clks
+    //>   apart) and never pops an empty queue, so the pairing holds.
+    //> - `count` is the number of stored bytes (0..16, saturating:
+    //>   a simultaneous push and pop is a no-op).  `room` is high while
+    //>   count < 12; the 4 slots still free at that threshold absorb
+    //>   the bytes in flight in the USB core's pop pipeline (rx_pop_d
+    //>   -> rx_valid_r -> rx_valid_rr in src/usb.vir) after the
+    //>   throttle takes effect.
     incoming clock      : Clock
     incoming push_data  : Word[8]
     incoming push_valid : Bit
@@ -53,21 +61,31 @@ ext mod EchoFifo {
 }
 
 mod EchoServer {
-    //> USB side.
+    //> System clock, 48 MHz on Fomu (one UART bit time is 417 clks;
+    //> see src/uart.vir).
     incoming clock : Clock
-    //> Byte from the host (valid for one cycle with `usb_rx_valid`).
+    //> Byte from the host, paired with `usb_rx_valid`: a 1-clk strobe
+    //> per byte popped from the core's rx FIFO (rx_valid_rr in
+    //> src/usb.vir).  Pushing `usb_rx_data` into the EchoFifo on that
+    //> same edge IS the pop.
     incoming usb_rx_data  : Word[8]
     incoming usb_rx_valid : Bit
-    //> The USB core's tx FIFO has room for another byte.
+    //> The USB core's tx FIFO has room for another byte (tx_ready_r in
+    //> src/usb.vir: !txfifo.full, registered and therefore one clk
+    //> stale).  Gates the hold slot's push below.
     incoming usb_tx_ready : Bit
-    //> Byte toward the host; `tx_strobe` is a 1-clk push strobe.
+    //> Byte toward the host; `tx_strobe` is the 1-clk push strobe.  The
+    //> core registers the write and re-checks !txfifo.full at the write
+    //> edge (txfifo_wr_d in src/usb.vir).
     outgoing tx_data      : Word[8]
     outgoing tx_strobe    : Bit
-    //> Flow control back to the USB core: low = stop popping bytes out
-    //> of the rx FIFO (the core will NAK bulk-OUT packets instead).
+    //> Flow control back to the USB core (= fifo.room): low = stop
+    //> popping bytes out of the rx FIFO (the core will NAK bulk-OUT
+    //> packets instead).
     outgoing room         : Bit
 
-    //> The raw UART lines.
+    //> The raw UART lines (115200 8N1).  In the current Top they are
+    //> joined through a one-clk registered loopback (src/top.vir).
     outgoing txd : Bit
     incoming rxd : Bit
 

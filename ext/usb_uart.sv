@@ -1,45 +1,38 @@
-// Fomu UART-over-USB PoC — vendored USB Full-Speed CDC-ACM device core.
-// Part of ~/projects/fomu-usb (see FOMU_UART_OVER_USB_PLANv2.md §4).
-// Hand-written Verilog-2005, vendored as an ext mod (plan §0 rules 1-3).
-// USB protocol constants cross-referenced against valentyusb (BSD-3-Clause,
-// ~/repos/valentyusb) as reading reference only; all code here is original.
+// Fomu UART-over-USB — vendored USB Full-Speed CDC-ACM device core.
+// Hand-written Verilog-2005 ext bodies for src/usb.vir: the USB core
+// itself (Crc5/Crc16, RxPhy, RxPacket + RxRam, TxPhy, Ep0, Serial and
+// the UsbUart top -- token router, response arbiter, snapshot loader,
+// rx push, loopback pipe) lives in src/usb.vir.  USB protocol constants
+// cross-referenced against valentyusb (BSD-3-Clause, ~/repos/valentyusb)
+// as a reading reference only; all code here is original.
 //
-// Single clock domain: 48 MHz (4 clk cycles per USB FS bit).  No PLL, no CDC.
-// Scope (plan §1): FS only, one configuration, EP0 control + EP1 IN/OUT
-// bulk, no suspend/resume, no SOF bookkeeping.  EP2 IN interrupt exists in
-// the descriptors only (CDC notification endpoint; Linux cdc_acm requires
-// its presence but the core never arms it — every IN to EP2 is NAKed).
+// Single clock domain: 48 MHz (4 clk cycles per USB FS bit), no PLL, no
+// CDC.  FS only, one configuration, EP0 control + EP1 IN/OUT bulk; no
+// suspend/resume, no SOF bookkeeping (SOF tokens are captured and
+// ignored).  The CDC notification endpoint EP2 IN exists in the
+// descriptors only (Linux cdc_acm requires its presence); the core never
+// arms it -- every EP2 token is NAKed (usb::UsbUart in src/usb.vir).
 //
-// Module inventory (bottom-up):
-//   (usb_crc5 / usb_crc16, the serial CRC LFSRs, migrated to
-//    src/usb.vir as usb::Crc5 / usb::Crc16 -- USB 2.0 §8.3.5)
-//   usb_fifo16x8          16x8 sync FIFO
-//   (usb_rx_phy, the RX PHY, migrated to src/usb.vir as usb::RxPhy)
-//   (usb_rx_packet, the bit stream -> packet record assembler,
-//    migrated to src/usb.vir as usb::RxPacket; its 64x8 payload
-//    block RAM moved to src/usb.vir as usb::RxRam, a plain mod over
-//    an ice40::SbRam40_4k cell -- the indexed-memory limitation that
-//    still keeps \echo::EchoFifo in ext/ is now routed around with
-//    the vendor cell primitive)
-//   (usb_tx_phy, the TX PHY, migrated to src/usb.vir as usb::TxPhy)
-//   (usb_ep0, the control transfer SM + CDC requests, migrated to
-//    src/usb.vir as usb::Ep0)
-//    src/usb.vir as usb::Ep0)
-//   (usb_serial, the EP1 bulk endpoint protocol, migrated to
-//    src/usb.vir as usb::Serial)
-//   (usb_uart, the core top itself -- token router, response
-//    arbiter, snapshot loader, rx push, loopback pipe -- migrated
-//    to src/usb.vir as usb::UsbUart)
-//   What remains here: the fixed-parameter FIFO wrappers the .vir top
-//   instantiates, plus the descriptor ROM (initialized BRAM; moving it
-//   to an ice40::SbRam40_4k cell needs an INIT_FILE hex image -- see
-//   src/usb.vir).  \usb::RxRam and \usb::SnapRam have moved to Virdant
-//   as plain mods over ice40::SbRam40_4k cells (no ext body needed).
-//     \usb::TxFifo / \usb::RxFifo   ext wrappers over usb_fifo16x8
-//     \usb::DescRom                 descriptor ROM (initialized BRAM)
-//   usb_uart              core top: ROM, router, arbiter, FIFOs, loopback
+// Module inventory (this file):
+//   usb_fifo16x8      generic synchronous FIFO, default 16-deep x 8-bit
+//                     (the rx side instantiates it 64-deep with BRAM
+//                     storage; see its banner below)
+//   \usb::TxFifo      ext body of usb::TxFifo  -- 16x8, flops, comb head
+//   \usb::RxFifo      ext body of usb::RxFifo  -- 64x8, BRAM, registered head
+//   \usb::DescRom     ext body of usb::DescRom -- 256x8 initialized BRAM
 //
-// Bit/wire-order conventions used throughout (verified against valentyusb):
+// Why these stay in ext: \usb::TxFifo / \usb::RxFifo must bake their
+// shape (Virdant ext mod declarations cannot carry parameters), and
+// \usb::DescRom needs a Verilog `initial` block for its contents (a
+// plain mod over an ice40::SbRam40_4k cell would need an INIT_FILE hex
+// image instead).  The other indexed memories -- the bulk-IN snapshot
+// RAM (usb::SnapRam) and the bulk-OUT payload RAM (usb::RxRam) -- are
+// plain Virdant mods over ice40::SbRam40_4k cells in src/usb.vir (no
+// ext body); the pads are ext/usb_pads.sv and the echo FIFO is
+// ext/echo_fifo.sv.
+//
+// Bit/wire-order conventions used throughout the core (verified against
+// valentyusb):
 //  - every byte goes on the wire LSB first;
 //  - PID byte = {~pid[3:0], pid[3:0]}; pid[1:0]: 01=token 11=data 10=handshake;
 //  - token = sync + PID + addr[6:0] + endp[3:0] + crc5[4:0], all LSB first;
@@ -52,27 +45,29 @@
 //    CRC boundary before EOP, so computed-vs-received is not an option.
 
 // ===========================================================================
-// usb_fifo16x8 — synchronous FIFO, default 16-deep x 8-bit (plan §2).
-// DEPTH=64 on the bulk-OUT rx side is a documented plan deviation: a
-// max-size (64 B) bulk-OUT packet must be absorbed atomically, which a
-// 16-deep FIFO can never accept under the "whole packet must fit" rule;
-// 64 is also exactly what a real device's endpoint buffer holds.
-// rd_data is the combinational head (RAM=0) or the head delayed one clk
-// (RAM=1: block-RAM storage with a free-running registered read port —
-// the 64-deep rx side uses it, taking 512 flops and their per-byte
-// write-decode cones out of the fabric).  CONTRACT: wr_en must be
-// pre-gated with !full by the caller (the write path must not read
-// `cnt`, or the full compare rides every byte's clock-enable cone —
-// a 48 MHz killer on the 64-deep rx FIFO; both instantiation sites
-// gate it in the register that produces wr_en).  rd_en must likewise
-// be caller-gated with !empty: the empty compare used to sit in
-// do_rd, chaining off the count registers into the txfifo read
-// pointer's clock enable (the vir-flow critical path, 23.1 ns).
-// Both sites comply: the rx popper pre-gates with !rxfifo_empty, and
-// the snapshot loader pops exactly min(count,64) bytes (counted at
-// arm; it is the only txfifo popper, so count only grows during the
-// load).  Simultaneous push+pop supported; with
-// RAM=1 the popped byte is on rd_data one clk after rd_en.
+// usb_fifo16x8 — synchronous FIFO, default 16-deep x 8-bit.
+// DEPTH=64 on the bulk-OUT rx side (usb::RxFifo): a max-size (64 B)
+// bulk-OUT packet must be absorbed atomically under the core's
+// whole-packet-must-fit admission rule, which a 16-deep FIFO could
+// never accept; 64 B is also exactly what a real device's endpoint
+// buffer holds.
+// rd_data is the combinational head (RAM=0) or the head delayed one
+// clk (RAM=1: block-RAM storage with a free-running registered read
+// port -- the 64-deep rx side uses it, taking 512 flops and their
+// per-byte write-decode cones out of the fabric).  With RAM=1 the
+// popped byte is on rd_data one clk after rd_en.
+// CONTRACT: wr_en must be pre-gated with !full by the caller, and
+// rd_en with !empty.  The FIFO has no internal protection: a push
+// while full or a pop while empty corrupts cnt and the pointers.  By
+// design the write/read enables here carry no `cnt` terms at all, so
+// the count compares never sit in a write/read clock-enable cone --
+// a hard requirement at 48 MHz.  Both instantiation sites comply
+// (usb::UsbUart in src/usb.vir): the rx pusher pre-gates with
+// !rxfifo.full and the rx popper with !rxfifo.empty, and the snapshot
+// loader pops exactly min(count,64) bytes counted at arm (it is the
+// tx FIFO's only popper, so count only grows during the load).
+// Simultaneous push+pop is supported (both pointers advance, cnt
+// unchanged).  `count` is 7 bits wide regardless of DEPTH.
 // ===========================================================================
 module usb_fifo16x8 #(
     parameter DEPTH = 16,
@@ -92,12 +87,10 @@ module usb_fifo16x8 #(
     reg [AW-1:0] wptr, rptr;
     reg [6:0] cnt;
 
-    // wr_en is caller-gated with !full, rd_en with !empty (see header
-    // CONTRACT): no `cnt` terms here.  The empty compare in do_rd once
-    // chained off the count registers into the txfifo read pointer's
-    // clock enable -- the vir-flow critical path (23.1 ns).  Both
-    // callers gate their pops (rx: !rxfifo_empty in rx_pop_d; tx: the
-    // snapshot loader pops min(count,64) and is the only popper).
+    // do_wr/do_rd carry no `cnt` terms: the caller owns both gates
+    // (wr_en pre-gated with !full, rd_en with !empty -- see the header
+    // CONTRACT), so the count compares never sit in the write/read
+    // enable paths.
     wire do_wr = wr_en;
     wire do_rd = rd_en;
 
@@ -190,12 +183,16 @@ endmodule
 // ===========================================================================
 // \usb::DescRom -- the descriptor ROM, ext body of usb::DescRom
 // (src/usb.vir).  256x8 initialized block RAM, registered sync read
-// (ra -> rd next clk).  Contiguous pages: sel0 device@0 (18 B), sel1
-// config@18 (75 B), sel2 str0@93, sel3 str1@97 (10 B), sel4 str2@107
-// (28 B); sel5 (line coding) and sel6 (status) are dynamic/trivial and
-// bypass the ROM.  The initial block is the vendored usb_uart's, moved
-// verbatim (a BRAM read replaces the desc_byte() case cascade: a
-// 128-deep case is ~20 ns of LUT chain, a BRAM read is a register).
+// (ra presented this clk -> rd next clk).  Contiguous pages, addressed
+// by usb::UsbUart's rom_page map (src/usb.vir): sel0 device@0 (18 B),
+// sel1 config@18 (75 B), sel2 str0@93 (4 B), sel3 str1@97 (10 B),
+// sel4 str2@107 (32 B -- bLength 0x20; the string data is followed by
+// zero pad bytes up to the declared length).  GET_STATUS (sel6)
+// bypasses the ROM: the tx producer mux in usb::UsbUart returns zero
+// bytes for it; no sel5 exists (usb::Ep0 implements no line-coding
+// request).  The ROM stays an ext body because its contents come from
+// the Verilog `initial` block below; a plain mod over an
+// ice40::SbRam40_4k cell would need an INIT_FILE hex image instead.
 // ===========================================================================
 module \usb::DescRom (
     input  wire       clk,
