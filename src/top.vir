@@ -20,27 +20,16 @@ export mod Top for ice40::Fomu {
         usb_dp := it.usb_dp
         usb_dn := it.usb_dn
         usb_dp_pu := it.usb_dp_pu
-        led_green := it.led_green
-        led_blue := it.led_blue
     }
 
-    reg led_buffer : Bit on clock {
-        it <= actual_top.led_red
-    }
-
-    reg led_counter : Word[32] on clock {
-        initial it <= 0
-
-        when {
-            case it > 0 {
-                it <= it - 1
-            }
-            case led_buffer {
-                it <= 0x100000
-            }
-        }
-        led_red := it > 0
-    }
+    // The LEDs (active low on PVT) map the USB controller's activity
+    // signals onto the pads: red lights while the USB is receiving
+    // data (rxing), green while it is sending (txing); blue is unused
+    // (tied off).  The ext core's rxing/txing are stretched ~175 ms
+    // past the last byte, so sustained traffic reads as solid light.
+    led_red   := !actual_top.rxing
+    led_green := !actual_top.txing
+    led_blue  := true
 
     // The echo server: the byte-level consumer of the USB core.  Bytes
     // from the host are rendered onto the raw UART tx line; bytes read
@@ -89,10 +78,12 @@ ext mod FomuTop {
     outgoing usb_dn : Bit
     //> USB D+ pull-up enable (pin A4); low = disconnected from host.
     outgoing usb_dp_pu : Bit
-    //> Heartbeat (active-low on PVT).
-    outgoing led_red : Bit
-    outgoing led_green : Bit
-    outgoing led_blue : Bit
+    //> USB activity from the controller (active high, stretched ~175
+    //> ms past the last byte): rxing = the USB is receiving data,
+    //> txing = it is sending data.  The platform wrapper maps these
+    //> onto the active-low LED pads.
+    outgoing rxing : Bit
+    outgoing txing : Bit
     //> Byte-stream interface of the USB core (plan §2).  The Virdant
     //> echo server consumes this stream; rx_valid is a 1-clk strobe
     //> per byte, rx_ready is the consumer's flow control.

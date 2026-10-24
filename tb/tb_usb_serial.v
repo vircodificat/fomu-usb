@@ -37,12 +37,12 @@ module tb_usb_serial;
     // ------------------------------------------------------------------
     // DUT (short POR for sim; hardware default is ~175 ms)
     // ------------------------------------------------------------------
-    wire usb_dp_pu, led_r, led_g, led_b;
+    wire usb_dp_pu, rxing, txing;
     \top::FomuTop #(.POR_CYCLES(24'd200)) dut(
         .clock(clk),
         .usb_dp(usb_dp), .usb_dn(usb_dn),
         .usb_dp_pu(usb_dp_pu),
-        .led_red(led_r), .led_green(led_g), .led_blue(led_b),
+        .rxing(rxing), .txing(txing),
         // byte-stream interface (the Virdant echo server consumes it,
         // exactly as the platform top in build/top.sv wires it)
         .rx_data(echo_rx_data),
@@ -516,6 +516,8 @@ module tb_usb_serial;
         // drain whatever is still backlogged
         drain_in(7'd42, 512 - got_n);
         check(got_n === 512, "S4: echoed byte count");
+        check(rxing === 1'b1, "S4: usb rxing indicator high");
+        check(txing === 1'b1, "S4: usb txing indicator high");
         for (i = 0; i < 512; i = i + 1)
             if (got[i] !== (i & 8'hFF)) begin
                 errors = errors + 1;
@@ -652,4 +654,15 @@ module tb_usb_serial;
                      errors, host.host_fail);
         $finish;
     end
+    // --------------------------------------------------------------
+    // Instrumentation: monitor the core's RX packet CRC and length
+    // --------------------------------------------------------------
+    always @(posedge clk) begin
+        if (dut.u_core.u_rxpkt.dt_valid) begin
+            $display("[%0t] RX pkt: dt_len=%0d dt_crc_ok=%b",
+                     $time, dut.u_core.u_rxpkt.dt_len,
+                     dut.u_core.u_rxpkt.dt_crc_ok);
+        end
+    end
+
 endmodule

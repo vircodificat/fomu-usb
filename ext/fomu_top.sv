@@ -27,9 +27,11 @@ module \top::FomuTop #(
     inout  wire usb_dp,       // USB D+ (pin A1)
     inout  wire usb_dn,       // USB D- (pin A2)
     output wire usb_dp_pu,    // D+ 1.5k pull-up enable (pin A4)
-    output wire led_red,      // active low (pin B5)
-    output wire led_green,    // active low (pin A5)
-    output wire led_blue,     // active low (pin C5)
+    // USB activity from the core (active high, stretched ~175 ms past
+    // the last byte): rxing = the USB is receiving data, txing = it is
+    // sending data.  The platform wrapper maps these onto the LEDs.
+    output wire rxing,
+    output wire txing,
     // Byte-stream interface (plan §2).  The byte-level consumer lives
     // in Virdant (the echo server, instantiated by the platform top);
     // this ext module only exposes the USB core's FIFO stream.
@@ -92,6 +94,8 @@ module \top::FomuTop #(
         .tx_strobe(tx_strobe),
         .rx_ready(rx_ready),
         .tx_ready(tx_ready),
+        .rxing(rxing),
+        .txing(txing),
         .bus_reset_o(),
         .connected_o()
     );
@@ -111,14 +115,4 @@ module \top::FomuTop #(
         .D_OUT_0(dn_tx),
         .D_IN_0(dn_rx)
     );
-
-    // ------------------------------------------------------------------
-    // LED heartbeat (proves life; active low on PVT): red blinks after
-    // POR at ~5.7 Hz, off during POR; green/blue off.
-    // ------------------------------------------------------------------
-    reg [23:0] hb_cnt = 24'd0;
-    always @(posedge clock) hb_cnt <= hb_cnt + 24'd1;
-    assign led_red   = por_done ? hb_cnt[22] : 1'b1;
-    assign led_green = 1'b1;
-    assign led_blue  = 1'b1;
 endmodule

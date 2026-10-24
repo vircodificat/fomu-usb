@@ -97,9 +97,14 @@ endmodule
 // pre-gated with !full by the caller (the write path must not read
 // `cnt`, or the full compare rides every byte's clock-enable cone —
 // a 48 MHz killer on the 64-deep rx FIFO; both instantiation sites
-// gate it in the register that produces wr_en).  rd_en is
-// self-protecting (checked against empty here; it only feeds the
-// pointer/count registers).  Simultaneous push+pop supported; with
+// gate it in the register that produces wr_en).  rd_en must likewise
+// be caller-gated with !empty: the empty compare used to sit in
+// do_rd, chaining off the count registers into the txfifo read
+// pointer's clock enable (the vir-flow critical path, 23.1 ns).
+// Both sites comply: the rx popper pre-gates with !rxfifo_empty, and
+// the snapshot loader pops exactly min(count,64) bytes (counted at
+// arm; it is the only txfifo popper, so count only grows during the
+// load).  Simultaneous push+pop supported; with
 // RAM=1 the popped byte is on rd_data one clk after rd_en.
 // ===========================================================================
 module usb_fifo16x8 #(
@@ -120,9 +125,14 @@ module usb_fifo16x8 #(
     reg [AW-1:0] wptr, rptr;
     reg [6:0] cnt;
 
-    // wr_en is caller-gated with !full (see header): no `cnt` term here.
+    // wr_en is caller-gated with !full, rd_en with !empty (see header
+    // CONTRACT): no `cnt` terms here.  The empty compare in do_rd once
+    // chained off the count registers into the txfifo read pointer's
+    // clock enable -- the vir-flow critical path (23.1 ns).  Both
+    // callers gate their pops (rx: !rxfifo_empty in rx_pop_d; tx: the
+    // snapshot loader pops min(count,64) and is the only popper).
     wire do_wr = wr_en;
-    wire do_rd = rd_en && (cnt != 7'd0);
+    wire do_rd = rd_en;
 
     generate
         if (RAM != 0) begin : g_ram
@@ -1592,6 +1602,14 @@ module usb_uart(
     input  wire        rx_ready,      // low = the rx consumer is full:
                                       // stop popping (it NAKs instead)
     output wire        tx_ready,      // FIFO has room
+    // USB activity indicators (LED-visible): rxing/txing stay high for
+    // ~175 ms after the last byte of the bulk byte stream in each
+    // direction (the 1-clk rx_valid/tx_strobe strobes are far too fast
+    // to see, so each is stretched).  rxing = the core is receiving
+    // data (host -> device), txing = sending (device -> host).  EP0
+    // control traffic is not covered (it is not in rx_valid/tx_strobe).
+    output wire        rxing,
+    output wire        txing,
     // status (TB visibility)
     output wire        bus_reset_o,
     output wire        connected_o
@@ -1672,7 +1690,17 @@ module usb_uart(
             // 115200 baud drain rate: when it goes low the rx FIFO
             // fills, the serial endpoint NAKs bulk-OUT, and the host
             // retries -- end-to-end flow control with no byte loss.
-            rx_pop_d    <= !rxfifo_empty && (txfifo_cnt < 7'd13) && rx_ready;
+            // Off-by-one fix (stress S4c, cnt wrap 0->127): the gate
+            // samples rxfifo_cnt's PRE-pop value.  When a pop is already
+            // in flight (rx_pop_d==1) and cnt==1, that pop consumes the
+            // last byte at this same edge, so the scheduled next pop
+            // would find an empty FIFO -- and the 7-bit cnt subtract
+            // wraps to 127.  From then on the bogus count reads "not
+            // empty" and the popper drains stale BRAM bytes into the
+            // echo chain every clk while rx_ready pulses.  Block a pop
+            // when the in-flight pop is consuming the last byte:
+            rx_pop_d    <= !rxfifo_empty && !(rxfifo_cnt == 7'd1 && rx_pop_d)
+                        && (txfifo_cnt < 7'd13) && rx_ready;
             rx_valid_r  <= rx_pop_d;
             rx_valid_rr <= rx_valid_r;
             // rxfifo_rd (BRAM, registered read) holds the popped byte
@@ -1696,19 +1724,34 @@ module usb_uart(
 
     usb_fifo16x8 u_txfifo(
         .clk(clk), .rst(rst || bus_reset),
-        // comb write gate AT THE WRITE EDGE (a registered gate would be
-        // stale by the ~1 clk it takes a gated push to land, and a full
-        // check at the arm edge lets one in-flight push overflow the
-        // count — bytes armed at 15 land at 16; the loopback admission
-        // control is the pop decision's headroom, which is sized for
-        // THIS 2-clk pipe).  The txfifo is 16 deep: the gate riding the
-        // byte clock enables is a short cone, unlike the 64-deep rxfifo
-        // (whose full check lives in rx_push_run's D instead).
-        .wr_en(tx_strobe && !txfifo_full), .wr_data(tx_data),
+        // The write gate is REGISTERED (txfifo_wr_d): the old comb gate
+        // at the write edge put the cnt full-compare into every byte's
+        // write-enable cone (via the echo's do_push chain) -- the
+        // vir-flow critical path, 21.8 ns.  A registered gate is safe
+        // here: the overflow scenario the old comment feared (a push
+        // landing inside the gate-to-write window) needs TWO pushes
+        // within 1 clk, and the echo pushes at most one byte per ~417
+        // clks (single hold slot) and is the only writer of this FIFO.
+        // tx_data (the echo's hold_data) is stable across the +1 clk:
+        // it only changes on the next receiver byte, >=417 clks later.
+        .wr_en(txfifo_wr_d), .wr_data(tx_data),
         .rd_en(snap_pop), .rd_data(txfifo_rd),
         .count(txfifo_cnt), .full(txfifo_full), .empty(txfifo_empty));
+    reg txfifo_wr_d;
+    always @(posedge clk)
+        txfifo_wr_d <= tx_strobe && !txfifo_full;
     wire [6:0] tx_room = 7'd16 - txfifo_cnt;
-    assign tx_ready = !txfifo_full;
+    // tx_ready is REGISTERED (+1 clk stale): the echo's do_push (its
+    // hold_valid clear) then reads only registered terms, taking the
+    // cnt full-compare out of hold_valid's enable cone.  Stale room is
+    // safe: the echo pushes at most one byte per ~417 clks (single
+    // hold slot) and is the only writer of the txfifo, so no push can
+    // land inside the 1-clk staleness window.  The txfifo_wr_d gate
+    // re-checks !full at the registered edge as belt-and-braces.
+    reg tx_ready_r;
+    always @(posedge clk)
+        tx_ready_r <= !txfifo_full;
+    assign tx_ready = tx_ready_r;
 
     // ------------------------------------------------------------------
     // EP0 + serial protocol modules
@@ -2299,6 +2342,26 @@ module usb_uart(
     always @(posedge clk)
         if (rst) configured_d <= 1'b0;
         else     configured_d <= configured;
+
+    // USB activity indicators: the rx/tx byte-stream strobes stretched
+    // to ~175 ms (see the port comment).  Self-contained counters --
+    // deliberately outside every USB engine path.
+    reg [22:0] rx_led_cnt = 23'd0;
+    reg [22:0] tx_led_cnt = 23'd0;
+    always @(posedge clk) begin
+        if (rx_valid)
+            rx_led_cnt <= 23'h7F_FFFF;
+        else if (rx_led_cnt != 23'd0)
+            rx_led_cnt <= rx_led_cnt - 23'd1;
+    end
+    always @(posedge clk) begin
+        if (tx_strobe)
+            tx_led_cnt <= 23'h7F_FFFF;
+        else if (tx_led_cnt != 23'd0)
+            tx_led_cnt <= tx_led_cnt - 23'd1;
+    end
+    assign rxing = (rx_led_cnt != 23'd0);
+    assign txing = (tx_led_cnt != 23'd0);
 
     assign connected_o = configured;
 endmodule
