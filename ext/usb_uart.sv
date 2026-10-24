@@ -15,7 +15,11 @@
 //    src/usb.vir as usb::Crc5 / usb::Crc16 -- USB 2.0 §8.3.5)
 //   usb_fifo16x8          16x8 sync FIFO
 //   (usb_rx_phy, the RX PHY, migrated to src/usb.vir as usb::RxPhy)
-//   usb_rx_packet         bit stream -> packet records
+//   (usb_rx_packet, the bit stream -> packet record assembler,
+//    migrated to src/usb.vir as usb::RxPacket -- except its 64x8
+//    payload block RAM, which stays here as \usb::RxRam: Virdant
+//    cannot express an indexed memory, the same limitation that
+//    keeps \echo::EchoFifo in ext/)
 //   (usb_tx_phy, the TX PHY, migrated to src/usb.vir as usb::TxPhy)
 //   usb_ep0               control SM + CDC requests (USB 2.0 §8.5.5)
 //   usb_serial            EP1 OUT/IN bulk protocol (toggles, ACK/NAK)
@@ -127,402 +131,40 @@ module usb_fifo16x8 #(
 endmodule
 
 // ===========================================================================
-// usb_rx_packet — bit stream -> packet records.
+// \usb::RxRam -- the 64x8 payload block RAM, the ext body of
+// usb::RxRam (src/usb.vir).  What remains of usb_rx_packet after its
+// migration to Virdant (usb::RxPacket, cycle-exact): Virdant cannot
+// express an indexed memory, so the payload store stays vendored
+// Verilog here, instantiated from the .vir side.
 //
-// Bit counting: `nb` counts PID-section bits (sync 0..7 ignored, PID
-// byte 0..7, token data 8..18, crc5 wire bits 19..23, i.e. up to 24);
-// `n3` is the data-section bit-in-byte index (0..7, wrapping), with `bc`
-// counting complete bytes (payload + the 2 trailing crc16 wire bytes,
-// subtracted at EOP).  Two small counters instead of one 10-bit `n`:
-// every position compare is then 2-3 LUTs, never a carry chain (48 MHz
-// timing — the wide compares rode the capture cones last synthesis).  Emits 1-clk registered pulses tk_*/dt_*/hs_*;
-// bad packets are silent.
-// Payload capture (bytes, wire order LSB first): dt_head = packet bytes
-// 0..7 (flopped — the EP0 request / line-coding window), dt_ram = payload
-// bytes 0..63 in block RAM (sync read: present dt_rd_addr, the byte is
-// on dt_rd_data the next clk).  Why the payload store is off the fabric:
-// see the storage block below the port list.
+// One write port (registered address wa + one enable -- no decode
+// tree, no per-byte enable fanout) and one registered sync read port
+// (present ra, the byte is on rd the NEXT clk) that replaces the 64:1
+// read mux a flopped payload would put on the 48 MHz critical path.
+// Writes beyond byte 63 never happen (usb::RxPacket pre-gates we with
+// !(bc >= 64); over-length packets set bad there, so dt_valid never
+// fires and no consumer ever sees a truncated payload).  Read-during-
+// write to one address returns the OLD byte (nonblocking): the rx
+// push of packet N reads packet N's bytes (written long before the
+// push starts), never a byte of a concurrently-arriving packet N+1.
+// Port contract identical to the old dt_ram (dt_wr / dt_rd_addr /
+// dt_rd_data); (* ram_style = "block" *) exactly as before, so yosys
+// maps it to the same SB_RAM.
 // ===========================================================================
-module usb_rx_packet(
-    input  wire         clk,
-    input  wire         rst,
-    input  wire         bus_reset,
-    input  wire         bit_i,
-    input  wire         bit_valid,
-    input  wire         sop,
-    input  wire         eop,
-    input  wire         pkt_err,
-    output reg          tk_valid,
-    output reg  [3:0]   tk_pid,
-    output reg  [6:0]   tk_addr,
-    output reg  [3:0]   tk_endp,
-    output reg  [10:0]  tk_frame,
-    output reg          tk_crc_ok,
-    output reg          dt_valid,
-    output reg  [3:0]   dt_pid,
-    output reg  [6:0]   dt_len,
-    output reg  [63:0]  dt_head,
-    output reg  [7:0]   dt_rd_data,
-    input  wire [5:0]   dt_rd_addr,
-    output reg          dt_crc_ok,
-    output reg          hs_valid,
-    output reg  [3:0]   hs_pid
+module \usb::RxRam (
+    input  wire       clk,
+    input  wire       we,
+    input  wire [5:0] wa,
+    input  wire [7:0] wd,
+    input  wire [5:0] ra,
+    output reg  [7:0] rd
 );
-    localparam [1:0] ST_IDLE = 2'd0, ST_SYNC = 2'd1, ST_BODY = 2'd2;
-
-    reg [1:0]  st;
-    reg [4:0]  nb;           // PID/token-section bit index (0..24)
-    reg [2:0]  n3;          // data-section bit-in-byte index (0..7)
-    reg [7:0]  pid_r;
-    reg [10:0] tk_sh;
-    reg [7:0]  bshift;
-    reg [6:0]  bc;
-    reg        bad;
-    reg        sec;        // 0 = PID section, 1 = data section
-    // capture candidates: the (wide) end-of-packet capture conditions,
-    // precomputed at the last relevant BIT clk and held until EOP (no
-    // bit_valid clks fire during SE0/EOP, so a hold is safe; any further
-    // decoded bit clears them, so over-long packets stay silent).  The
-    // EOP-edge strobes then close over 2-3 inputs instead of the whole
-    // bit-counting tree (48 MHz timing).
-    reg        tok_cap, sof_cap, hs_cap, dat_cap;
-    // registered shared qualify for the caps (one clk delayed): the
-    // !bad && !pkt_err && st==ST_BODY prefix ANDed with the section.
-    // Computing it ONCE here keeps the per-bit cap cones at 2-3 shallow
-    // LUTs; a same-cycle pkt_err is re-checked inline (pkt_err is a
-    // register), and same-cycle `bad` sets are covered: the nb==7 PID
-    // check by hs_cap's own inline PID check, the bc==66 overflow by the
-    // ≥8-clk gap to the next data-section byte boundary.  The caps are
-    // consumed only at EOP (≥8 clks after the last bit), so the +1 clk
-    // is free.
-    reg        q_pid_r;     // qualify for the PID-section caps
-    reg        q_dat_r;     // qualify for the data-section cap
-    // registered byte-count admission for dat_cap (bc in 1..65: at
-    // least 2 bytes total, and one more byte would still fit the
-    // 64-byte payload RAM) — keeps the 7-bit compares out of dat_cap's cone
-    reg        dat_bc_ok_r;
-    // registered helpers (see the always blocks below): bc_is_66_r
-    // decouples the (bc == 66) compare from the bc+1 carry chain (the
-    // compare shared the adder's carry LUTs, chaining bc's D-cone into
-    // dat_bc_ok_r's D and bad's enable cones — the critical path);
-    // pid_bad_r / bc66_hit_r are registered per-cause error hits so the
-    // sticky `bad` flag's D is a 3-input OR of REGISTERS (no clock
-    // enable: an E-gated bad ingested the same compare tree); the CRC
-    // residual compares are registered so the 16-bit equality tree ends
-    // at its own register instead of riding dt_crc_ok's D-cone.
-    reg        bc_is_66_r;
-    reg        pid_bad_r;
-    reg        bc66_hit_r;
-    reg        crc5_res_r;
-    reg        crc16_res_r;
-
-    wire [4:0]  c5;
-    wire [15:0] c16;
-
-    // CRC5 advances on token bits nb = 8..23 (data + received crc5 wire
-    // bits; residual check 5'h0C); CRC16 advances on every data-section
-    // bit (payload + received crc16 wire bits; residual check 16'h800D).
-    \usb::Crc5 u_crc5 (
-        .clk(clk),
-        .rst(sop | rst | bus_reset),
-        .adv(bit_valid && (st == ST_BODY) && !sec
-             && (nb >= 5'd8) && (nb <= 5'd23)),
-        .din(bit_i),
-        .crc(c5));
-    \usb::Crc16 u_crc16 (
-        .clk(clk),
-        .rst(sop | rst | bus_reset),
-        .adv(bit_valid && (st == ST_BODY) && sec),
-        .din(bit_i),
-        .crc(c16));
-
-    // registered helpers: shallow independent cones, each ending at its
-    // OWN register (see the declaration comment).  crc*_res_r are
-    // computed every cycle — the residual is only SAMPLED at EOP (when
-    // the LFSR has consumed the whole packet), so mid-packet values are
-    // harmless.  bc_is_66_r is read one clk after bc reaches 66; bc
-    // holds between byte completes, so the delay is exact.
-    always @(posedge clk) begin
-        if (rst || bus_reset) begin
-            bc_is_66_r  <= 1'b0;
-            pid_bad_r   <= 1'b0;
-            bc66_hit_r  <= 1'b0;
-            crc5_res_r  <= 1'b0;
-            crc16_res_r <= 1'b0;
-        end else begin
-            bc_is_66_r  <= (bc[6:3] == 4'b0100) && (bc[2:0] == 3'b010);
-            pid_bad_r   <= bit_valid && (st == ST_BODY) && !sec
-                           && (nb == 5'd7)
-                           && (pid_new[3:0] != ~pid_new[7:4]);
-            bc66_hit_r  <= bit_valid && (st == ST_BODY) && sec
-                           && (n3 == 3'd7) && (bc == 7'd66);
-            crc5_res_r  <= (c5 == 5'h0C);
-            crc16_res_r <= (c16 == 16'h800D);
-        end
-    end
-
-    // bad: FLAT sticky error — plain D, no clock enable (see the decl
-    // comment).  The +1 clk on the set (hits are registered) is covered
-    // by the documented redundancy: q_pid_r/q_dat_r re-check pkt_err
-    // inline, hs_cap re-checks the PID inline, and dat_bc_ok_r gates
-    // the overflow via bc_is_66_r.
-    always @(posedge clk) begin
-        if (rst || bus_reset)
-            bad <= 1'b0;
-        else
-            bad <= sop ? 1'b0
-                 : (bad || (bit_valid && pkt_err)
-                        || pid_bad_r || bc66_hit_r);
-    end
-
-    // PID capture value on this cycle
-    wire [7:0] pid_new = {bit_i, pid_r[7:1]};
-
-    // ------------------------------------------------------------------
-    // Payload capture storage — OFF THE FABRIC (48 MHz timing): 512
-    // payload flops put the bc->byte-enable decode (64-way, riding the
-    // bc+1 carry chain) AND the 64:1 read mux (into the usb_uart rx
-    // push) in the critical path.  Instead:
-    //   dt_ram  64x8 block RAM: payload bytes 0..63.  ONE write port
-    //           with a REGISTERED address (bc) and one enable — no
-    //           decode tree, no per-byte enable fanout; the sync read
-    //           (dt_rd_addr -> dt_rd_data) replaces the mux.
-    //   dt_head 8 flopped bytes: packet bytes 0..7 — consumers that
-    //           need several bytes AT ONCE (usb_ep0: the rq* request
-    //           latch, the SET_LINE_CODING capture) can't use a RAM
-    //           port, so the head window stays flopped (its enable
-    //           decode is 3 bits, not 7).
-    // Writes beyond byte 63 (over-length packets) are dropped — the
-    // 512-flop version's out-of-range part-select writes did nothing;
-    // those packets set bad (bc==66) and dt_valid stays 0, so no
-    // consumer ever sees a dropped byte.  A bad packet's payload is
-    // still written (same as the flop version).  Read-during-write to
-    // one address returns the OLD byte (nonblocking): the rx push of
-    // packet N reads packet N's bytes (written long before the push
-    // starts), never a byte of a concurrently-arriving packet N+1.
-    // ------------------------------------------------------------------
-    (* ram_style = "block" *) reg [7:0] dt_ram [0:63];
-
-    // byte completing on this bit clk (bit_i = the byte MSB,
-    // bshift[7:1] = the earlier 7 bits, LSB first)
-    wire [7:0] dt_byte_new = {bit_i, bshift[7:1]};
-
-    // byte-complete write strobe (registered inputs only: n3/st/sec/bc
-    // are regs; bit_valid/pkt_err are registered upstream in usb::RxPhy)
-    wire dt_wr = bit_valid && !pkt_err && (st == ST_BODY) && sec
-                 && (n3 == 3'd7);
+    (* ram_style = "block" *) reg [7:0] mem [0:63];
 
     always @(posedge clk) begin
-        if (dt_wr && !bc[6])            // bc >= 64: drop (no RAM slot)
-            dt_ram[bc[5:0]] <= dt_byte_new;
-        dt_rd_data <= dt_ram[dt_rd_addr];  // free-running registered read
-    end
-
-    // head shadow (bytes 0..7): flopped copy in its own always block so
-    // the 64 byte clock enables stay out of the FSM's cones
-    always @(posedge clk) begin
-        if (rst || bus_reset)
-            dt_head <= 64'd0;
-        else if (dt_wr && (bc[6:3] == 4'd0))      // bc < 8: head window
-            dt_head[8*bc[2:0] +: 8] <= dt_byte_new;
-    end
-
-    always @(posedge clk) begin
-        if (rst || bus_reset) begin
-            st      <= ST_IDLE;
-            nb      <= 5'd0;
-            n3      <= 3'd0;
-            pid_r   <= 8'd0;
-            tk_sh   <= 11'd0;
-            bshift  <= 8'd0;
-            bc      <= 7'd0;
-            sec     <= 1'b0;
-            tok_cap <= 1'b0;
-            sof_cap <= 1'b0;
-            hs_cap  <= 1'b0;
-            dat_cap <= 1'b0;
-            dat_bc_ok_r <= 1'b0;
-            q_pid_r <= 1'b0;
-            q_dat_r <= 1'b0;
-        end else begin
-
-            if (sop) begin
-                st     <= ST_SYNC;
-                nb     <= 5'd0;
-                n3     <= 3'd0;
-                pid_r  <= 8'd0;
-                tk_sh  <= 11'd0;
-                bshift <= 8'd0;
-                bc     <= 7'd0;
-                sec    <= 1'b0;
-                tok_cap <= 1'b0;
-                sof_cap <= 1'b0;
-                hs_cap  <= 1'b0;
-                dat_cap <= 1'b0;
-                q_pid_r <= 1'b0;
-                q_dat_r <= 1'b0;
-            end else if (eop) begin
-                // capture decision: precomputed at the last bit clk
-                // (tok_cap & friends).  The strobes + captured fields
-                // live in the FLAT always block below — this branch
-                // only retires the FSM state and clears the caps.
-                st <= ST_IDLE;
-                tok_cap <= 1'b0;
-                sof_cap <= 1'b0;
-                hs_cap  <= 1'b0;
-                dat_cap <= 1'b0;
-            end else if (bit_valid) begin
-                // per-bit capture precompute (registered inputs only):
-                // latched at the last relevant bit and held through the
-                // SE0 tail to EOP.  tok: nb==23 is the last token bit
-                // (nb==24 would be at EOP); hs: nb==7 is the last PID bit
-                // (nb==8 at EOP, PID check included — `bad` is not
-                // visible yet); dat: byte-aligned last bit (n3==7 with
-                // dat_bc_ok_r ⇔ 2+ bytes at EOP) and the 64-byte payload
-                // limit holds (bc != 66 ⇔ one more byte would overflow
-                // the 64-byte payload RAM)
-                // shared qualify, REGISTERED one clk earlier (see decl)
-                q_pid_r <= !bad && !pkt_err && (st == ST_BODY) && !sec;
-                q_dat_r <= !bad && !pkt_err && (st == ST_BODY) && sec;
-                tok_cap <= q_pid_r && !pkt_err
-                           && (pid_r[1:0] == 2'b01) && (nb == 5'd23);
-                sof_cap <= q_pid_r && !pkt_err
-                           && (pid_r[1:0] == 2'b01) && (nb == 5'd23)
-                           && (pid_r[3:0] == 4'h5);
-                hs_cap  <= q_pid_r && !pkt_err
-                           && ((pid_r[1:0] == 2'b00)
-                               || (pid_r[1:0] == 2'b10))
-                           && (nb == 5'd7)
-                           && (pid_new[3:0] == ~pid_new[7:4]);
-                dat_cap <= q_dat_r && !pkt_err
-                           && (n3 == 3'd7) && dat_bc_ok_r;
-                dat_bc_ok_r <= (bc != 7'd0) && !bc_is_66_r;
-                if (!pkt_err) begin
-                    case (st)
-                    ST_IDLE: ;
-                    ST_SYNC: begin
-                        // ignore sync bits 0..7
-                        if (nb == 5'd7) begin
-                            st  <= ST_BODY;
-                            nb  <= 5'd0;
-                            n3  <= 3'd0;
-                            sec <= 1'b0;
-                        end else
-                            nb <= nb + 5'd1;
-                    end
-                    ST_BODY: begin
-                        if (!sec) begin
-                            // PID byte (nb = 0..7), then token remainder.
-                            // pid_r is FROZEN after the PID byte (it
-                            // classifies the packet at EOP); token data
-                            // bits are nb = 8..18 (the shift-up capture);
-                            // crc5 wire bits nb = 19..23 feed the residual
-                            // check via usb::Crc5 and are not captured.
-                            if (nb <= 5'd7)
-                                pid_r <= pid_new;
-                            if ((nb >= 5'd8) && (nb <= 5'd18))
-                                tk_sh <= {bit_i, tk_sh[10:1]};
-                            if (nb == 5'd7) begin
-                                // PID check failure is registered upstream
-                                // (pid_bad_r -> bad, +1 clk)
-                                if (pid_new[1:0] == 2'b11) begin
-                                    sec <= 1'b1;    // data section
-                                    n3  <= 3'd0;
-                                    nb  <= 5'd24;
-                                end else begin
-                                    nb <= 5'd8;    // token/handshake bits
-                                end
-                            end else
-                                nb <= nb + 5'd1;
-                        end else begin
-                            // data section: byte COUNTING only — the
-                            // payload STORE is off-fabric (dt_ram /
-                            // dt_head above).  bc counts payload bytes
-                            // AND the 2 trailing crc16 wire bytes
-                            // (subtracted at EOP — same scheme the BFM
-                            // receiver uses and T8/T9 proved on 64 B
-                            // packets).  No delay line: the end is only
-                            // known at EOP.  n3 wraps mod 8 (3 bits, no
-                            // compare); bshift feeds dt_byte_new.
-                            n3     <= n3 + 3'd1;
-                            bshift <= {bit_i, bshift[7:1]};
-                            if (n3 == 3'd7) begin
-                                // byte complete (the store strobe is
-                                // dt_wr, in the storage block above;
-                                // the >64-byte overflow is registered
-                                // upstream: bc66_hit_r -> bad)
-                                bc <= bc + 7'd1;
-                            end
-                        end
-                    end
-                    endcase
-                end
-            end
-        end
-    end
-
-    // ------------------------------------------------------------------
-    // Output strobes + captured fields — FLAT equations, own always
-    // block.  These used to live inside the FSM's if/else-if chain
-    // above; synthesis then shared the priority-mux tree across
-    // tk_valid/dt_valid/hs_valid's D-cones AND the captured fields'
-    // clock enables (hs_pid's enable was literally the same LUTs as
-    // hs_valid's D), chaining sop/eop/reset terms LUT-to-LUT from the
-    // PHY into hs_pid's enable — the 23 ns critical path.  The caps are
-    // MUTUALLY EXCLUSIVE by construction (tok: nb==23 in the PID
-    // section; hs: nb==7 in the PID section; dat: data section), so the
-    // else-if priority was redundant: each strobe is now one 2-input
-    // AND of registers, and each capture enable is eop AND its cap.
-    // Reading the caps AT the eop edge is safe (same edge clears them;
-    // nonblocking semantics see the pre-edge values).
-    // ------------------------------------------------------------------
-    always @(posedge clk) begin
-        if (rst || bus_reset) begin
-            tk_valid  <= 1'b0;
-            dt_valid  <= 1'b0;
-            hs_valid  <= 1'b0;
-            tk_pid    <= 4'h0;
-            tk_addr   <= 7'h0;
-            tk_endp   <= 4'h0;
-            tk_frame  <= 11'h0;
-            tk_crc_ok <= 1'b0;
-            dt_pid    <= 4'h0;
-            dt_len    <= 7'h0;
-            dt_crc_ok <= 1'b0;
-            hs_pid    <= 4'h0;
-        end else begin
-            tk_valid <= eop && tok_cap;
-            dt_valid <= eop && dat_cap;
-            hs_valid <= eop && hs_cap;
-
-            if (eop) begin
-                if (tok_cap) begin
-                    tk_pid    <= pid_r[3:0];
-                    tk_crc_ok <= crc5_res_r;
-                end
-                if (tok_cap && sof_cap) begin
-                    // SOF: 11-bit frame number
-                    tk_frame <= tk_sh;
-                end
-                if (tok_cap && !sof_cap) begin
-                    // token bits b8..b18 land at tk_sh[0..10]
-                    // (shift-up capture): addr = tk_sh[6:0],
-                    // endp = tk_sh[10:7]
-                    tk_addr <= tk_sh[6:0];
-                    tk_endp <= tk_sh[10:7];
-                end
-                if (dat_cap) begin
-                    // data: bc = payload bits + 16 crc bits
-                    dt_pid    <= pid_r[3:0];
-                    dt_len    <= (bc >= 7'd2) ? (bc - 7'd2) : 7'd0;
-                    dt_crc_ok <= crc16_res_r;
-                end
-                if (hs_cap) begin
-                    // handshake: nothing after the PID byte
-                    hs_pid <= pid_r[3:0];
-                end
-            end
-        end
+        if (we)
+            mem[wa] <= wd;
+        rd <= mem[ra];    // registered sync read; read-during-write = OLD byte
     end
 endmodule
 
@@ -567,7 +209,7 @@ module usb_ep0(
     input  wire         dt_valid,
     input  wire  [3:0]  dt_pid,
     input  wire  [6:0]  dt_len,
-    // payload head window: packet bytes 0..7 (usb_rx_packet's flopped
+    // payload head window: packet bytes 0..7 (usb::RxPacket's flopped
     // shadow — EP0 only ever needs the request / line-coding window,
     // never the RAM bytes 8..63)
     input  wire [63:0]  dt_head,
@@ -1118,13 +760,13 @@ module \usb::UsbUart (
     wire [6:0]  tk_addr, dt_len;
     wire [3:0]  tk_endp;
     wire [10:0] tk_frame;
-    // rx packet payload capture (off-fabric, see usb_rx_packet): the
+    // rx packet payload capture (off-fabric, see usb::RxPacket): the
     // flopped head window + the payload RAM's registered read.  The RAM
     // read address is the rx-push byte index push_i (declared with the
     // rx-push block below).
     wire [63:0] dt_head;
     wire [7:0]  dt_rd_data;
-    usb_rx_packet u_rxpkt(
+    \usb::RxPacket u_rxpkt(
         .clk(clk), .rst(rst), .bus_reset(bus_reset),
         .bit_i(rx_bit), .bit_valid(rx_bit_v),
         .sop(rx_sop), .eop(rx_eop), .pkt_err(rx_perr),
@@ -1457,8 +1099,8 @@ module \usb::UsbUart (
     // rx push: accepted bulk-OUT payloads stream from the rx packet's
     // payload RAM into the rx FIFO, one byte per clk.  The 64:1 payload
     // mux the old rx_push_byte register closed over is GONE (the payload
-    // store is off-fabric, see usb_rx_packet): usb_rx_packet registers
-    // dt_ram[push_i] into dt_rd_data one clk after the index holds it,
+    // store is off-fabric, see usb::RxPacket): the payload RAM
+    // (\usb::RxRam) registers mem[push_i] into dt_rd_data one clk after
     // so the 1-stage rx_push_run_d strobe pairs index and byte exactly
     // (byte i written at the C(2+i)->C(3+i) posedge, once, in order):
     //     ser_accept during C0: push_i<-0, rx_push_run<-1

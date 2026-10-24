@@ -21,12 +21,13 @@ SHELL := /bin/bash
 
 # Vendored plain-Verilog USB core + the ext bodies of the Virdant/Verilog
 # split (src/usb.vir): the SB_IO pad pair (the only `inout` in the
-# design), the parameterized POR, and the USB core itself.
+# design) and the USB core itself.  The POR is a plain Virdant mod now
+# (usb::UsbPor in src/usb.vir); the old ext/usb_por.sv is gone -- keep it
+# out of any compile or iverilog rejects the duplicate module.
 USB_SRVS := ext/usb_uart.sv
 PADS_SV  := ext/usb_pads.sv
-POR_SV   := ext/usb_por.sv
 ECHO_SV  := ext/echo_fifo.sv
-EXT_SRVS := $(USB_SRVS) $(PADS_SV) $(POR_SV) $(ECHO_SV)
+EXT_SRVS := $(USB_SRVS) $(PADS_SV) $(ECHO_SV)
 USB_BUILD := build/builtin.sv build/usb.sv build/echo.sv build/uart.sv
 
 # Testbench sources.  tb/usb_host_bfm.v is an include file (tasks/macros

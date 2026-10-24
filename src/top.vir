@@ -10,8 +10,8 @@ export mod Top for ice40::Fomu {
     // low (= disconnected), so a wrapper that leaves it unwired produces
     // an image no host can ever see (the P0 found when the first upload
     // build tied it to 1'b0).  Driven by the POR: attach only after the
-    // ~175 ms power-on count (ext/usb_por.sv, parameterized so the sim
-    // TB can shorten it).
+    // ~175 ms power-on count (usb::UsbPor in src/usb.vir; its count is
+    // inlined -- no parameter -- so the sim TB eats the full delay).
     outgoing usb_dp_pu : Bit
     // heartbeat LEDs (active low on PVT), driven by the core's
     // activity signals
@@ -19,9 +19,10 @@ export mod Top for ice40::Fomu {
     outgoing led_green : Bit
     outgoing led_blue  : Bit
 
-    // Power-on reset.  Instantiated at the top (not inside the
-    // controller) so the ext body's POR_CYCLES parameter stays
-    // overridable by the testbench.
+    // Power-on reset (a plain Virdant mod since the POR_CYCLES
+    // parameter was inlined).  Kept at the top (not inside the
+    // controller) so the topology mirrors the sim TB, which
+    // instantiates the pieces directly.
     mod por of usb::UsbPor {
         it.clock := clock
     }

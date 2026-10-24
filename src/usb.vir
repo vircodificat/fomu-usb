@@ -2,14 +2,13 @@
 //>
 //> This is the "rest of the USB controller" half of the Virdant/Verilog
 //> split (see wiki/top-vir.md and HANDOFF.md): everything between the
-//> byte stream and the pads except the two things Virdant cannot
-//> express -- the bidirectional USB pads (UsbPads, ext) and the
-//> parameterized power-on reset (UsbPor, ext; the TB overrides
-//> POR_CYCLES, which only a hand-written Verilog body can offer).
+//> byte stream and the pads except the one thing Virdant cannot
+//> express -- the bidirectional USB pads (UsbPads, ext; the only
+//> `inout` in the design).
 //>
 //> Topology (wired by export mod Top in src/top.vir):
 //>
-//>     UsbPor (ext, ~175 ms) --por_done--> UsbController --byte stream--> echo
+//>     UsbPor (~175 ms) --por_done--> UsbController --byte stream--> echo
 //>     UsbController --dp_tx/dn_tx/output_enable--> UsbPads (ext, SB_IO)
 //>     UsbPads --dp_rx/dn_rx--> UsbController
 //>
@@ -44,37 +43,55 @@ ext mod UsbPads {
     outgoing dn_rx : Bit
 }
 
-//> Power-on reset: counts to POR_CYCLES at 48 MHz, then releases
-//> `por_done`.  The default (~8.4M cycles = ~175 ms) is how long the
-//> device waits before releasing the D+ pull-up and attaching to the
-//> host; testbenches override it to a few hundred cycles.  The
-//> parameter lives in the hand-written Verilog body
-//> (ext/usb_por.sv) so the sim TB can override it at instantiation --
-//> a plain Virdant `mod` would bake the count into generated code the
-//> TB cannot reach.
+//> Power-on reset: counts 8.4M cycles at 48 MHz (~175 ms), then
+//> releases `por_done`.  The count is the USB attach delay: how long
+//> the device waits before releasing the D+ pull-up and attaching to
+//> the host.
 //>
-//> NB: Virdant's `@parameter` annotation mechanism (declared on an ext
-//> mod def, overridden at the instantiation) was tried here and DOES
-//> elaborate -- but its Verilog emission is currently broken: a
-//> trailing comma after the last `#(.NAME(value))` entry whenever the
-//> ext mod has ports, which iverilog rejects (yosys tolerates it).
-//> Left unused until upstream fixes the emitter; the body's Verilog
-//> `parameter` is the parameterization that matters for the TB.
-ext mod UsbPor {
+//> NB: the POR count is inlined -- there is no parameter.  The old ext
+//> body kept `POR_CYCLES` as a hand-written Verilog `parameter` so the
+//> sim TB could shorten it, but a plain Virdant mod must bake the
+//> constant into generated code the TB cannot reach, so the sim now
+//> eats the full ~175 ms attach delay.
+mod UsbPor {
     //> 48 MHz board clock.
     incoming clock  : Clock
-    //> High once the POR_CYCLES count completes: gates the D+ pull-up
+    //> High once the POR count completes: gates the D+ pull-up
     //> (attach) at the top and, registered once more in UsbController,
     //> the core reset.
     outgoing por_done : Bit
+
+    // 24 bits suffice: 8_400_000 < 2^24 = 16_777_216.
+    reg por_cnt : Word[24] on clock {
+        initial it <= 0
+        it <= when {
+            case !por_done_r && (it < 8_400_000) => it + 1
+            else                                 => it
+        }
+    }
+
+    reg por_done_r : Bit on clock {
+        initial it <= false
+        it <= when {
+            case por_cnt >= 8_400_000 => true
+            else                      => it
+        }
+    }
+
+    por_done := por_done_r
 }
 
 //> The USB Full-Speed CDC-ACM device core, vendored Verilog
 //> (ext/usb_uart.sv, module inventory in its file header).  This is
 //> the migration boundary: the core stays an ext mod today and its
-//> internals (usb_crc5/16, usb_fifo16x8, usb_rx_phy, usb_rx_packet,
-//> usb_tx_phy, usb_ep0, usb_serial) move into .vir one at a time, all
-//> with unidirectional interfaces.
+//> internals move into .vir one at a time, all with unidirectional
+//> interfaces.  Done so far: usb_crc5/16 -> usb::Crc5/Crc16,
+//> usb_rx_phy -> usb::RxPhy, usb_rx_packet -> usb::RxPacket,
+//> usb_tx_phy -> usb::TxPhy.  Remaining: usb_fifo16x8, usb_ep0,
+//> usb_serial -- plus \usb::RxRam (the 64x8 payload block RAM),
+//> which stays vendored Verilog for good: Virdant cannot express an
+//> indexed memory (the same limitation that keeps \echo::EchoFifo
+//> in ext/).
 ext mod UsbUart {
     //> 48 MHz clock: 4 clk cycles per USB FS bit.
     incoming clk : Clock
@@ -493,6 +510,647 @@ mod RxPhy {
             case rst              => false
             case se0_cnt == 119w7 => true
             else                  => false
+        }
+    }
+}
+
+//> usb_rx_packet -- bit stream -> packet records, migrated out of
+//> ext/usb_uart.sv.  Cycle-exact translation of the original always
+//> blocks (same discipline as usb::RxPhy): every reg's next-state
+//> below is the same priority chain the Verilog if/else-if tree
+//> encoded, and the registered-helper structure (the cap precompute
+//> + qualify dance) is load-bearing for the 48 MHz timing -- see
+//> wiki/usb-rx-packet.md and the original comments carried below.
+//>
+//> Bit counting: nb counts PID-section bits (sync 0..7 ignored, PID
+//> byte 0..7, token data 8..18, crc5 wire bits 19..23, parked at 24
+//> in the data section); n3 is the data-section bit-in-byte index
+//> (0..7, wrapping), with bc counting complete bytes (payload + the
+//> 2 trailing crc16 wire bytes, subtracted at EOP).  Emits 1-clk
+//> registered pulses tk_*/dt_*/hs_*; bad packets are silent.
+//> Payload capture: dt_head = flopped packet bytes 0..7, and the
+//> payload RAM (usb::RxRam above) holds bytes 0..63 in block RAM
+//> (sync read: dt_rd_addr -> dt_rd_data the next clk).
+enum type RxPktState {
+    Idle = 0b00w2
+    Sync = 0b01
+    Body = 0b10
+}
+
+//> The 64x8 payload block RAM (dt_ram in the old usb_rx_packet), the
+//> one piece of the packet receiver that stays vendored Verilog:
+//> Virdant cannot express an indexed memory.  One write port
+//> (registered address, one enable -- no decode tree, no per-byte
+//> enable fanout) and one registered sync read port (present ra,
+//> the byte is on rd the NEXT clk) that replaces the 64:1 read mux
+//> the flopped version would put on the 48 MHz critical path.
+//> Read-during-write to one address returns the OLD byte
+//> (nonblocking semantics), exactly the old dt_ram contract.
+//> Body in ext/usb_uart.sv, (* ram_style = "block" *) for yosys.
+ext mod RxRam {
+    //> 48 MHz clock.
+    incoming clk : Clock
+    //> Write enable: byte-complete strobe, pre-gated with !(bc >= 64)
+    //> by the caller (writes beyond byte 63 are dropped -- over-length
+    //> packets go bad and dt_valid never fires, so no consumer ever
+    //> sees a dropped byte).
+    incoming we : Bit
+    //> Write address: the byte-count index, 0..63.
+    incoming wa : Word[6]
+    //> Write data byte.
+    incoming wd : Word[8]
+    //> Read address (present this clk; the byte is on rd next clk).
+    incoming ra : Word[6]
+    //> Registered read data: mem[ra] as of the previous posedge.
+    outgoing rd : Word[8]
+}
+
+//> Bit stream -> packet records: consumes usb::RxPhy's decoded bit
+//> stream (bit_i/bit_valid/sop/eop/pkt_err) and emits 1-clk record
+//> pulses -- tk_* (token: OUT/IN/SOF), dt_* (data: payload +
+//> read port), hs_* (handshake) -- for the router in the core top.
+//> A packet record is emitted only if the packet was good; CRC
+//> failures deliver the record with *_crc_ok low instead (the
+//> protocol layer retries), while stuff errors, bad PIDs and
+//> over-length payloads make the packet silent (bad).
+mod RxPacket {
+    //> 48 MHz clock: 4 clk cycles per USB FS bit.
+    incoming clk : Clock
+    //> Synchronous reset, active high (core reset from UsbController).
+    incoming rst : Bit
+    //> Bus reset strobe from usb::RxPhy (SE0 held >= 2.5 us): flushes
+    //> everything, including partial packet state.
+    incoming bus_reset : Bit
+    //> Decoded (NRZI-decoded, bit-unstuffed) data bit.
+    incoming bit_i : Bit
+    //> 1-clk strobe: bit_i is a real packet bit this cycle.
+    incoming bit_valid : Bit
+    //> 1-clk pulse: start of packet (J->K from idle).
+    incoming sop : Bit
+    //> 1-clk pulse: end of packet (SE0 held ~1.75 bit times).
+    incoming eop : Bit
+    //> Sticky per-packet error from usb::RxPhy (stuff violation or
+    //> illegal line state); kills the packet.
+    incoming pkt_err : Bit
+
+    // ---- token record ------------------------------------------------
+    //> 1-clk pulse: a token record is in tk_* (latched this edge).
+    outgoing tk_valid : Bit {
+        it := tk_valid_r
+    }
+    //> Token PID (OUT 1 / IN 9 / SOF 5 / SETUP D).
+    outgoing tk_pid : Word[4] {
+        it := tk_pid_r
+    }
+    //> Device address (tk_sh[6:0]; SOF packets leave it stale).
+    outgoing tk_addr : Word[7] {
+        it := tk_addr_r
+    }
+    //> Endpoint (tk_sh[10:7]; SOF packets leave it stale).
+    outgoing tk_endp : Word[4] {
+        it := tk_endp_r
+    }
+    //> SOF frame number (tk_sh[10:0]; non-SOF tokens leave it stale).
+    outgoing tk_frame : Word[11] {
+        it := tk_frame_r
+    }
+    //> CRC5 residual check (5'h0C after a good token stream).
+    outgoing tk_crc_ok : Bit {
+        it := tk_crc_ok_r
+    }
+
+    // ---- data record -------------------------------------------------
+    //> 1-clk pulse: a data record is in dt_* (latched this edge).
+    outgoing dt_valid : Bit {
+        it := dt_valid_r
+    }
+    //> Data PID (DATA0 3 / DATA1 B).
+    outgoing dt_pid : Word[4] {
+        it := dt_pid_r
+    }
+    //> Payload byte count (bc - 2: the 2 crc16 wire bytes are excluded).
+    outgoing dt_len : Word[7] {
+        it := dt_len_r
+    }
+    //> Flopped payload head window, packet bytes 0..7 (consumers that
+    //> need several bytes AT ONCE -- the EP0 request latch,
+    //> SET_LINE_CODING -- cannot use the one-at-a-time RAM port).
+    outgoing dt_head : Word[64] {
+        it := dt_head_r
+    }
+    //> Payload RAM registered read (usb::RxRam.rd): present dt_rd_addr,
+    //> the byte is here the NEXT clk.
+    outgoing dt_rd_data : Word[8] {
+        it := ram.rd
+    }
+    //> Payload RAM read address (the rx-push byte index in the core).
+    incoming dt_rd_addr : Word[6]
+    //> CRC16 residual check (16'h800D after a good payload stream).
+    outgoing dt_crc_ok : Bit {
+        it := dt_crc_ok_r
+    }
+
+    // ---- handshake record --------------------------------------------
+    //> 1-clk pulse: a handshake record is in hs_pid (latched this edge).
+    outgoing hs_valid : Bit {
+        it := hs_valid_r
+    }
+    //> Handshake PID (ACK 2 / NAK A / STALL E).
+    outgoing hs_pid : Word[4] {
+        it := hs_pid_r
+    }
+
+    // ---- capture helpers, wires ----------------------------------------
+
+    //> PID capture value on this cycle (shift bit_i in at the bottom;
+    //> wire order = LSB first).
+    wire pid_new : Word[8] {
+        it := word(bit_i, pid_r[8..1])
+    }
+    //> Byte completing on this bit clk (bit_i = the byte MSB,
+    //> bshift[7:1] = the earlier 7 bits, LSB first).
+    wire dt_byte_new : Word[8] {
+        it := word(bit_i, bshift[8..1])
+    }
+    //> Byte-complete write strobe (registered inputs only: n3/st/sec
+    //> are regs; bit_valid/pkt_err are registered upstream in
+    //> usb::RxPhy).
+    wire dt_wr : Bit {
+        it := bit_valid && !pkt_err && (st == #Body) && sec && (n3 == 7w3)
+    }
+
+    // ---- CRC LFSRs ----------------------------------------------------
+    //> CRC5 advances on token bits nb = 8..23 (data + received crc5
+    //> wire bits; residual 5'h0C).  NOT gated by pkt_err, exactly as
+    //> the vendored body: a bad packet's residual is never sampled.
+    mod crc5 of Crc5 {
+        it.clk := clk
+        it.rst := sop || rst || bus_reset
+        it.adv := bit_valid && (st == #Body) && !sec
+            && (nb >= 8w5) && (nb < 24w5)
+        it.din := bit_i
+    }
+    //> c5: the CRC5 state / residual compare source.
+    wire c5 : Word[5] {
+        it := crc5.crc
+    }
+    //> CRC16 advances on every data-section bit (payload + received
+    //> crc16 wire bits; residual 16'h800D).
+    mod crc16 of Crc16 {
+        it.clk := clk
+        it.rst := sop || rst || bus_reset
+        it.adv := bit_valid && (st == #Body) && sec
+        it.din := bit_i
+    }
+    //> c16: the CRC16 state / residual compare source.
+    wire c16 : Word[16] {
+        it := crc16.crc
+    }
+
+    // ---- registered helpers --------------------------------------------
+    //> Each ends at its OWN register so the wide compares stay out of
+    //> the capture strobes' cones (48 MHz timing; the caps are
+    //> consumed only at EOP, >= 8 clks after the last bit, so the +1
+    //> clk on each is free).  Computed every cycle from registered
+    //> inputs; mid-packet values are harmless (only read at EOP).
+
+    //> bc == 66 registered (the over-length hit), split so no 7-bit
+    //> compare rides bc's D-cone: bits 6..3 == 0100 and bits 2..0 ==
+    //> 010 (66 = 0b1000010).
+    reg bc_is_66_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => (bc[7..3] == 4w4) && (bc[3..0] == 2w3)
+        }
+    }
+    //> PID check failure ({~pid, pid}: low nibble != ~high nibble,
+    //> i.e. the nibbles XOR != 1111), registered one clk before it
+    //> sets `bad`.
+    reg pid_bad_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => bit_valid && (st == #Body) && !sec && (nb == 7w5)
+                    && ((pid_new[4..0] ^ pid_new[8..4]) != 15w4)
+        }
+    }
+    //> Over-length data hit registered (67th byte = bc == 66 with a
+    //> byte completing): feeds `bad`, +1 clk.
+    reg bc66_hit_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => bit_valid && (st == #Body) && sec
+                    && (n3 == 7w3) && (bc == 66w7)
+        }
+    }
+    //> CRC5 residual compare (5'h0C), registered: the 5-bit equality
+    //> tree ends at its own flop instead of riding tk_crc_ok's cone.
+    reg crc5_res_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => c5 == 12w5
+        }
+    }
+    //> CRC16 residual compare (16'h800D), registered likewise.
+    reg crc16_res_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => c16 == 0x800dw16
+        }
+    }
+
+    //> Flat sticky per-packet error, plain D (no clock enable): set on
+    //> a stuff error (inline), a bad PID or an over-length byte (the
+    //> registered hits above, +1 clk); cleared at sop and by reset.
+    //> A bad packet is silent: every cap is qualified by !bad, so no
+    //> strobe ever fires.
+    reg bad : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case sop              => false
+            else => it || (bit_valid && pkt_err) || pid_bad_r || bc66_hit_r
+        }
+    }
+
+    // ---- FSM ------------------------------------------------------------
+    //> IDLE -> (sop) -> SYNC (skip the 8 sync bits) -> BODY (PID
+    //> section, then token or data section) -> (eop) -> IDLE.
+    reg st : RxPktState on clk {
+        initial it <= #Idle
+        it <= when {
+            case rst || bus_reset => #Idle
+            case sop             => #Sync
+            case eop             => #Idle
+            case bit_valid && !pkt_err => mux(it == #Sync && nb == 7w5, #Body, it)
+            else => it
+        }
+    }
+
+    //> PID/token-section bit index: sync 0..7 (ignored), PID byte
+    //> 0..7, token data 8..18, crc5 wire bits 19..23; parked at 24 in
+    //> the data section (and reached at EOP for a well-formed token).
+    reg nb : Word[5] on clk {
+        initial it <= 0w5
+        it <= when {
+            case rst || bus_reset => 0w5
+            case sop             => 0w5
+            case bit_valid && !pkt_err => match st {
+                case #Sync => mux(it == 7w5, 0w5, it + 1w5)
+                case #Body => when {
+                    // data section: parked at 24
+                    case sec     => it
+                    // last PID bit: classify the packet from the low 2
+                    // PID bits (11 = data -> park at 24; else token/
+                    // handshake bits start at 8)
+                    case it == 7w5 => mux(pid_new[2..0] == 3w2, 24w5, 8w5)
+                    else           => it + 1w5
+                }
+                else => it
+            }
+            else => it
+        }
+    }
+
+    //> Data-section bit-in-byte index (0..7, wraps mod 8).
+    reg n3 : Word[3] on clk {
+        initial it <= 0w3
+        it <= when {
+            case rst || bus_reset => 0w3
+            case sop             => 0w3
+            case bit_valid && !pkt_err => match st {
+                case #Sync => mux(nb == 7w5, 0w3, it)
+                case #Body => mux(sec,
+                    it + 1w3,
+                    mux(nb == 7w5 && pid_new[2..0] == 3w2, 0w3, it))
+                else => it
+            }
+            else => it
+        }
+    }
+
+    //> The PID byte, FROZEN after the PID section (it classifies the
+    //> packet at EOP; the token/crc bits never touch it).
+    reg pid_r : Word[8] on clk {
+        initial it <= 0w8
+        it <= when {
+            case rst || bus_reset => 0w8
+            case sop             => 0w8
+            case bit_valid && !pkt_err
+                && (st == #Body) && !sec && (nb < 8w5) => pid_new
+            else => it
+        }
+    }
+
+    //> The 11 token bits, shift-up capture (LSB first): at EOP,
+    //> addr = tk_sh[6:0], endp = tk_sh[10:7], frame = tk_sh[10:0].
+    reg tk_sh : Word[11] on clk {
+        initial it <= 0w11
+        it <= when {
+            case rst || bus_reset => 0w11
+            case sop             => 0w11
+            case bit_valid && !pkt_err
+                && (st == #Body) && !sec
+                && (nb >= 8w5) && (nb < 19w5) => word(bit_i, it[11..1])
+            else => it
+        }
+    }
+
+    //> Data-section byte assembly shifter (feeds dt_byte_new).
+    reg bshift : Word[8] on clk {
+        initial it <= 0w8
+        it <= when {
+            case rst || bus_reset => 0w8
+            case sop             => 0w8
+            case bit_valid && !pkt_err
+                && (st == #Body) && sec => word(bit_i, it[8..1])
+            else => it
+        }
+    }
+
+    //> Byte count in the data section: payload bytes + the 2
+    //> trailing crc16 wire bytes (subtracted at EOP).
+    reg bc : Word[7] on clk {
+        initial it <= 0w7
+        it <= when {
+            case rst || bus_reset => 0w7
+            case sop             => 0w7
+            case bit_valid && !pkt_err
+                && (st == #Body) && sec && (n3 == 7w3) => it + 1w7
+            else => it
+        }
+    }
+
+    //> Section flag: 0 = PID section, 1 = data section (set when the
+    //> PID low bits say 11).
+    reg sec : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case sop             => false
+            case bit_valid && !pkt_err
+                && (st == #Body) && !it && (nb == 7w5)
+                => mux(pid_new[2..0] == 3w2, true, it)
+            else => it
+        }
+    }
+
+    // ---- capture candidates --------------------------------------------
+    //> The (wide) end-of-packet capture conditions, precomputed at the
+    //> last relevant BIT clk and held until EOP (no bit_valid clks
+    //> fire during SE0/EOP, so a hold is safe; any further decoded bit
+    //> clears them, so over-long packets stay silent).  The EOP-edge
+    //> strobes then close over 2-3 shallow inputs instead of the whole
+    //> bit-counting tree.
+
+    //> Registered shared qualify for the PID-section caps (+1 clk: the
+    //> caps are consumed only at EOP >= 8 clks later, so it is free).
+    //> A same-cycle pkt_err is re-checked inline in every cap.
+    reg q_pid_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case sop             => false
+            case bit_valid => !bad && !pkt_err && (st == #Body) && !sec
+            else => it
+        }
+    }
+    //> Registered shared qualify for the data-section cap, ditto.
+    reg q_dat_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case sop             => false
+            case bit_valid => !bad && !pkt_err && (st == #Body) && sec
+            else => it
+        }
+    }
+
+    //> Token cap: last token bit (nb == 23) with token-class PID low
+    //> bits (01).
+    reg tok_cap : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case sop             => false
+            case eop             => false
+            case bit_valid => q_pid_r && !pkt_err
+                && (pid_r[2..0] == 1w2) && (nb == 23w5)
+            else => it
+        }
+    }
+    //> SOF cap: token cap plus PID value 5 (the frame number case).
+    reg sof_cap : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case sop             => false
+            case eop             => false
+            case bit_valid => q_pid_r && !pkt_err
+                && (pid_r[2..0] == 1w2) && (nb == 23w5)
+                && (pid_r[4..0] == 5w4)
+            else => it
+        }
+    }
+    //> Handshake cap: last PID bit (nb == 7) with handshake-class low
+    //> bits (00 or 10) and the {~pid, pid} check inline (bad is not
+    //> visible yet at this edge -- it comes via the +1-clk pid_bad_r).
+    reg hs_cap : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case sop             => false
+            case eop             => false
+            case bit_valid => q_pid_r && !pkt_err
+                && ((pid_r[2..0] == 0w2) || (pid_r[2..0] == 2w2))
+                && (nb == 7w5)
+                && ((pid_new[4..0] ^ pid_new[8..4]) == 15w4)
+            else => it
+        }
+    }
+    //> Data cap: byte-aligned last bit (n3 == 7) with dat_bc_ok_r
+    //> (bc in 1..65: at least 2 bytes total at EOP, and one more byte
+    //> would still fit the 64-byte payload RAM -- the bc == 66
+    //> overflow is gated via the registered bc_is_66_r).
+    reg dat_cap : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case sop             => false
+            case eop             => false
+            case bit_valid => q_dat_r && !pkt_err && (n3 == 7w3) && dat_bc_ok_r
+            else => it
+        }
+    }
+    //> Registered byte-count admission for dat_cap (bc in 1..65 as of
+    //> the last bit); NOT cleared at sop (holds through, exactly as
+    //> the vendored body -- a sop-edge recompute would drag bc's
+    //> D-cone into the strobe path).
+    reg dat_bc_ok_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case sop             => it
+            case bit_valid => (bc != 0w7) && !bc_is_66_r
+            else => it
+        }
+    }
+
+    // ---- payload storage -----------------------------------------------
+    //> The payload RAM instance (block RAM, off the fabric: one write
+    //> port + one registered read -- see usb::RxRam above).  Writes
+    //> beyond byte 63 are dropped (bc[6]: over-length packets set bad
+    //> via bc66_hit_r, so dt_valid never fires and no consumer ever
+    //> sees a truncated payload).
+    mod ram of RxRam {
+        it.clk := clk
+        it.we  := dt_wr && !bc[6]
+        it.wa  := bc[6..0]
+        it.wd  := dt_byte_new
+        it.ra  := dt_rd_addr
+    }
+
+    //> Flopped payload head shadow, packet bytes 0..7 (bc < 8), in its
+    //> own driver block so the byte enables stay out of the FSM's
+    //> cones.  A bad packet's payload is still written (same as the
+    //> vendored body); dt_valid just never fires for it.
+    reg dt_head_r : Word[64] on clk {
+        initial it <= 0w64
+        it <= when {
+            case rst || bus_reset => 0w64
+            // bc < 8: head window (bits 6..3 == 0)
+            case dt_wr && (bc[7..3] == 0w4) => match bc[3..0] {
+                // byte k lands at dt_head[8k+7 : 8k], LSB first
+                case 0 => word(it[64..8],  dt_byte_new)
+                case 1 => word(it[64..16], dt_byte_new, it[8..0])
+                case 2 => word(it[64..24], dt_byte_new, it[16..0])
+                case 3 => word(it[64..32], dt_byte_new, it[24..0])
+                case 4 => word(it[64..40], dt_byte_new, it[32..0])
+                case 5 => word(it[64..48], dt_byte_new, it[40..0])
+                case 6 => word(it[64..56], dt_byte_new, it[48..0])
+                case 7 => word(dt_byte_new, it[56..0])
+            }
+            else => it
+        }
+    }
+
+    // ---- output strobes + captured fields --------------------------------
+    //> FLAT equations, one always block in the vendored body: the caps
+    //> are MUTUALLY EXCLUSIVE by construction (tok: nb==23 in the PID
+    //> section; hs: nb==7 in the PID section; dat: data section), so
+    //> the caps close each strobe as one 2-input AND of registers, and
+    //> reading them AT the eop edge is safe (same edge clears them;
+    //> nonblocking semantics see the pre-edge values).
+
+    //> Token strobe.
+    reg tk_valid_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => eop && tok_cap
+        }
+    }
+    //> Token PID field: pid_r[3:0] at EOP.
+    reg tk_pid_r : Word[4] on clk {
+        initial it <= 0w4
+        it <= when {
+            case rst || bus_reset => 0w4
+            case eop && tok_cap => pid_r[4..0]
+            else => it
+        }
+    }
+    //> Token address field: tk_sh[6:0] (non-SOF tokens only).
+    reg tk_addr_r : Word[7] on clk {
+        initial it <= 0w7
+        it <= when {
+            case rst || bus_reset => 0w7
+            case eop && tok_cap && !sof_cap => tk_sh[7..0]
+            else => it
+        }
+    }
+    //> Token endpoint field: tk_sh[10:7] (non-SOF tokens only).
+    reg tk_endp_r : Word[4] on clk {
+        initial it <= 0w4
+        it <= when {
+            case rst || bus_reset => 0w4
+            case eop && tok_cap && !sof_cap => tk_sh[11..7]
+            else => it
+        }
+    }
+    //> SOF frame field: the whole tk_sh (SOF tokens only).
+    reg tk_frame_r : Word[11] on clk {
+        initial it <= 0w11
+        it <= when {
+            case rst || bus_reset => 0w11
+            case eop && tok_cap && sof_cap => tk_sh
+            else => it
+        }
+    }
+    //> Token CRC5 verdict: the registered residual compare.
+    reg tk_crc_ok_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case eop && tok_cap => crc5_res_r
+            else => it
+        }
+    }
+
+    //> Data strobe.
+    reg dt_valid_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => eop && dat_cap
+        }
+    }
+    //> Data PID field.
+    reg dt_pid_r : Word[4] on clk {
+        initial it <= 0w4
+        it <= when {
+            case rst || bus_reset => 0w4
+            case eop && dat_cap => pid_r[4..0]
+            else => it
+        }
+    }
+    //> Data length field: bc - 2 (the crc16 wire bytes drop out).
+    reg dt_len_r : Word[7] on clk {
+        initial it <= 0w7
+        it <= when {
+            case rst || bus_reset => 0w7
+            case eop && dat_cap => mux(bc >= 2w7, bc - 2w7, 0w7)
+            else => it
+        }
+    }
+    //> Data CRC16 verdict: the registered residual compare.
+    reg dt_crc_ok_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case eop && dat_cap => crc16_res_r
+            else => it
+        }
+    }
+
+    //> Handshake strobe.
+    reg hs_valid_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => eop && hs_cap
+        }
+    }
+    //> Handshake PID field (nothing follows the PID byte).
+    reg hs_pid_r : Word[4] on clk {
+        initial it <= 0w4
+        it <= when {
+            case rst || bus_reset => 0w4
+            case eop && hs_cap => pid_r[4..0]
+            else => it
         }
     }
 }
@@ -951,8 +1609,9 @@ mod TxPhy {
 mod UsbController {
     //> 48 MHz board clock.
     incoming clock : Clock
-    //> From UsbPor (instantiated at the top so the sim TB can
-    //> parameterize it): high once the ~175 ms power-on count is done.
+    //> From UsbPor (instantiated at the top, mirroring the sim TB's
+    //> instantiate-the-pieces topology): high once the ~175 ms power-on
+    //> count is done.
     incoming por_done : Bit
 
     // Byte-stream interface (plan §2), identical contract to the old

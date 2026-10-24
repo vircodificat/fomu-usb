@@ -3,8 +3,9 @@
 // Hand-written Verilog-2005 for iverilog.
 //
 // Instantiates the post-split pieces directly (with sb_io_sim for the
-// pads), mirroring export mod Top in src/top.vir: the ext POR
-// (\usb::UsbPor, POR_CYCLES parameterized so sim can shorten it), the
+// pads), mirroring export mod Top in src/top.vir: the POR
+// (\usb::UsbPor -- a plain Virdant mod whose ~175 ms count is
+// inlined, so this sim eats the full 8.4M-cycle attach delay), the
 // Virdant USB controller (the generated build/usb.sv
 // \usb::UsbController), and the ext SB_IO pad pair (\usb::UsbPads,
 // ext/usb_pads.sv -- the only `inout` in the design).  The Virdant
@@ -38,11 +39,12 @@ module tb_usb_serial;
     integer sof_frame = 0;
 
     // ------------------------------------------------------------------
-    // DUT (short POR for sim; hardware default is ~175 ms) -- the
+    // DUT (the POR count is inlined in the Virdant mod: ~175 ms of
+    // simulated attach delay, no parameter to shorten) -- the
     // post-split topology of export mod Top in src/top.vir.
     // ------------------------------------------------------------------
     wire por_done;
-    \usb::UsbPor #(.POR_CYCLES(24'd200)) por(
+    \usb::UsbPor por(
         .clock(clk), .por_done(por_done));
 
     wire usb_dp_pu = por_done;    // wired at the top in src/top.vir

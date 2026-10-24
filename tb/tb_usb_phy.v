@@ -2,7 +2,7 @@
 // Part of ~/projects/fomu-usb (see FOMU_UART_OVER_USB_PLANv2.md §7).
 // Hand-written Verilog-2005 for iverilog.
 //
-// Wires the BFM's pad driver straight into usb_rx_phy + usb_rx_packet,
+// Wires the BFM's pad driver straight into \usb::RxPhy + \usb::RxPacket,
 // and loops the core's usb_tx_phy output back onto the same nets (via a
 // tri-state driver, like the SB_IO would): BFM-sent packets must decode
 // with correct PID/addr/EP/bytes/CRC, and core-sent packets must be
@@ -45,7 +45,7 @@ module tb_usb_phy;
     wire [63:0] dt_head;
     wire [7:0]  dt_rd_data;
     reg  [5:0]  dt_rd_addr = 6'd0;
-    usb_rx_packet rxpkt(
+    \usb::RxPacket rxpkt(
         .clk(clk), .rst(rst), .bus_reset(rx_breset),
         .bit_i(rx_bit), .bit_valid(rx_bitv),
         .sop(rx_sop), .eop(rx_eop), .pkt_err(rx_perr),

@@ -11,8 +11,7 @@
 //              i_OUTPUT_ENABLE=oe, i_D_OUT_0=o, o_D_IN_0=i)
 // No clock, no reset, no state: pure pad plumbing.  Everything around
 // this — POR, pull-up enable, the USB core itself — is unidirectional
-// and lives in Virdant (src/usb.vir) or the parameterized POR ext mod
-// (ext/usb_por.sv).
+// and lives in Virdant (src/usb.vir); the POR is usb::UsbPor there.
 //
 // Port contract note: the Virdant ext mod declaration (src/usb.vir)
 // types the pad side `outgoing Bit` because Virdant cannot express a
