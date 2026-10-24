@@ -90,6 +90,341 @@ ext mod UsbUart {
     outgoing txing : Bit
 }
 
+//> Serial CRC LFSRs (USB 2.0 §8.3.5), migrated out of ext/usb_uart.sv.
+//> Both advance one serial WIRE bit per clk when `adv` is high (wire
+//> order = LSB first); the checker convention feeds the received wire
+//> CRC bits too and compares the residual (token CRC5: 5'h0C, data
+//> CRC16: 16'h800D).  Known-answer vectors live in tb/tb_crc.v,
+//> cross-checked against valentyusb.
+//>
+//> Wire-bit convention (ext/usb_uart.sv header): TX emits
+//> crc_wire[i] = ~crc[W-1-i] (complement + bit reverse).
+
+//> CRC5, poly x^5+x^2+1, seed 0x1F -- token CRC (addr+endp).
+mod Crc5 {
+    incoming clk : Clock
+    incoming rst : Bit
+    incoming adv : Bit
+    incoming din : Bit
+    outgoing crc : Word[5] {
+        it := r
+    }
+
+    //> feedback: new bit = din ^ tap
+    wire inv : Bit {
+        it := din ^ r[4]
+    }
+
+    reg r : Word[5] on clk {
+        initial it <= 31w5
+        it <= when {
+            case rst => 31w5
+            case adv => word(it[4..0], inv) ^ word(0w2, inv, 0w2)
+            else     => it
+        }
+    }
+}
+
+//> CRC16, poly x^16+x^15+x^2+1, seed 0xFFFF -- data-payload CRC.
+mod Crc16 {
+    incoming clk : Clock
+    incoming rst : Bit
+    incoming adv : Bit
+    incoming din : Bit
+    outgoing crc : Word[16] {
+        it := r
+    }
+
+    wire inv : Bit {
+        it := din ^ r[15]
+    }
+
+    reg r : Word[16] on clk {
+        initial it <= 65535w16
+        it <= when {
+            case rst => 65535w16
+            case adv => word(it[15..0], inv) ^ word(inv, 0w12, inv, 0w2)
+            else     => it
+        }
+    }
+}
+
+//> usb_rx_phy -- pads to decoded bits (USB 2.0 §7.1.x), migrated out
+//> of ext/usb_uart.sv.  Single 48 MHz domain, 4 clks per FS bit, no
+//> DLL/PLL/CDC.  Turn the raw D+/D- pad samples into an NRZI-decoded,
+//> bit-unstuffed serial bit stream plus the packet-boundary signals
+//> the rest of the core consumes (all one-clk strobes):
+//>
+//>   sop   J->K seen from idle (start of packet)
+//>   eop   SE0 held ~1.75 bit times (end of packet)
+//>   active  inside a packet (sop..eop)
+//>   pkt_err sticky per-packet error (SE1 seen, or 6 ones then a 1;
+//>           cleared at the next sop)
+//>   bus_reset SE0 held >= 2.5 us (120 clks)
+//>
+//> Cycle-exact translation of the original always block: every reg's
+//> next-state below is the same priority chain the Verilog if/else-if
+//> tree encoded.  The bit-sampling details (phase-1 capture, re-align
+//> on every transition, 7-clk EOP arming) are load-bearing -- see the
+//> original comments preserved on each reg and wiki/usb-rx-phy.md.
+mod RxPhy {
+    incoming clk : Clock
+    incoming rst : Bit
+    //> raw pad samples (SB_IO D_IN_0 through the UsbPads ext mod).
+    incoming dp  : Bit
+    incoming dn  : Bit
+
+    outgoing bit_o     : Bit {
+        it := bit_r
+    }
+    outgoing bit_valid : Bit {
+        it := bit_v_r
+    }
+    outgoing sop       : Bit {
+        it := sop_r
+    }
+    outgoing eop       : Bit {
+        it := eop_r
+    }
+    outgoing active    : Bit {
+        it := act
+    }
+    outgoing pkt_err   : Bit {
+        it := perr
+    }
+    outgoing bus_reset : Bit {
+        it := br_r
+    }
+
+    // ---- synchronizers, edge history, decode cones --------------------
+
+    reg dp_s1 : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst => false
+            else     => dp
+        }
+    }
+    reg dp_s2 : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst => false
+            else     => dp_s1
+        }
+    }
+    reg dn_s1 : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst => false
+            else     => dn
+        }
+    }
+    reg dn_s2 : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst => false
+            else     => dn_s1
+        }
+    }
+    // previous-cycle sample (transition detect)
+    reg dp_p : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst => false
+            else     => sdp
+        }
+    }
+    reg dn_p : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst => false
+            else     => sdn
+        }
+    }
+
+    wire sdp : Bit {
+        it := dp_s2
+    }
+    wire sdn : Bit {
+        it := dn_s2
+    }
+    wire trans : Bit {
+        it := (sdp != dp_p) || (sdn != dn_p)
+    }
+    // bus states: SE0 (both low), SE1 (illegal), K (the sync edge polarity)
+    wire se0 : Bit {
+        it := !sdp && !sdn
+    }
+    wire se1 : Bit {
+        it := sdp && sdn
+    }
+    wire k : Bit {
+        it := !sdp && sdn
+    }
+    // NRZI decode of the mid-bit sample: a bit is a 1 when the line
+    // level did not change since the previous sample.
+    wire bit_val : Bit {
+        it := (sdp == lev_d) && (sdn == lev_n)
+    }
+
+    // next-state helper cones (mutually exclusive where priority
+    // matters; rst always wins as the first case of every reg)
+    wire sop_edge : Bit {
+        it := !act && k
+    }
+    wire abort : Bit {
+        it := act && se1
+    }
+    wire eop_now : Bit {
+        it := act && se0 && (se0_cnt == 6w7)
+    }
+    // inside a packet at a J/K level (not SE0/SE1)
+    wire jk : Bit {
+        it := act && !se1 && !se0
+    }
+    // the mid-bit sample point: phase 1 captures sdp 2-3 clks after the
+    // switch reaches sdp -- inside the bit's visibility window for EVERY
+    // achievable quantized window width (3, 4 or 5 clks).  The re-align
+    // at every transition (ph reset, below) makes the counter read 0 one
+    // clk after the transition, so one sample lands per bit window for
+    // run windows of any length (4n-1/4n/4n+1 clks all yield n captures).
+    wire sample : Bit {
+        it := jk && (ph == 1w2)
+    }
+
+    // previous bit sample (NRZI decode reference); idle is J
+    reg lev_d : Bit on clk {
+        initial it <= true
+        it <= when {
+            case rst    => true
+            case sample => sdp
+            else        => it
+        }
+    }
+    reg lev_n : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst    => false
+            case sample => sdn
+            else        => it
+        }
+    }
+
+    // bit-phase counter: clock recovery re-aligns on every transition
+    reg ph : Word[2] on clk {
+        initial it <= 0w2
+        it <= when {
+            case rst       => 0w2
+            case sop_edge  => 0w2
+            case jk        => mux(trans, 0w2, it + 1w2)
+            else           => it
+        }
+    }
+
+    // in-packet flag: armed at sop, dropped with the eop pulse or on SE1
+    reg act : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst      => false
+            case sop_edge => true
+            case abort    => false
+            case eop_now  => false
+            else          => it
+        }
+    }
+
+    // sticky per-packet error: SE1 or a stuffing violation; cleared at
+    // the next sop
+    reg perr : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst                        => false
+            case sop_edge                   => false
+            case abort                      => true
+            case sample && drop_state && bit_val => true
+            else                            => it
+        }
+    }
+
+    // consecutive-ones counter for bit destuffing (3-bit, wraps)
+    reg stuff_cnt : Word[3] on clk {
+        initial it <= 0w3
+        it <= when {
+            case rst   => 0w3
+            case !act  => 0w3
+            case sample => mux(drop_state, 0w3, mux(bit_val, it + 1w3, 0w3))
+            else       => it
+        }
+    }
+
+    // the sample after 6 consecutive ones is the stuffed 0: drop it
+    reg drop_state : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst                                    => false
+            case !act                                   => false
+            case sample && it                           => false
+            case sample && bit_val && (stuff_cnt == 5w3) => true
+            else                                        => it
+        }
+    }
+
+    // standalone SE0 timer: EOP threshold is checked off `eop_now`
+    // (~1.75 bit times = 7 clks); 119 clks = 2.5 us = bus reset.  The
+    // 7-bit counter wraps, so sustained reset SE0 re-pulses every
+    // 128 clks (the ep0 FSM treats each pulse identically).
+    reg se0_cnt : Word[7] on clk {
+        initial it <= 0w7
+        it <= when {
+            case rst => 0w7
+            case se0 => it + 1w7
+            else     => 0w7
+        }
+    }
+
+    // single-cycle output strobes (default low, pulsed by their events)
+    reg sop_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst      => false
+            case sop_edge => true
+            else          => false
+        }
+    }
+    reg eop_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst     => false
+            case eop_now => true
+            else         => false
+        }
+    }
+    reg bit_v_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst                    => false
+            case sample && !drop_state  => true
+            else                        => false
+        }
+    }
+    reg bit_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst    => false
+            case sample => bit_val
+            else        => it
+        }
+    }
+    reg br_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst              => false
+            case se0_cnt == 119w7 => true
+            else                  => false
+        }
+    }
+}
+
 mod UsbController {
     incoming clock : Clock
     //> From UsbPor (instantiated at the top so the sim TB can

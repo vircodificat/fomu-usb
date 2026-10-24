@@ -26,7 +26,7 @@ module tb_usb_phy;
     // core RX chain
     // ------------------------------------------------------------------
     wire rx_bit, rx_bitv, rx_sop, rx_eop, rx_act, rx_perr, rx_breset;
-    usb_rx_phy rxphy(
+    \usb::RxPhy rxphy(
         .clk(clk), .rst(rst),
         .dp(usb_dp), .dn(usb_dn),
         .bit_o(rx_bit), .bit_valid(rx_bitv),

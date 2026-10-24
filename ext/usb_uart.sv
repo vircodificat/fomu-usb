@@ -11,9 +11,10 @@
 // its presence but the core never arms it — every IN to EP2 is NAKed).
 //
 // Module inventory (bottom-up):
-//   usb_crc5 / usb_crc16  serial CRC LFSRs          (USB 2.0 §8.3.5)
+//   (usb_crc5 / usb_crc16, the serial CRC LFSRs, migrated to
+//    src/usb.vir as usb::Crc5 / usb::Crc16 -- USB 2.0 §8.3.5)
 //   usb_fifo16x8          16x8 sync FIFO
-//   usb_rx_phy            pad -> bit stream         (USB 2.0 §7.1.x)
+//   (usb_rx_phy, the RX PHY, migrated to src/usb.vir as usb::RxPhy)
 //   usb_rx_packet         bit stream -> packet records
 //   usb_tx_phy            packet records -> pads
 //   usb_ep0               control SM + CDC requests (USB 2.0 §8.5.5)
@@ -31,58 +32,6 @@
 //    the received CRC wire bits and compare the final state (token CRC5:
 //    5'h0C; data CRC16: 16'h800D).  The receiver cannot know the payload/
 //    CRC boundary before EOP, so computed-vs-received is not an option.
-
-// ===========================================================================
-// usb_crc5 — serial CRC5 LFSR (USB 2.0 §8.3.5, poly x^5+x^2+1, seed 0x1F)
-// ===========================================================================
-module usb_crc5(
-    input  wire       clk,
-    input  wire       rst,     // sync reset (active high): seed 5'h1F
-    input  wire       adv,     // advance one serial bit
-    input  wire       din,     // serial bit, wire order (LSB first)
-    output wire [4:0] crc
-);
-    reg [4:0] r;
-    wire inv = din ^ r[4];
-    always @(posedge clk) begin
-        if (rst)
-            r <= 5'h1F;
-        else if (adv) begin
-            r[0] <= inv;
-            r[1] <= r[0];
-            r[2] <= r[1] ^ inv;
-            r[3] <= r[2];
-            r[4] <= r[3];
-        end
-    end
-    assign crc = r;
-endmodule
-
-// ===========================================================================
-// usb_crc16 — serial CRC16 LFSR (x^16+x^15+x^2+1, seed 0xFFFF)
-// ===========================================================================
-module usb_crc16(
-    input  wire         clk,
-    input  wire         rst,     // sync reset: seed 16'hFFFF
-    input  wire         adv,
-    input  wire         din,
-    output wire [15:0]  crc
-);
-    reg [15:0] r;
-    wire inv = din ^ r[15];
-    always @(posedge clk) begin
-        if (rst)
-            r <= 16'hFFFF;
-        else if (adv) begin
-            r[0]   <= inv;
-            r[1]   <= r[0];
-            r[2]   <= r[1] ^ inv;
-            r[14:3] <= r[13:2];
-            r[15]  <= r[14] ^ inv;
-        end
-    end
-    assign crc = r;
-endmodule
 
 // ===========================================================================
 // usb_fifo16x8 — synchronous FIFO, default 16-deep x 8-bit (plan §2).
@@ -175,173 +124,6 @@ module usb_fifo16x8 #(
     assign count    = cnt;
     assign full     = (cnt == DEPTH[6:0]);
     assign empty    = (cnt == 7'd0);
-endmodule
-
-// ===========================================================================
-// usb_rx_phy — pad -> unstuffed decoded bit stream + packet/reset flags.
-//
-// 4x oversampling clock recovery: a sample timer is re-armed to fire 2 clks
-// after EVERY dp/dn transition visible in the synchronized sample stage,
-// then re-fires every 4 clks until the next transition (runs of 1s).  The
-// capture lands 2-3 clks after the transition reaches sdp -- safely inside
-// the bit's visibility window for EVERY achievable quantized window width
-// (3, 4 or 5 clks: the wire bit period is 4.000 clks nominal, but each
-// transition is asynchronous to the 48 MHz clock, so ceil()-quantization
-// plus the host's ±0.25% rate tolerance makes consecutive sdp switch gaps
-// vary; a free-running fixed-phase sampler loses/duplicates a bit each
-// time the gap is 3).  NRZI: same level as the previous bit sample -> 1,
-// change -> 0.  Bit unstuffing: the bit after six consecutive decoded 1s
-// is dropped (a stuffed 0); a 1 there is a violation.  EOP = SE0 held
-// >= 7 clks (~1.75 bit times; a spec-fast host's 2-bit EOP is 7.98 clks
-// and can present only 7 samplable cycles).  Bus reset = SE0 held >= 2.5 us
-// (120 clks @ 48 MHz; USB 2.0 §7.1.7.5).  SE1 is an error: the packet is
-// flagged bad and abandoned.
-// J = (dp=1,dn=0), K = (dp=0,dn=1), idle = J (D+ pull-up).
-// ===========================================================================
-module usb_rx_phy(
-    input  wire clk,
-    input  wire rst,
-    input  wire dp,               // raw pads
-    input  wire dn,
-    output wire bit_o,            // decoded (unstuffed) bit
-    output wire bit_valid,        // 1-clk strobe per decoded bit
-    output wire sop,              // 1-clk pulse: J->K from idle
-    output wire eop,              // 1-clk pulse: SE0 >= 2 bit times
-    output wire active,           // in packet (sop..eop)
-    output wire pkt_err,          // per-packet error (cleared at sop)
-    output wire bus_reset         // 1-clk pulse: SE0 >= 2.5 us
-);
-    reg dp_s1, dp_s2, dn_s1, dn_s2;   // 2-FF pad synchronizers
-    reg dp_p, dn_p;                   // previous-cycle sample (edge detect)
-    reg lev_d, lev_n;                 // previous bit sample (NRZI decode)
-    reg [1:0] ph;
-    reg act, perr;
-    reg [2:0] stuff_cnt;
-    reg drop_state;
-    reg [6:0] se0_cnt;
-    reg sop_r, eop_r, bit_v_r, bit_r, br_r;
-
-    wire sdp = dp_s2;
-    wire sdn = dn_s2;
-    wire trans = (sdp != dp_p) || (sdn != dn_p);
-    wire se0   = (sdp == 1'b0) && (sdn == 1'b0);
-    wire se1   = (sdp == 1'b1) && (sdn == 1'b1);
-    wire k     = (sdp == 1'b0) && (sdn == 1'b1);
-    // NRZI decode of the mid-bit sample
-    wire bit_val = (sdp == lev_d) && (sdn == lev_n);
-
-    always @(posedge clk) begin
-        if (rst) begin
-            dp_s1 <= 1'b0; dp_s2 <= 1'b0;
-            dn_s1 <= 1'b0; dn_s2 <= 1'b0;
-            dp_p <= 1'b0; dn_p <= 1'b0;
-            lev_d <= 1'b1; lev_n <= 1'b0;
-            ph <= 2'd0;
-            act <= 1'b0; perr <= 1'b0;
-            stuff_cnt <= 3'd0; drop_state <= 1'b0;
-            se0_cnt <= 7'd0;
-            sop_r <= 1'b0; eop_r <= 1'b0;
-            bit_v_r <= 1'b0; bit_r <= 1'b0; br_r <= 1'b0;
-        end else begin
-            // synchronizer + edge history
-            dp_s1 <= dp; dp_s2 <= dp_s1;
-            dn_s1 <= dn; dn_s2 <= dn_s1;
-            dp_p <= sdp; dn_p <= sdn;
-
-            // defaults: single-cycle pulses
-            sop_r   <= 1'b0;
-            eop_r   <= 1'b0;
-            bit_v_r <= 1'b0;
-            br_r    <= 1'b0;
-
-            // SE0 timer: EOP (2 bit times) and bus reset (2.5 us)
-            if (se0)
-                se0_cnt <= se0_cnt + 7'd1;
-            else
-                se0_cnt <= 7'd0;
-            if (se0_cnt == 7'd119)
-                br_r <= 1'b1;
-
-            if (!act) begin
-                // idle: wait for the J->K sync edge
-                stuff_cnt  <= 3'd0;
-                drop_state <= 1'b0;
-                if (k) begin
-                    sop_r <= 1'b1;
-                    act   <= 1'b1;
-                    ph    <= 2'd0;
-                    lev_d <= 1'b1;      // previous level was idle J
-                    lev_n <= 1'b0;
-                    perr  <= 1'b0;
-                end
-            end else begin
-                if (se1) begin
-                    // illegal bus state: abandon packet
-                    perr <= 1'b1;
-                    act  <= 1'b0;
-                end else if (se0) begin
-                    // SE0: EOP after ~1.75 bit times (7 clks) — stay armed
-                    // until then (act drops WITH the eop pulse); bus reset
-                    // is detected by the standalone SE0 timer below.  A
-                    // spec-fast host's 2-bit EOP is 7.98 clks, which can
-                    // present only 7 samplable cycles, so 8 would miss it
-                    // and leave `act` stuck high (PHY deaf until reset).
-                    if (se0_cnt == 7'd6) begin
-                        eop_r <= 1'b1;
-                        act <= 1'b0;
-                    end
-                end else begin
-                    // J or K level: track the bit period
-                    if (trans)
-                        ph <= 2'd0;      // clock recovery: re-align on edge
-                    else
-                        ph <= ph + 2'd1;
-                    if (ph == 2'd1) begin
-                        // sample: NRZI decode + unstuff.  The realign makes
-                        // the counter read 0 one clk after the transition
-                        // reaches sdp, so phase 1 captures sdp 2-3 clks after
-                        // the switch -- inside the bit's visibility window
-                        // for EVERY achievable quantized window width (3, 4
-                        // or 5 clks: each transition is asynchronous to the
-                        // 48 MHz clock, so ceil()-quantization plus the
-                        // host's ±0.25% rate tolerance varies the gap; the
-                        // old phase-2 capture landed in the window's LAST
-                        // cycle and a 3-clk window lost/duplicated a bit).
-                        // The re-align at every switch also guarantees one
-                        // sample per bit window for run windows of any
-                        // length (4n-1/4n/4n+1 clks all yield n captures).
-                        lev_d <= sdp;
-                        lev_n <= sdn;
-                        bit_r <= bit_val;
-                        if (drop_state) begin
-                            // this decoded bit is the stuffed 0: drop it
-                            drop_state <= 1'b0;
-                            stuff_cnt  <= 3'd0;
-                            if (bit_val)
-                                perr <= 1'b1;    // 6 ones then a 1: violation
-                        end else begin
-                            bit_v_r <= 1'b1;
-                            if (bit_val) begin
-                                stuff_cnt <= stuff_cnt + 3'd1;
-                                if (stuff_cnt == 3'd5)
-                                    drop_state <= 1'b1;
-                            end else begin
-                                stuff_cnt <= 3'd0;
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    assign bit_o     = bit_r;
-    assign bit_valid = bit_v_r;
-    assign sop       = sop_r;
-    assign eop       = eop_r;
-    assign active    = act;
-    assign pkt_err   = perr;
-    assign bus_reset = br_r;
 endmodule
 
 // ===========================================================================
@@ -440,14 +222,14 @@ module usb_rx_packet(
     // CRC5 advances on token bits nb = 8..23 (data + received crc5 wire
     // bits; residual check 5'h0C); CRC16 advances on every data-section
     // bit (payload + received crc16 wire bits; residual check 16'h800D).
-    usb_crc5 u_crc5(
+    \usb::Crc5 u_crc5 (
         .clk(clk),
         .rst(sop | rst | bus_reset),
         .adv(bit_valid && (st == ST_BODY) && !sec
              && (nb >= 5'd8) && (nb <= 5'd23)),
         .din(bit_i),
         .crc(c5));
-    usb_crc16 u_crc16(
+    \usb::Crc16 u_crc16 (
         .clk(clk),
         .rst(sop | rst | bus_reset),
         .adv(bit_valid && (st == ST_BODY) && sec),
@@ -526,7 +308,7 @@ module usb_rx_packet(
     wire [7:0] dt_byte_new = {bit_i, bshift[7:1]};
 
     // byte-complete write strobe (registered inputs only: n3/st/sec/bc
-    // are regs; bit_valid/pkt_err are registered upstream in usb_rx_phy)
+    // are regs; bit_valid/pkt_err are registered upstream in usb::RxPhy)
     wire dt_wr = bit_valid && !pkt_err && (st == ST_BODY) && sec
                  && (n3 == 3'd7);
 
@@ -635,7 +417,7 @@ module usb_rx_packet(
                             // classifies the packet at EOP); token data
                             // bits are nb = 8..18 (the shift-up capture);
                             // crc5 wire bits nb = 19..23 feed the residual
-                            // check via usb_crc5 and are not captured.
+                            // check via usb::Crc5 and are not captured.
                             if (nb <= 5'd7)
                                 pid_r <= pid_new;
                             if ((nb >= 5'd8) && (nb <= 5'd18))
@@ -876,7 +658,7 @@ module usb_tx_phy(
     always @(posedge clk) raw_bit_r <= raw_bit;
 
     wire [15:0] u_crc16_crc;
-    usb_crc16 u_crc16(
+    \usb::Crc16 u_crc16 (
         .clk(clk),
         .rst(tx_start),
         .adv(state == S_DATA && (btc == 2'd2) && !cur_stuff
@@ -1622,7 +1404,7 @@ module \usb::UsbUart (
     // RX chain
     // ------------------------------------------------------------------
     wire rx_bit, rx_bit_v, rx_sop, rx_eop, rx_active, rx_perr, bus_reset;
-    usb_rx_phy u_rxphy(
+    \usb::RxPhy u_rxphy (
         .clk(clk), .rst(rst),
         .dp(dp_rx), .dn(dn_rx),
         .bit_o(rx_bit), .bit_valid(rx_bit_v),

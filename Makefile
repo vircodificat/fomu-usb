@@ -83,12 +83,12 @@ build:
 test: build test-crc test-usb-phy test-usb-serial
 
 test-crc: tools
-	$(IVERILOG) -g2012 -gspecify -o build/tb_crc.vvp $(USB_SRVS) tb/tb_crc.v
+	$(IVERILOG) -g2012 -gspecify -o build/tb_crc.vvp $(USB_SRVS) build/usb.sv tb/tb_crc.v
 	$(VVP) build/tb_crc.vvp
 
 test-usb-phy: tools
 	$(IVERILOG) -g2012 -gspecify -o build/tb_usb_phy.vvp \
-	    $(USB_SRVS) tb/usb_host_bfm.v tb/tb_usb_phy.v
+	    $(USB_SRVS) build/usb.sv tb/usb_host_bfm.v tb/tb_usb_phy.v
 	$(VVP) build/tb_usb_phy.vvp
 
 test-usb-serial: tools
