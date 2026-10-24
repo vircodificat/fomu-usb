@@ -252,7 +252,7 @@ module tb_usb_phy;
             check(s_dt_pid === 4'h3, "T3: dt_pid DATA0");
             check(s_dt_len === 7'd8, "T3: dt_len");
             check(s_dt_crc === 1'b1, "T3: dt_crc_ok");
-            // head window (flopped bytes 0..7 — what usb_ep0 latches)
+            // head window (flopped bytes 0..7 — what usb::Ep0 latches)
             for (i = 0; i < 8; i = i + 1)
                 check(s_dt_head[8*i +: 8] === host.host_data_bytes[i],
                       "T3: payload head byte");
