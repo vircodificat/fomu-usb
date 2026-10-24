@@ -16,10 +16,11 @@
 //   usb_fifo16x8          16x8 sync FIFO
 //   (usb_rx_phy, the RX PHY, migrated to src/usb.vir as usb::RxPhy)
 //   (usb_rx_packet, the bit stream -> packet record assembler,
-//    migrated to src/usb.vir as usb::RxPacket -- except its 64x8
-//    payload block RAM, which stays here as \usb::RxRam: Virdant
-//    cannot express an indexed memory, the same limitation that
-//    keeps \echo::EchoFifo in ext/)
+//    migrated to src/usb.vir as usb::RxPacket; its 64x8 payload
+//    block RAM moved to src/usb.vir as usb::RxRam, a plain mod over
+//    an ice40::SbRam40_4k cell -- the indexed-memory limitation that
+//    still keeps \echo::EchoFifo in ext/ is now routed around with
+//    the vendor cell primitive)
 //   (usb_tx_phy, the TX PHY, migrated to src/usb.vir as usb::TxPhy)
 //   (usb_ep0, the control transfer SM + CDC requests, migrated to
 //    src/usb.vir as usb::Ep0)
@@ -29,12 +30,12 @@
 //   (usb_uart, the core top itself -- token router, response
 //    arbiter, snapshot loader, rx push, loopback pipe -- migrated
 //    to src/usb.vir as usb::UsbUart)
-//   What remains here: the memory primitives Virdant cannot
-//   express (indexed memories) + the fixed-parameter FIFO wrappers
-//   the .vir top instantiates:
+//   What remains here: the fixed-parameter FIFO wrappers the .vir top
+//   instantiates, plus the descriptor ROM (initialized BRAM; moving it
+//   to an ice40::SbRam40_4k cell needs an INIT_FILE hex image -- see
+//   src/usb.vir).  \usb::RxRam and \usb::SnapRam have moved to Virdant
+//   as plain mods over ice40::SbRam40_4k cells (no ext body needed).
 //     \usb::TxFifo / \usb::RxFifo   ext wrappers over usb_fifo16x8
-//     \usb::RxRam                   rx packet payload RAM
-//     \usb::SnapRam                 bulk-IN snapshot RAM
 //     \usb::DescRom                 descriptor ROM (initialized BRAM)
 //   usb_uart              core top: ROM, router, arbiter, FIFOs, loopback
 //
@@ -144,43 +145,6 @@ module usb_fifo16x8 #(
 endmodule
 
 // ===========================================================================
-// \usb::RxRam -- the 64x8 payload block RAM, the ext body of
-// usb::RxRam (src/usb.vir).  What remains of usb_rx_packet after its
-// migration to Virdant (usb::RxPacket, cycle-exact): Virdant cannot
-// express an indexed memory, so the payload store stays vendored
-// Verilog here, instantiated from the .vir side.
-//
-// One write port (registered address wa + one enable -- no decode
-// tree, no per-byte enable fanout) and one registered sync read port
-// (present ra, the byte is on rd the NEXT clk) that replaces the 64:1
-// read mux a flopped payload would put on the 48 MHz critical path.
-// Writes beyond byte 63 never happen (usb::RxPacket pre-gates we with
-// !(bc >= 64); over-length packets set bad there, so dt_valid never
-// fires and no consumer ever sees a truncated payload).  Read-during-
-// write to one address returns the OLD byte (nonblocking): the rx
-// push of packet N reads packet N's bytes (written long before the
-// push starts), never a byte of a concurrently-arriving packet N+1.
-// Port contract identical to the old dt_ram (dt_wr / dt_rd_addr /
-// dt_rd_data); (* ram_style = "block" *) exactly as before, so yosys
-// maps it to the same SB_RAM.
-// ===========================================================================
-module \usb::RxRam (
-    input  wire       clk,
-    input  wire       we,
-    input  wire [5:0] wa,
-    input  wire [7:0] wd,
-    input  wire [5:0] ra,
-    output reg  [7:0] rd
-);
-    (* ram_style = "block" *) reg [7:0] mem [0:63];
-
-    always @(posedge clk) begin
-        if (we)
-            mem[wa] <= wd;
-        rd <= mem[ra];    // registered sync read; read-during-write = OLD byte
-    end
-endmodule
-// ===========================================================================
 // \usb::TxFifo / \usb::RxFifo -- ext bodies of usb::TxFifo / usb::RxFifo
 // (src/usb.vir): thin fixed-parameter wrappers over usb_fifo16x8
 // (Virdant ext mods cannot carry parameters).  The behavior contract
@@ -221,33 +185,6 @@ module \usb::RxFifo (
         .wr_en(wr_en), .wr_data(wr_data),
         .rd_en(rd_en), .rd_data(rd_data),
         .count(count), .full(full), .empty(empty));
-endmodule
-
-// ===========================================================================
-// \usb::SnapRam -- the bulk-IN snapshot RAM, ext body of usb::SnapRam
-// (src/usb.vir).  64x8 block RAM: one write port (the snapshot loader's
-// index, one enable) and one registered sync read (the tx byte fetch
-// index).  The 7-bit ports index a 64-entry array with Verilog
-// out-of-range semantics (write ignored, read X) -- exactly the old
-// `snap[li] <= txfifo_rd; snap_q <= snap[byte_rd_addr]`: the tx fetch
-// index can lead the consumed bytes during the packet tail, and a
-// leading fetch must read X, not an aliased byte.
-// ===========================================================================
-module \usb::SnapRam (
-    input  wire       clk,
-    input  wire       we,
-    input  wire [6:0] wa,
-    input  wire [7:0] wd,
-    input  wire [6:0] ra,
-    output reg  [7:0] rd
-);
-    (* ram_style = "block" *) reg [7:0] mem [0:63];
-
-    always @(posedge clk) begin
-        if (we)
-            mem[wa] <= wd;
-        rd <= mem[ra];    // registered sync read
-    end
 endmodule
 
 // ===========================================================================

@@ -34,6 +34,13 @@ USB_BUILD := build/builtin.sv build/usb.sv build/echo.sv build/uart.sv
 # meant to be `include`d inside a TB module) and is never compiled on its own.
 TB_SIM_BFM_INC := tb/usb_host_bfm.v
 
+# iverilog-only behavioural cell models: yosys/nextpnr treat SB_IO and
+# SB_RAM40_4K as native cells, iverilog needs a simulation model (same
+# pattern as sb_io_sim.v).  sb_ram_sim.v is needed by every test target
+# that compiles build/usb.sv -- usb::RxRam / usb::SnapRam are plain
+# Virdant mods over ice40::SbRam40_4k cells now.
+SB_RAM_SIM := tb/sb_ram_sim.v
+
 ## html — render wiki/*.md to build/html/*.html for browser reading.
 ## One page per module plus the overview pages; Home.html is the index.
 ## The dark stylesheet (wiki/style.css) is INLINED into every page via
@@ -84,18 +91,18 @@ build:
 test: build test-crc test-usb-phy test-usb-serial
 
 test-crc: tools
-	$(IVERILOG) -g2012 -gspecify -o build/tb_crc.vvp $(USB_SRVS) build/builtin.sv build/usb.sv tb/tb_crc.v
+	$(IVERILOG) -g2012 -gspecify -o build/tb_crc.vvp $(USB_SRVS) $(SB_RAM_SIM) build/builtin.sv build/usb.sv tb/tb_crc.v
 	$(VVP) build/tb_crc.vvp
 
 test-usb-phy: tools
 	$(IVERILOG) -g2012 -gspecify -o build/tb_usb_phy.vvp \
-	    $(USB_SRVS) build/builtin.sv build/usb.sv tb/usb_host_bfm.v tb/tb_usb_phy.v
+	    $(USB_SRVS) $(SB_RAM_SIM) build/builtin.sv build/usb.sv tb/usb_host_bfm.v tb/tb_usb_phy.v
 	$(VVP) build/tb_usb_phy.vvp
 
 test-usb-serial: tools
 	$(IVERILOG) -g2012 -gspecify -o build/tb_usb_serial.vvp \
 	    $(EXT_SRVS) $(USB_BUILD) \
-	    tb/sb_io_sim.v tb/usb_host_bfm.v \
+	    tb/sb_io_sim.v tb/sb_ram_sim.v tb/usb_host_bfm.v \
 	    tb/tb_usb_serial.v
 	$(VVP) build/tb_usb_serial.vvp
 

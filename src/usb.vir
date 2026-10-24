@@ -1,3 +1,5 @@
+import ice40
+
 //> The USB controller, in Virdant.
 //>
 //> This is the "rest of the USB controller" half of the Virdant/Verilog
@@ -14,6 +16,7 @@
 //>
 //> The pad-facing side is deliberately UNIDIRECTIONAL: the only
 //> bidirectional nets in the whole design live inside UsbPads.
+
 
 //> The two USB D+/D- tristate pad cells (iCE40 SB_IO, PIN_TYPE
 //> 6'b101001) -- the one ext mod that touches a bidirectional net.
@@ -498,17 +501,18 @@ enum type RxPktState {
     Body = 0b10
 }
 
-//> The 64x8 payload block RAM (dt_ram in the old usb_rx_packet), the
-//> one piece of the packet receiver that stays vendored Verilog:
-//> Virdant cannot express an indexed memory.  One write port
+//> The 64x8 payload block RAM (dt_ram in the old usb_rx_packet), a
+//> plain Virdant mod over one iCE40 SB_RAM40_4K cell
+//> (ice40::SbRam40_4k, WRITE_MODE/READ_MODE 0 = NORMAL).  The 8-bit
+//> payload rides the cell's low byte (WDATA zero-extended, MASK
+//> 0xFF00 freezes the upper byte) and the 6-bit byte index rides the
+//> low 6 address bits (zext to the cell's Word[11]).  One write port
 //> (registered address, one enable -- no decode tree, no per-byte
 //> enable fanout) and one registered sync read port (present ra,
-//> the byte is on rd the NEXT clk) that replaces the 64:1 read mux
-//> the flopped version would put on the 48 MHz critical path.
-//> Read-during-write to one address returns the OLD byte
-//> (nonblocking semantics), exactly the old dt_ram contract.
-//> Body in ext/usb_uart.sv, (* ram_style = "block" *) for yosys.
-ext mod RxRam {
+//> the byte is on rd the NEXT clk: SB_RAM40_4K NORMAL read mode is
+//> registered, RCLKE/RE tied high = free-running read).  yosys maps
+//> the cell directly -- no inference, no ram_style hint needed.
+mod RxRam {
     //> 48 MHz clock.
     incoming clk : Clock
     //> Write enable: byte-complete strobe, pre-gated with !(bc >= 64)
@@ -524,6 +528,20 @@ ext mod RxRam {
     incoming ra : Word[6]
     //> Registered read data: mem[ra] as of the previous posedge.
     outgoing rd : Word[8]
+
+    mod ram of ice40::SbRam40_4k {
+        it.RCLK  := clk
+        it.WCLK  := clk
+        it.RCLKE := true
+        it.WCLKE := true
+        it.RE    := true
+        it.WE    := we
+        it.WADDR := zext(wa)
+        it.RADDR := zext(ra)
+        it.WDATA := word(0w8, wd)
+        it.MASK  := 0xFF00
+        rd := it.RDATA[8..0]
+    }
 }
 
 //> Bit stream -> packet records: consumes usb::RxPhy's decoded bit
@@ -2541,12 +2559,18 @@ ext mod RxFifo {
 //> The bulk-IN snapshot RAM (64x8 block RAM): at arm time the
 //> snapshot loader pops min(count,64) bytes from the tx FIFO in
 //> here, so an unacknowledged IN packet is retransmitted
-//> byte-identically until the host ACKs.  One write port (the
-//> loader's index) and one registered sync read (byte_rd_addr ->
-//> rd next clk).  The 7-bit ports index a 64-entry array with
-//> Verilog out-of-range semantics, exactly the old
-//> `snap[li] <= ...; snap_q <= snap[byte_rd_addr]`.
-ext mod SnapRam {
+//> byte-identically until the host ACKs.  A plain Virdant mod over
+//> one iCE40 SB_RAM40_4K cell.  The 7-bit ports index a 64-entry
+//> window of the cell's 256-deep space with the old out-of-range
+//> semantics preserved: writes are gated to !wa[6] (>= 64 is a
+//> no-op), and a read index >= 64 lands on entries 64..127, which
+//> are NEVER written -- X in simulation, zero in the bitstream --
+//> not an aliased byte from 0..63.  (The tx fetch index can lead
+//> the consumed bytes during the packet tail; the fetched byte is
+//> never sent because tx_len caps the PHY, so either value is
+//> harmless, but fresh-X matches the vendored body's simulation
+//> semantics exactly.)
+mod SnapRam {
     //> 48 MHz clock.
     incoming clk : Clock
     //> Write enable (the loader's step strobe).
@@ -2560,6 +2584,20 @@ ext mod SnapRam {
     incoming ra : Word[7]
     //> Registered read data: mem[ra] as of the previous posedge.
     outgoing rd : Word[8]
+
+    mod ram of ice40::SbRam40_4k {
+        it.RCLK  := clk
+        it.WCLK  := clk
+        it.RCLKE := true
+        it.WCLKE := true
+        it.RE    := true
+        it.WE    := we && !wa[6]
+        it.WADDR := zext(wa)
+        it.RADDR := zext(ra)
+        it.WDATA := word(0w8, wd)
+        it.MASK  := 0xFF00
+        rd := it.RDATA[8..0]
+    }
 }
 
 //> The descriptor ROM (256x8 initialized block RAM, registered
