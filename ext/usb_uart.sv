@@ -23,7 +23,19 @@
 //   (usb_tx_phy, the TX PHY, migrated to src/usb.vir as usb::TxPhy)
 //   (usb_ep0, the control transfer SM + CDC requests, migrated to
 //    src/usb.vir as usb::Ep0)
-//   usb_serial            EP1 OUT/IN bulk protocol (toggles, ACK/NAK)
+//    src/usb.vir as usb::Ep0)
+//   (usb_serial, the EP1 bulk endpoint protocol, migrated to
+//    src/usb.vir as usb::Serial)
+//   (usb_uart, the core top itself -- token router, response
+//    arbiter, snapshot loader, rx push, loopback pipe -- migrated
+//    to src/usb.vir as usb::UsbUart)
+//   What remains here: the memory primitives Virdant cannot
+//   express (indexed memories) + the fixed-parameter FIFO wrappers
+//   the .vir top instantiates:
+//     \usb::TxFifo / \usb::RxFifo   ext wrappers over usb_fifo16x8
+//     \usb::RxRam                   rx packet payload RAM
+//     \usb::SnapRam                 bulk-IN snapshot RAM
+//     \usb::DescRom                 descriptor ROM (initialized BRAM)
 //   usb_uart              core top: ROM, router, arbiter, FIFOs, loopback
 //
 // Bit/wire-order conventions used throughout (verified against valentyusb):
@@ -168,577 +180,91 @@ module \usb::RxRam (
         rd <= mem[ra];    // registered sync read; read-during-write = OLD byte
     end
 endmodule
-
 // ===========================================================================
-// usb_serial — EP1 bulk endpoint protocol: data toggles + ACK/NAK/ARM
-// decisions.  Data movement lives in usb_uart (FIFOs, snapshot regs, tx
-// PHY mux).  IN packets are snapshotted from the tx FIFO into usb_uart's
-// 64-byte snapshot register at arm time, so an unacknowledged packet is
-// retransmitted byte-identically (same data pid) until the host ACKs.
-// Data toggles reset on bus reset and SET_CONFIGURATION (USB 2.0 §9.1.1.5).
+// \usb::TxFifo / \usb::RxFifo -- ext bodies of usb::TxFifo / usb::RxFifo
+// (src/usb.vir): thin fixed-parameter wrappers over usb_fifo16x8
+// (Virdant ext mods cannot carry parameters).  The behavior contract
+// (caller-gated wr_en/rd_en, count terms never in the FIFO's own
+// enables) is the usb_fifo16x8 header's; the wrappers add nothing.
 // ===========================================================================
-module usb_serial(
-    input  wire        clk,
-    input  wire        rst,
-    input  wire        bus_reset,
-    input  wire        set_cfg,       // pulse: SET_CONFIGURATION completed
-    // token strobes (router-gated: address + endpoint 1 matched)
-    input  wire        tk_in,
-    input  wire        tk_out,
-    // data packet strobe (router-gated: an armed OUT to EP1)
-    input  wire        dt_valid,
-    input  wire  [3:0] dt_pid,
-    input  wire  [6:0] dt_len,
-    input  wire        dt_crc_ok,
-    // handshake strobe (router-gated: our in-flight packet was ACKed)
-    input  wire        hs_ack,
-    // FIFO status (usb_uart)
-    input  wire        txfifo_empty,
-    input  wire  [6:0] txfifo_count,
-    input  wire        rx_room,       // 1: the whole packet fits the rx FIFO
-    input  wire  [6:0] tx_room,        // free slots in the tx FIFO
-    // response request (1-clk pulse)
-    output reg         resp_req,
-    output reg  [3:0] resp_pid,
-    output reg  [6:0] resp_len,
-    output reg         resp_fresh,     // 1: snapshot len bytes from tx FIFO
-    // router hints
-    output wire        ser_busy,       // OUT data packet expected
-    output wire        ser_ack_wait    // our data packet is in flight
+module \usb::TxFifo (
+    input  wire       clk,
+    input  wire       rst,
+    input  wire       wr_en,
+    input  wire [7:0] wr_data,
+    input  wire       rd_en,
+    output wire [7:0] rd_data,
+    output wire [6:0] count,
+    output wire       full,
+    output wire       empty
 );
-    localparam [3:0] PID_DATA0 = 4'h3, PID_DATA1 = 4'hB,
-                     PID_ACK = 4'h2, PID_NAK = 4'hA;
+    usb_fifo16x8 u (   // defaults: DEPTH=16, AW=4, RAM=0 (flops, comb head)
+        .clk(clk), .rst(rst),
+        .wr_en(wr_en), .wr_data(wr_data),
+        .rd_en(rd_en), .rd_data(rd_data),
+        .count(count), .full(full), .empty(empty));
+endmodule
 
-    reg       tog_tx, tog_rx;    // 0 => next data pid DATA0
-    reg       pkt_pending;       // snapshot holds an unacknowledged packet
-    reg [6:0] pkt_len;
-    reg       armed_out;
-    reg       dt_acc, dt_rej;    // registered accept/reject decision
+module \usb::RxFifo (
+    input  wire       clk,
+    input  wire       rst,
+    input  wire       wr_en,
+    input  wire [7:0] wr_data,
+    input  wire       rd_en,
+    output wire [7:0] rd_data,
+    output wire [6:0] count,
+    output wire       full,
+    output wire       empty
+);
+    usb_fifo16x8 #(.DEPTH(64), .AW(6), .RAM(1)) u (   // BRAM, registered head
+        .clk(clk), .rst(rst),
+        .wr_en(wr_en), .wr_data(wr_data),
+        .rd_en(rd_en), .rd_data(rd_data),
+        .count(count), .full(full), .empty(empty));
+endmodule
 
-    assign ser_busy    = armed_out;
-    assign ser_ack_wait = pkt_pending;
+// ===========================================================================
+// \usb::SnapRam -- the bulk-IN snapshot RAM, ext body of usb::SnapRam
+// (src/usb.vir).  64x8 block RAM: one write port (the snapshot loader's
+// index, one enable) and one registered sync read (the tx byte fetch
+// index).  The 7-bit ports index a 64-entry array with Verilog
+// out-of-range semantics (write ignored, read X) -- exactly the old
+// `snap[li] <= txfifo_rd; snap_q <= snap[byte_rd_addr]`: the tx fetch
+// index can lead the consumed bytes during the packet tail, and a
+// leading fetch must read X, not an aliased byte.
+// ===========================================================================
+module \usb::SnapRam (
+    input  wire       clk,
+    input  wire       we,
+    input  wire [6:0] wa,
+    input  wire [7:0] wd,
+    input  wire [6:0] ra,
+    output reg  [7:0] rd
+);
+    (* ram_style = "block" *) reg [7:0] mem [0:63];
 
     always @(posedge clk) begin
-        if (rst || bus_reset || set_cfg) begin
-            tog_tx     <= 1'b0;
-            tog_rx     <= 1'b0;
-            pkt_pending <= 1'b0;
-            pkt_len    <= 7'd0;
-            armed_out  <= 1'b0;
-            dt_acc     <= 1'b0;
-            dt_rej     <= 1'b0;
-            resp_req   <= 1'b0;
-        end else begin
-            resp_req   <= 1'b0;
-            resp_fresh <= 1'b0;
-
-            if (tk_in) begin
-                if (pkt_pending) begin
-                    // retransmit the unacknowledged packet, same pid
-                    resp_req <= 1'b1;
-                    resp_pid <= tog_tx ? PID_DATA1 : PID_DATA0;
-                    resp_len <= pkt_len;
-                end else if (!txfifo_empty) begin
-                    // arm a new packet: snapshot min(count, 64) bytes
-                    pkt_len     <= (txfifo_count > 7'd64)
-                                 ? 7'd64 : {2'b0, txfifo_count};
-                    pkt_pending <= 1'b1;
-                    resp_req  <= 1'b1;
-                    resp_pid  <= tog_tx ? PID_DATA1 : PID_DATA0;
-                    resp_len  <= (txfifo_count > 7'd64)
-                               ? 7'd64 : {2'b0, txfifo_count};
-                    resp_fresh <= 1'b1;
-                end else begin
-                    resp_req <= 1'b1;      // nothing to send: NAK
-                    resp_pid <= PID_NAK;
-                    resp_len <= 7'd0;
-                end
-            end
-
-            if (tk_out)
-                armed_out <= 1'b1;          // data packet expected next
-
-            // OUT data decision, REGISTERED one clk after dt_valid: the
-            // room check (an add+compare crossing the rx FIFO count) and
-            // the response/toggle registers then land in separate
-            // cycles (+1 clk response latency is well inside the device
-            // turnaround budget).  usb_uart streams the payload on the
-            // serial ACK pulse.
-            dt_acc <= armed_out && dt_valid && dt_crc_ok
-                      && (dt_pid == (tog_rx ? PID_DATA1 : PID_DATA0))
-                      && rx_room;
-            dt_rej <= armed_out && dt_valid
-                      && !(dt_crc_ok
-                           && (dt_pid == (tog_rx ? PID_DATA1 : PID_DATA0))
-                           && rx_room);
-            if (armed_out && dt_valid)
-                armed_out <= 1'b0;
-            if (dt_acc) begin
-                resp_req <= 1'b1;      // accept: usb_uart pushes + we ACK
-                resp_pid <= PID_ACK;
-                resp_len <= 7'd0;
-                tog_rx  <= ~tog_rx;
-            end else if (dt_rej) begin
-                resp_req <= 1'b1;      // full/bad: NAK, no toggle
-                resp_pid <= PID_NAK;
-                resp_len <= 7'd0;
-            end
-
-            if (hs_ack && pkt_pending) begin
-                // our in-flight data packet was accepted: forget it
-                pkt_pending <= 1'b0;
-                tog_tx      <= ~tog_tx;
-            end
-        end
+        if (we)
+            mem[wa] <= wd;
+        rd <= mem[ra];    // registered sync read
     end
 endmodule
 
 // ===========================================================================
-// usb_uart — core top: descriptor ROM, token router, response arbiter,
-// bulk snapshot loader, rx push, FIFOs + byte-stream loopback interface.
+// \usb::DescRom -- the descriptor ROM, ext body of usb::DescRom
+// (src/usb.vir).  256x8 initialized block RAM, registered sync read
+// (ra -> rd next clk).  Contiguous pages: sel0 device@0 (18 B), sel1
+// config@18 (75 B), sel2 str0@93, sel3 str1@97 (10 B), sel4 str2@107
+// (28 B); sel5 (line coding) and sel6 (status) are dynamic/trivial and
+// bypass the ROM.  The initial block is the vendored usb_uart's, moved
+// verbatim (a BRAM read replaces the desc_byte() case cascade: a
+// 128-deep case is ~20 ns of LUT chain, a BRAM read is a register).
 // ===========================================================================
-module \usb::UsbUart (
-    input  wire        clk,
-    input  wire        rst,           // sync, active high (registered por_done,
-                                      // see src/usb.vir UsbController)
-    input  wire        dp_rx,         // pad readback (SB_IO D_IN_0)
-    input  wire        dn_rx,
-    output wire        dp_tx,         // to pads (SB_IO D_OUT_0)
-    output wire        dn_tx,
-    output wire        output_enable, // pad drive enable (SB_IO OUTPUT_ENABLE)
-    // byte-stream FIFO interface (plan §2; loopback wired in Top)
-    output wire [7:0]  rx_data,
-    output wire        rx_valid,      // 1-clk strobe per byte (= FIFO pop)
-    input  wire [7:0]  tx_data,
-    input  wire        tx_strobe,     // FIFO push strobe
-    input  wire        rx_ready,      // low = the rx consumer is full:
-                                      // stop popping (it NAKs instead)
-    output wire        tx_ready,      // FIFO has room
-    // USB activity indicators (LED-visible): rxing/txing stay high for
-    // ~175 ms after the last byte of the bulk byte stream in each
-    // direction (the 1-clk rx_valid/tx_strobe strobes are far too fast
-    // to see, so each is stretched).  rxing = the core is receiving
-    // data (host -> device), txing = sending (device -> host).  EP0
-    // control traffic is not covered (it is not in rx_valid/tx_strobe).
-    output wire        rxing,
-    output wire        txing,
-    // status (TB visibility)
-    output wire        bus_reset_o,
-    output wire        connected_o
+module \usb::DescRom (
+    input  wire       clk,
+    input  wire [7:0] ra,
+    output reg  [7:0] rd
 );
-    localparam [3:0] PID_OUT = 4'h1, PID_IN = 4'h9, PID_SETUP = 4'hD,
-                     PID_SOF = 4'h5, PID_ACK = 4'h2, PID_NAK = 4'hA;
-
-    // ------------------------------------------------------------------
-    // RX chain
-    // ------------------------------------------------------------------
-    wire rx_bit, rx_bit_v, rx_sop, rx_eop, rx_active, rx_perr, bus_reset;
-    \usb::RxPhy u_rxphy (
-        .clk(clk), .rst(rst),
-        .dp(dp_rx), .dn(dn_rx),
-        .bit_o(rx_bit), .bit_valid(rx_bit_v),
-        .sop(rx_sop), .eop(rx_eop), .active(rx_active),
-        .pkt_err(rx_perr), .bus_reset(bus_reset));
-
-    wire tk_valid, tk_crc_ok, dt_valid, dt_crc_ok, hs_valid;
-    wire [3:0]  tk_pid, dt_pid, hs_pid;
-    wire [6:0]  tk_addr, dt_len;
-    wire [3:0]  tk_endp;
-    wire [10:0] tk_frame;
-    // rx packet payload capture (off-fabric, see usb::RxPacket): the
-    // flopped head window + the payload RAM's registered read.  The RAM
-    // read address is the rx-push byte index push_i (declared with the
-    // rx-push block below).
-    wire [63:0] dt_head;
-    wire [7:0]  dt_rd_data;
-    \usb::RxPacket u_rxpkt(
-        .clk(clk), .rst(rst), .bus_reset(bus_reset),
-        .bit_i(rx_bit), .bit_valid(rx_bit_v),
-        .sop(rx_sop), .eop(rx_eop), .pkt_err(rx_perr),
-        .tk_valid(tk_valid), .tk_pid(tk_pid), .tk_addr(tk_addr),
-        .tk_endp(tk_endp), .tk_frame(tk_frame), .tk_crc_ok(tk_crc_ok),
-        .dt_valid(dt_valid), .dt_pid(dt_pid), .dt_len(dt_len),
-        .dt_head(dt_head), .dt_rd_data(dt_rd_data),
-        .dt_rd_addr(push_i[5:0]), .dt_crc_ok(dt_crc_ok),
-        .hs_valid(hs_valid), .hs_pid(hs_pid));
-
-    assign bus_reset_o = bus_reset;
-
-    // ------------------------------------------------------------------
-    // FIFOs + byte-stream loopback interface
-    // ------------------------------------------------------------------
-    wire [7:0] rxfifo_rd, txfifo_rd;
-    wire [6:0] rxfifo_cnt, txfifo_cnt;
-    wire rxfifo_full, rxfifo_empty, txfifo_full, txfifo_empty;
-
-    // registered loopback strobe pair (now three stages on the rx side:
-    // the BRAM read is registered): the pop decision, then the
-    // (rx_valid pulse, rx_data byte) pair the consumer latches one clk
-    // after the BRAM read port has produced the popped byte.
-    // (the PoC Top wires the loopback: tx_data = rx_data, tx_strobe =
-    // rx_valid; the pipelined pair keeps the plan §2 contract and takes
-    // the empty/full decode off the single-cycle paths)
-    reg       rx_pop_d;
-    reg       rx_valid_r, rx_valid_rr;
-    reg [7:0] rx_data_d;
-    always @(posedge clk) begin
-        if (rst || bus_reset) begin
-            rx_pop_d   <= 1'b0;
-            rx_valid_r <= 1'b0;
-            rx_valid_rr<= 1'b0;
-        end else begin
-            // tx headroom: the 3-stage rx pipe (pop decision -> valid
-            // -> BRAM read -> Top strobe -> push) keeps up to 3 pushes
-            // in flight when a decided pop's byte lands, so the decision
-            // requires cnt <= 12 (16 - 3 in flight - 1 margin): a landing
-            // push then never meets a full txfifo and the comb write
-            // gate at the txfifo never drops a popped byte.  A popped
-            // byte MUST land in the txfifo — nothing else can re-read
-            // it from the rxfifo.
-            // Pop while the rx FIFO has a byte, the tx FIFO keeps the
-            // pipe's headroom, AND the byte-stream consumer signals
-            // room (rx_ready).  With the Virdant echo server as the
-            // consumer, rx_ready throttles the pop rate to the UART's
-            // 115200 baud drain rate: when it goes low the rx FIFO
-            // fills, the serial endpoint NAKs bulk-OUT, and the host
-            // retries -- end-to-end flow control with no byte loss.
-            // Off-by-one fix (stress S4c, cnt wrap 0->127): the gate
-            // samples rxfifo_cnt's PRE-pop value.  When a pop is already
-            // in flight (rx_pop_d==1) and cnt==1, that pop consumes the
-            // last byte at this same edge, so the scheduled next pop
-            // would find an empty FIFO -- and the 7-bit cnt subtract
-            // wraps to 127.  From then on the bogus count reads "not
-            // empty" and the popper drains stale BRAM bytes into the
-            // echo chain every clk while rx_ready pulses.  Block a pop
-            // when the in-flight pop is consuming the last byte:
-            rx_pop_d    <= !rxfifo_empty && !(rxfifo_cnt == 7'd1 && rx_pop_d)
-                        && (txfifo_cnt < 7'd13) && rx_ready;
-            rx_valid_r  <= rx_pop_d;
-            rx_valid_rr <= rx_valid_r;
-            // rxfifo_rd (BRAM, registered read) holds the popped byte
-            // from one clk after rx_pop_d — pair it with rx_valid_rr
-            rx_data_d   <= rxfifo_rd;
-        end
-    end
-
-    usb_fifo16x8 #(.DEPTH(64), .AW(6), .RAM(1)) u_rxfifo(
-        .clk(clk), .rst(rst || bus_reset),
-        .wr_en(rx_push_run_d), .wr_data(dt_rd_data),
-        .rd_en(rx_pop_d), .rd_data(rxfifo_rd),
-        .count(rxfifo_cnt), .full(rxfifo_full), .empty(rxfifo_empty));
-    assign rx_data  = rx_data_d;
-    assign rx_valid = rx_valid_rr;
-    // does the whole packet fit the rx FIFO?  adder+compare (carry
-    // chain), combinational — the serial registers the DECISION one
-    // clk later, so this stays out of its response cycle
-    wire [7:0] rx_sum = {1'b0, rxfifo_cnt} + {1'b0, dt_len};
-    wire rx_room_ok = (rx_sum <= 8'd64);
-
-    usb_fifo16x8 u_txfifo(
-        .clk(clk), .rst(rst || bus_reset),
-        // The write gate is REGISTERED (txfifo_wr_d): the old comb gate
-        // at the write edge put the cnt full-compare into every byte's
-        // write-enable cone (via the echo's do_push chain) -- the
-        // vir-flow critical path, 21.8 ns.  A registered gate is safe
-        // here: the overflow scenario the old comment feared (a push
-        // landing inside the gate-to-write window) needs TWO pushes
-        // within 1 clk, and the echo pushes at most one byte per ~417
-        // clks (single hold slot) and is the only writer of this FIFO.
-        // tx_data (the echo's hold_data) is stable across the +1 clk:
-        // it only changes on the next receiver byte, >=417 clks later.
-        .wr_en(txfifo_wr_d), .wr_data(tx_data),
-        .rd_en(snap_pop), .rd_data(txfifo_rd),
-        .count(txfifo_cnt), .full(txfifo_full), .empty(txfifo_empty));
-    reg txfifo_wr_d;
-    always @(posedge clk)
-        txfifo_wr_d <= tx_strobe && !txfifo_full;
-    wire [6:0] tx_room = 7'd16 - txfifo_cnt;
-    // tx_ready is REGISTERED (+1 clk stale): the echo's do_push (its
-    // hold_valid clear) then reads only registered terms, taking the
-    // cnt full-compare out of hold_valid's enable cone.  Stale room is
-    // safe: the echo pushes at most one byte per ~417 clks (single
-    // hold slot) and is the only writer of the txfifo, so no push can
-    // land inside the 1-clk staleness window.  The txfifo_wr_d gate
-    // re-checks !full at the registered edge as belt-and-braces.
-    reg tx_ready_r;
-    always @(posedge clk)
-        tx_ready_r <= !txfifo_full;
-    assign tx_ready = tx_ready_r;
-
-    // ------------------------------------------------------------------
-    // EP0 + serial protocol modules
-    // ------------------------------------------------------------------
-    wire        ep0_resp_req;
-    wire [3:0]  ep0_resp_pid;
-    wire [6:0]  ep0_resp_len;
-    wire [2:0]  ep0_resp_sel;
-    wire [9:0]  ep0_resp_base;
-    wire [6:0]  dev_addr;
-    wire        configured, ep0_busy, ep0_stalling, ep0_wait_ack;
-
-    wire        ser_resp_req, ser_resp_fresh, ser_busy, ser_ack_wait;
-    wire [3:0]  ser_resp_pid;
-    wire [6:0]  ser_resp_len;
-
-    \usb::Ep0 u_ep0(
-        .clk(clk), .rst(rst), .bus_reset(bus_reset),
-        .tk_setup(ep0_tk_setup), .tk_in(ep0_tk_in), .tk_out(ep0_tk_out),
-        .dt_valid(ep0_dt_valid_r), .dt_pid(dt_pid), .dt_len(dt_len),
-        .dt_head(dt_head), .dt_crc_ok(dt_crc_ok),
-        .hs_ack(ep0_hs_ack),
-        .resp_req(ep0_resp_req), .resp_pid(ep0_resp_pid),
-        .resp_len(ep0_resp_len), .resp_sel(ep0_resp_sel),
-        .resp_base(ep0_resp_base),
-        .dev_addr(dev_addr), .configured(configured),
-        .ep0_busy(ep0_busy), .ep0_stalling(ep0_stalling),
-        .ep0_wait_ack(ep0_wait_ack));
-
-    usb_serial u_serial(
-        .clk(clk), .rst(rst), .bus_reset(bus_reset), .set_cfg(cfg_strobe),
-        .tk_in(ser_tk_in), .tk_out(ser_tk_out),
-        .dt_valid(ser_dt_valid), .dt_pid(dt_pid), .dt_len(dt_len),
-        .dt_crc_ok(dt_crc_ok),
-        .hs_ack(ser_hs_ack),
-        .txfifo_empty(txfifo_empty), .txfifo_count(txfifo_cnt),
-        .rx_room(rx_room_ok), .tx_room(tx_room),
-        .resp_req(ser_resp_req), .resp_pid(ser_resp_pid),
-        .resp_len(ser_resp_len), .resp_fresh(ser_resp_fresh),
-        .ser_busy(ser_busy), .ser_ack_wait(ser_ack_wait));
-
-    // ------------------------------------------------------------------
-    // Token router: address filter + endpoint decode.  The device answers
-    // only its own address (starts 0; SET_ADDRESS latches at status
-    // completion), SOF tokens decode but are ignored.
-    // The address compare + pid/endp decode is REGISTERED (tok_v_r, +1
-    // clk on token strobes — well inside the device turnaround budget):
-    // the dev_addr compare then sits in ONE register's D-cone instead of
-    // fanning into every consumer's clock-enable logic (that fanout was
-    // the critical path).  tk_pid/tk_endp hold their values between
-    // packets, so decoding them one clk late is exact.
-    // ------------------------------------------------------------------
-    reg tok_v_r;
-    always @(posedge clk) begin
-        if (rst || bus_reset)
-            tok_v_r <= 1'b0;
-        else
-            tok_v_r <= tk_valid && tk_crc_ok && (tk_addr == dev_addr);
-    end
-    // The FULL token strobes are REGISTERED (+1 clk on top of tok_v_r):
-    // the pid/endp decode otherwise stays combinational off tok_v_r and
-    // every consumer's register-enable cone ingests it (tk_pid -> decode
-    // -> resp_*/pkt_len CEN was the last long path family).  tk_pid/
-    // tk_endp hold their values between packets, so decoding them one
-    // clk later is exact; the +1 clk on token strobes is free (turnaround
-    // budget ~30-50 clks; inter-packet gap >= 2 bit times = 8 clks, so
-    // no subsequent packet can outrun the delayed strobe).
-    reg ep0_tk_setup_r, ep0_tk_in_r, ep0_tk_out_r;
-    reg ser_tk_in_r,  ser_tk_out_r;
-    reg ep2_tk_in_r,  ep2_tk_out_r;
-    always @(posedge clk) begin
-        if (rst || bus_reset) begin
-            ep0_tk_setup_r <= 1'b0;
-            ep0_tk_in_r    <= 1'b0;
-            ep0_tk_out_r   <= 1'b0;
-            ser_tk_in_r    <= 1'b0;
-            ser_tk_out_r   <= 1'b0;
-            ep2_tk_in_r    <= 1'b0;
-            ep2_tk_out_r   <= 1'b0;
-        end else begin
-            ep0_tk_setup_r <= tok_v_r && (tk_pid == PID_SETUP) && (tk_endp == 4'd0);
-            ep0_tk_in_r    <= tok_v_r && (tk_pid == PID_IN)    && (tk_endp == 4'd0);
-            ep0_tk_out_r   <= tok_v_r && (tk_pid == PID_OUT)   && (tk_endp == 4'd0);
-            ser_tk_in_r    <= tok_v_r && (tk_pid == PID_IN)    && (tk_endp == 4'd1);
-            ser_tk_out_r   <= tok_v_r && (tk_pid == PID_OUT)   && (tk_endp == 4'd1);
-            ep2_tk_in_r    <= tok_v_r && (tk_pid == PID_IN)    && (tk_endp == 4'd2);
-            ep2_tk_out_r   <= tok_v_r && (tk_pid == PID_OUT)   && (tk_endp == 4'd2);
-        end
-    end
-    wire ep0_tk_setup = ep0_tk_setup_r;
-    wire ep0_tk_in    = ep0_tk_in_r;
-    wire ep0_tk_out   = ep0_tk_out_r;
-    wire ser_tk_in    = ser_tk_in_r;
-    wire ser_tk_out   = ser_tk_out_r;
-    wire ep2_tk_in    = ep2_tk_in_r;
-    wire ep2_tk_out   = ep2_tk_out_r;
-
-    // data packet router: the module expecting a data packet owns it.
-    // EP0's strobe is REGISTERED one clk after arrival: the rxpkt EOP
-    // outputs (dt_len = bc-2, dt_crc_ok = 16-bit CRC-residual compare)
-    // carry wide cones in their D-terms, and fanning them into EP0's
-    // accept enables in the ARRIVAL cycle was the critical path.  Every
-    // field EP0 reads (dt_head / dt_pid / dt_len / dt_crc_ok) is a
-    // register that HOLDS until the next packet's EOP, so the delayed
-    // read is bit-identical; the +1 clk is free (device turnaround
-    // budget ~30-50 clks, the core uses ~20).  usb_serial keeps the
-    // arrival-cycle strobe: its accept decision is already registered
-    // one clk later (dt_acc/dt_rej), so its cone was never critical.
-    // No token can land in the 1-clk strobe delay: the inter-packet
-    // gap is >= 2 bit times = 8 clks.
-    // "last valid token was OUT-to-EP0": qualifies EP0's data-stage
-    // STALL.  During EP_STALL the only data packet EP0 may answer is
-    // the stalled control transfer's OWN data stage (its token was
-    // OUT-to-EP0).  Without this qualifier the router handed EVERY
-    // data packet to a stalled EP0, STALLing the host's bulk-OUT
-    // writes and killing the echo until the next SETUP (found on
-    // hardware: the port enumerated but no byte ever flowed after the
-    // connect script's SET_LINE_CODING stalled).  The token precedes
-    // its data packet back-to-back, so this register is stable across
-    // the data packet; the next token re-evaluates it.
-    reg last_out_ep0;
-    always @(posedge clk) begin
-        if (rst || bus_reset)
-            last_out_ep0 <= 1'b0;
-        else if (tok_v_r)
-            last_out_ep0 <= (tk_pid == PID_OUT) && (tk_endp == 4'd0);
-    end
-    wire ep0_data_take = ep0_busy || (ep0_stalling && last_out_ep0);
-    wire ep0_dt_gate = dt_valid && ep0_data_take;
-    reg  ep0_dt_valid_r;
-    always @(posedge clk)
-        if (rst || bus_reset) ep0_dt_valid_r <= 1'b0;
-        else                  ep0_dt_valid_r <= ep0_dt_gate;
-    wire ser_dt_valid = dt_valid && ser_busy
-                        && !ep0_data_take;
-
-    // handshake router: the module with a response in flight owns it
-    wire ep0_hs_ack = hs_valid && (hs_pid == PID_ACK) && ep0_wait_ack;
-    wire ser_hs_ack = hs_valid && (hs_pid == PID_ACK)
-                      && !ep0_wait_ack && ser_ack_wait;
-
-    // ------------------------------------------------------------------
-    // Response arbiter: requests never overlap in protocol order (one
-    // response per token/data packet), so a simple priority mux with an
-    // in-flight owner register suffices.
-    // ------------------------------------------------------------------
-    // notif EP (EP2): the host polls it, the core never arms it — every
-    // token gets a NAK.  REGISTERED: a combinational NAK off the token
-    // router would drag the whole token-decode cone into the tx engine's
-    // state logic (the response comes 1 clk later, still far inside the
-    // device turnaround budget).
-    reg ep2_nak_req;
-    always @(posedge clk)
-        if (rst)        ep2_nak_req <= 1'b0;
-        else            ep2_nak_req <= ep2_tk_in_r || ep2_tk_out_r;
-    wire tx_start = ep0_resp_req || ser_resp_req || ep2_nak_req;
-
-    reg [1:0] tx_owner;   // 0 none, 1 ep0, 2 serial, 3 ep2
-    wire tx_busy;
-    wire tx_done;
-    always @(posedge clk) begin
-        if (rst)                 tx_owner <= 2'd0;
-        else if (tx_start)       tx_owner <= ep0_resp_req ? 2'd1
-                                       : ser_resp_req ? 2'd2 : 2'd3;
-        else if (tx_done)        tx_owner <= 2'd0;
-    end
-
-    wire [3:0] tx_pid_w = ep0_resp_req ? ep0_resp_pid
-                       : ser_resp_req ? ser_resp_pid
-                       : PID_NAK;   // EP2 notif endpoint
-    wire [6:0] tx_len_w = ep0_resp_req ? ep0_resp_len
-                       : ser_resp_req ? ser_resp_len
-                       : 7'd0;
-
-    // ------------------------------------------------------------------
-    // Snapshot loader: a fresh bulk-IN arm pops min(count,64) bytes from
-    // the tx FIFO into snap[] one byte per clk (byte 0 is first needed
-    // ~72+ clks after the arm, so the load always wins the race).
-    // ------------------------------------------------------------------
-    (* ram_style = "block" *) reg [7:0] snap [0:63];
-    reg       load_run;
-    reg [6:0] li;          // write address: counts 0..len-1 while loading
-    // Termination is a COUNTDOWN, not an address compare: rem is loaded
-    // with the packet length at arm time and decrements once per popped
-    // byte; the last byte is being written when rem == 1, i.e.
-    // !(|rem[6:1]) — a 6-input OR (1-2 LUTs) into load_run's D.  The old
-    // test compared li against a precomputed snap_len_m1 (7-bit
-    // equality, 4-LUT chain) landing on BOTH load_run's D and li's clock
-    // enable — the vir-flow critical path (21.2 ns).  li's enable is now
-    // the plain registered load_run: no compare cone at all.  Byte
-    // schedule is identical: one pop per clk, snap[0..len-1] in order.
-    reg [6:0] rem;
-    wire      snap_pop = load_run;
-    // sync-read port (BRAM): address held one byte ahead (see producer)
-    reg [7:0] snap_q;
-    always @(posedge clk) snap_q <= snap[byte_rd_addr];
-
-    always @(posedge clk) begin
-        if (rst || bus_reset) begin
-            load_run <= 1'b0;
-            li <= 7'd0;
-            rem <= 7'd0;
-        end else begin
-            if (tx_start && ser_resp_req && ser_resp_fresh) begin
-                li <= 7'd0;
-                rem <= tx_len_w;
-                load_run <= (tx_len_w != 7'd0);
-            end else if (load_run) begin
-                snap[li] <= txfifo_rd;
-                li <= li + 7'd1;
-                rem <= rem - 7'd1;
-                load_run <= (|rem[6:1]);   // rem != 1: more bytes follow
-            end
-        end
-    end
-
-    // ------------------------------------------------------------------
-    // rx push: accepted bulk-OUT payloads stream from the rx packet's
-    // payload RAM into the rx FIFO, one byte per clk.  The 64:1 payload
-    // mux the old rx_push_byte register closed over is GONE (the payload
-    // store is off-fabric, see usb::RxPacket): the payload RAM
-    // (\usb::RxRam) registers mem[push_i] into dt_rd_data one clk after
-    // so the 1-stage rx_push_run_d strobe pairs index and byte exactly
-    // (byte i written at the C(2+i)->C(3+i) posedge, once, in order):
-    //     ser_accept during C0: push_i<-0, rx_push_run<-1
-    //     C1: dt_rd_addr=0 -> posedge: dt_rd_data=byte0 during C2,
-    //                            rx_push_run_d <- run(C1)=1 during C2
-    //     posedge C2: FIFO writes byte0 (wr_en=run_d, wr_data=rd_data)
-    // wr_en is pre-gated with !full inside rx_push_run's own D (the
-    // serial accept already required cnt+dt_len <= 64), so the rxfifo
-    // write port sees two clean registers.
-    // ------------------------------------------------------------------
-    reg       rx_push_run;
-    reg [6:0] push_i;
-    reg       rx_push_run_d;
-    // Termination is a COUNTDOWN (push_rem): the old `push_i + 7'd1 >=
-    // dt_len_hold` compare rode the 7-bit increment carry chain into
-    // push_i's own clock-enable cone -- the vir-flow critical path
-    // (22.0 ns).  push_rem counts the bytes still to push; the stop
-    // test is a 6-input NOR, and push_i's increment feeds only its own
-    // D.  Byte-exact: push_rem==1 in cycle N means cycle N pushes the
-    // last byte, so run drops at N's edge exactly where the old
-    // compare dropped it (push_i visits one extra index in the
-    // trailing cycle; that read is discarded -- run_d is 0 by then).
-    reg [6:0] push_rem;
-    wire ser_accept = ser_resp_req && (ser_resp_pid == 4'h2); // ACK
-
-    always @(posedge clk) begin
-        if (rst || bus_reset) begin
-            rx_push_run   <= 1'b0;
-            rx_push_run_d <= 1'b0;
-            push_i <= 7'd0;
-            push_rem <= 7'd0;
-        end else begin
-            rx_push_run_d <= rx_push_run;
-            if (ser_accept) begin
-                push_i      <= 7'd0;
-                push_rem    <= dt_len;
-                rx_push_run <= (dt_len != 7'd0) && !rxfifo_full;
-            end else if (rx_push_run) begin
-                push_i <= push_i + 7'd1;
-                push_rem <= push_rem - 7'd1;
-                rx_push_run <= |(push_rem[6:1]);   // push_rem==1: last byte
-            end
-        end
-    end
-
-    // ------------------------------------------------------------------
-    // Descriptor ROM: 256 x 8 initialized BRAM (sync read).  Contiguous
-    // pages: sel0 device@0 (18 B), sel1 config@18 (75 B), sel2 str0@93,
-    // sel3 str1@97 (10 B), sel4 str2@107 (28 B).  sel5 (line coding)
-    // and sel6 (status) are dynamic/trivial and bypass the ROM.  This
-    // replaces the desc_byte() case cascade: a 128-deep case is ~20 ns
-    // of LUT chain; a BRAM read is a register.
-    // ------------------------------------------------------------------
     (* ram_style = "block" *) reg [7:0] desc_rom [0:255];
     initial begin
             desc_rom[8'd0] = 8'h12;
@@ -998,82 +524,5 @@ module \usb::UsbUart (
             desc_rom[8'd254] = 8'h00;
             desc_rom[8'd255] = 8'h00;
     end
-
-    // ------------------------------------------------------------------
-    // Byte fetch pipeline (per byte of the in-flight packet):
-    //   tx_addr_next (comb from s) -> byte_rd_addr (reg)
-    //      -> snap_q / desc_q (BRAM sync-read output register)
-    // The producer mux below therefore feeds the PHY from registered
-    // sources only; the PHY's tx_byte register is a further stage.
-    // ------------------------------------------------------------------
-    reg [6:0] byte_rd_addr;
-    always @(posedge clk) byte_rd_addr <= tx_addr_next_w;
-
-    // EP0 ROM address: page start + transfer offset, latched at arm
-    function [7:0] rom_page;
-        input [2:0] sd;
-        begin
-            case (sd)
-            3'd0: rom_page = 8'd0;    // device
-            3'd1: rom_page = 8'd18;   // config
-            3'd2: rom_page = 8'd93;   // string 0
-            3'd3: rom_page = 8'd97;   // string 1
-            3'd4: rom_page = 8'd107;  // string 2
-            default: rom_page = 8'd0;
-            endcase
-        end
-    endfunction
-    reg [7:0] rom_base_r;
-    always @(posedge clk)
-        if (rst) rom_base_r <= 8'd0;
-        else if (ep0_resp_req)
-            rom_base_r <= rom_page(ep0_resp_sel) + ep0_resp_base[7:0];
-
-    reg [7:0] rom_addr_r;
-    always @(posedge clk) rom_addr_r <= rom_base_r + {1'b0, byte_rd_addr};
-    reg [7:0] desc_q;
-    always @(posedge clk) desc_q <= desc_rom[rom_addr_r];
-
-    // dynamic EP0 responses: GET_STATUS (2 zero bytes)
-    // tx PHY producer mux: registered sources only
-    wire [7:0] tx_byte = (tx_owner == 2'd2) ? snap_q
-                      : (ep0_resp_sel == 3'd6) ? 8'h00
-                      : desc_q;
-
-    wire [6:0] tx_addr_next_w;
-    \usb::TxPhy u_txphy (
-        .clk(clk), .rst(rst),
-        .tx_start(tx_start), .tx_pid(tx_pid_w), .tx_len(tx_len_w),
-        .tx_byte(tx_byte), .tx_addr(), .tx_addr_next(tx_addr_next_w),
-        .tx_busy(tx_busy), .tx_done(tx_done),
-        .dp(dp_tx), .dn(dn_tx), .output_enable(output_enable));
-
-    // SET_CONFIGURATION completed -> reset bulk data toggles (§9.1.1.5)
-    reg configured_d;
-    wire cfg_strobe = configured ^ configured_d;
-    always @(posedge clk)
-        if (rst) configured_d <= 1'b0;
-        else     configured_d <= configured;
-
-    // USB activity indicators: the rx/tx byte-stream strobes stretched
-    // to ~175 ms (see the port comment).  Self-contained counters --
-    // deliberately outside every USB engine path.
-    reg [22:0] rx_led_cnt = 23'd0;
-    reg [22:0] tx_led_cnt = 23'd0;
-    always @(posedge clk) begin
-        if (rx_valid)
-            rx_led_cnt <= 23'h7F_FFFF;
-        else if (rx_led_cnt != 23'd0)
-            rx_led_cnt <= rx_led_cnt - 23'd1;
-    end
-    always @(posedge clk) begin
-        if (tx_strobe)
-            tx_led_cnt <= 23'h7F_FFFF;
-        else if (tx_led_cnt != 23'd0)
-            tx_led_cnt <= tx_led_cnt - 23'd1;
-    end
-    assign rxing = (rx_led_cnt != 23'd0);
-    assign txing = (tx_led_cnt != 23'd0);
-
-    assign connected_o = configured;
+    always @(posedge clk) rd <= desc_rom[ra];
 endmodule

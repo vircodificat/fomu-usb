@@ -81,57 +81,17 @@ mod UsbPor {
     por_done := por_done_r
 }
 
-//> The USB Full-Speed CDC-ACM device core, vendored Verilog
-//> (ext/usb_uart.sv, module inventory in its file header).  This is
-//> the migration boundary: the core stays an ext mod today and its
-//> internals move into .vir one at a time, all with unidirectional
-//> interfaces.  Done so far: usb_crc5/16 -> usb::Crc5/Crc16,
-//> usb_rx_phy -> usb::RxPhy, usb_rx_packet -> usb::RxPacket,
-//> usb_tx_phy -> usb::TxPhy, usb_ep0 -> usb::Ep0.  Remaining:
-//> usb_fifo16x8, usb_serial -- plus \usb::RxRam (the 64x8 payload
-//> block RAM),
-//> which stays vendored Verilog for good: Virdant cannot express an
-//> indexed memory (the same limitation that keeps \echo::EchoFifo
-//> in ext/).
-ext mod UsbUart {
-    //> 48 MHz clock: 4 clk cycles per USB FS bit.
-    incoming clk : Clock
-    //> Synchronous reset, active high.  Fed by the registered por_done
-    //> (one clk behind UsbPor's release) -- see the por_rst doccomment
-    //> in UsbController below for why the extra register stage is
-    //> load-bearing.
-    incoming rst : Bit
-    //> D+ pad sample in (from UsbPads).
-    incoming dp_rx         : Bit
-    //> D- pad sample in (from UsbPads).
-    incoming dn_rx         : Bit
-    //> D+ drive level out (to UsbPads).
-    outgoing dp_tx         : Bit
-    //> D- drive level out (to UsbPads).
-    outgoing dn_tx         : Bit
-    //> Pad drive enable: drive the bus while high (SB_IO
-    //> OUTPUT_ENABLE via UsbPads).
-    outgoing output_enable : Bit
-    //> Byte from the host; valid for one cycle with rx_valid.
-    outgoing rx_data   : Word[8]
-    //> 1-clk strobe per received byte (= the rx FIFO pop).
-    outgoing rx_valid  : Bit
-    //> The tx FIFO has room for another byte.
-    outgoing tx_ready  : Bit
-    //> Byte toward the host.
-    incoming tx_data   : Word[8]
-    //> 1-clk push strobe for tx_data.
-    incoming tx_strobe : Bit
-    //> Flow control back: low = the rx consumer is full, stop popping
-    //> (the core NAKs bulk-OUT packets instead).
-    incoming rx_ready  : Bit
-    //> The core is receiving data (host -> device); stretched ~175 ms
-    //> past the last byte so it is LED-visible (drives led_red).
-    outgoing rxing : Bit
-    //> The core is sending data (device -> host); stretched ~175 ms
-    //> past the last byte (drives led_green).
-    outgoing txing : Bit
-}
+//> The USB Full-Speed CDC-ACM device core is now a PLAIN Virdant
+//> mod (mod UsbUart, declared after usb::TxPhy below): the whole
+//> protocol stack -- RxPhy, RxPacket, Ep0, Serial, TxPhy, the token
+//> router, response arbiter, snapshot loader and rx push -- lives in
+//> .vir.  Only what Virdant cannot express stays vendored in
+//> ext/usb_uart.sv as ext bodies: the two sync FIFOs (\usb::TxFifo /
+//> \usb::RxFifo over usb_fifo16x8), the bulk-IN snapshot RAM
+//> (\usb::SnapRam), the descriptor ROM (\usb::DescRom) and the
+//> payload RAM (\usb::RxRam) -- all indexed memories (the same
+//> limitation that keeps \echo::EchoFifo in ext/); \usb::UsbPads
+//> stays ext for the other Virdant gap, the design's only `inout`.
 
 //> Serial CRC LFSRs (USB 2.0 §8.3.5), migrated out of ext/usb_uart.sv.
 //> Both advance one serial WIRE bit per clk when `adv` is high (wire
@@ -1017,8 +977,10 @@ mod RxPacket {
 
     //> Flopped payload head shadow, packet bytes 0..7 (bc < 8) -- eight
     //> SEPARATE byte-regs, exactly the vendored body's per-byte flops:
-    //> each byte's enable is its own shallow decode (dt_wr && bc < 8 &&
-    //> bc == k) and its D is dt_byte_new directly.  A single Word[64]
+    //> each byte's enable is its own shallow decode (dt_wr && bc == k
+    //> -- k < 8, so the equality subsumes the head-window test) and
+    //> its D is dt_byte_new directly; the bc compare runs in PARALLEL
+    //> with the dt_wr cone instead of serially behind it.  A single Word[64]
     //> reg with an 8-way splice mux was tried instead and was a
     //> MEASURED REGRESSION (abc9 shared the whole dt_wr cone into every
     //> bit's enable: the 21.6 ns vir-flow critical path, synth FAIL at
@@ -1029,7 +991,7 @@ mod RxPacket {
         initial it <= 0w8
         it <= when {
             case rst || bus_reset => 0w8
-            case dt_wr && (bc[7..3] == 0w4) && (bc[3..0] == 0w3) => dt_byte_new
+            case dt_wr && (bc == 0w7) => dt_byte_new
             else => it
         }
     }
@@ -1037,7 +999,7 @@ mod RxPacket {
         initial it <= 0w8
         it <= when {
             case rst || bus_reset => 0w8
-            case dt_wr && (bc[7..3] == 0w4) && (bc[3..0] == 1w3) => dt_byte_new
+            case dt_wr && (bc == 1w7) => dt_byte_new
             else => it
         }
     }
@@ -1045,7 +1007,7 @@ mod RxPacket {
         initial it <= 0w8
         it <= when {
             case rst || bus_reset => 0w8
-            case dt_wr && (bc[7..3] == 0w4) && (bc[3..0] == 2w3) => dt_byte_new
+            case dt_wr && (bc == 2w7) => dt_byte_new
             else => it
         }
     }
@@ -1053,7 +1015,7 @@ mod RxPacket {
         initial it <= 0w8
         it <= when {
             case rst || bus_reset => 0w8
-            case dt_wr && (bc[7..3] == 0w4) && (bc[3..0] == 3w3) => dt_byte_new
+            case dt_wr && (bc == 3w7) => dt_byte_new
             else => it
         }
     }
@@ -1061,7 +1023,7 @@ mod RxPacket {
         initial it <= 0w8
         it <= when {
             case rst || bus_reset => 0w8
-            case dt_wr && (bc[7..3] == 0w4) && (bc[3..0] == 4w3) => dt_byte_new
+            case dt_wr && (bc == 4w7) => dt_byte_new
             else => it
         }
     }
@@ -1069,7 +1031,7 @@ mod RxPacket {
         initial it <= 0w8
         it <= when {
             case rst || bus_reset => 0w8
-            case dt_wr && (bc[7..3] == 0w4) && (bc[3..0] == 5w3) => dt_byte_new
+            case dt_wr && (bc == 5w7) => dt_byte_new
             else => it
         }
     }
@@ -1077,7 +1039,7 @@ mod RxPacket {
         initial it <= 0w8
         it <= when {
             case rst || bus_reset => 0w8
-            case dt_wr && (bc[7..3] == 0w4) && (bc[3..0] == 6w3) => dt_byte_new
+            case dt_wr && (bc == 6w7) => dt_byte_new
             else => it
         }
     }
@@ -1085,7 +1047,7 @@ mod RxPacket {
         initial it <= 0w8
         it <= when {
             case rst || bus_reset => 0w8
-            case dt_wr && (bc[7..3] == 0w4) && (bc[3..0] == 7w3) => dt_byte_new
+            case dt_wr && (bc == 7w7) => dt_byte_new
             else => it
         }
     }
@@ -1837,6 +1799,236 @@ mod Ep0 {
     }
 }
 
+//> usb_serial -- EP1 bulk endpoint protocol, migrated out of
+//> ext/usb_uart.sv.  Cycle-exact translation: data toggles + ACK/NAK/
+//> ARM decisions only -- data movement lives in the core top (FIFOs,
+//> snapshot RAM, tx PHY mux).  IN packets are snapshotted from the
+//> tx FIFO into the snapshot RAM at arm time, so an unacknowledged
+//> packet is retransmitted byte-identically (same data pid) until
+//> the host ACKs.  Data toggles reset on bus reset and
+//> SET_CONFIGURATION (USB 2.0 §9.1.1.5).
+//>
+//> The OUT data accept/reject is REGISTERED one clk after arrival
+//> (dt_acc/dt_rej): the room check (an add+compare crossing the rx
+//> FIFO count) and the response/toggle registers then land in
+//> separate cycles (+1 clk response latency is well inside the
+//> device turnaround budget).  The core top streams the payload on
+//> the serial ACK pulse.
+mod Serial {
+    //> 48 MHz clock: 4 clk cycles per USB FS bit.
+    incoming clk : Clock
+    //> Synchronous reset, active high (core reset from UsbController).
+    incoming rst : Bit
+    //> Bus reset strobe (via the core): flushes the protocol state.
+    incoming bus_reset : Bit
+    //> Pulse: SET_CONFIGURATION completed (reset the bulk toggles).
+    incoming set_cfg : Bit
+    //> Router-gated token strobes (address + endpoint 1 matched):
+    //> IN (host wants a bulk-IN packet).
+    incoming tk_in : Bit
+    //> OUT (a data packet for EP1 follows).
+    incoming tk_out : Bit
+    //> Router-gated data packet strobe: an armed OUT to EP1 (NOT
+    //> delayed a clk, unlike EP0's -- the accept decision below is
+    //> itself registered).
+    incoming dt_valid : Bit
+    //> Data packet PID.
+    incoming dt_pid : Word[4]
+    //> Data packet payload byte count.
+    incoming dt_len : Word[7]
+    //> Data packet CRC16 verdict.
+    incoming dt_crc_ok : Bit
+    //> Router-gated handshake strobe: our in-flight packet was ACKed.
+    incoming hs_ack : Bit
+    //> Tx FIFO status: nothing queued for the host.
+    incoming txfifo_empty : Bit
+    //> Tx FIFO fill (for arm sizing: min(count, 64) bytes).
+    incoming txfifo_count : Word[7]
+    //> 1: the whole OUT packet fits the rx FIFO (core-side add+compare;
+    //> the decision here is registered one clk after arrival).
+    incoming rx_room : Bit
+    //> Free slots in the tx FIFO (unused -- kept for interface
+    //> completeness with the old vendored port).
+    incoming tx_room : Word[7]
+
+    //> Response request (1-clk pulse).
+    outgoing resp_req : Bit {
+        it := resp_req_r
+    }
+    //> Response PID: DATA0 3 / DATA1 B / ACK 2 / NAK A.
+    outgoing resp_pid : Word[4] {
+        it := resp_pid_r
+    }
+    //> Response byte count.
+    outgoing resp_len : Word[7] {
+        it := resp_len_r
+    }
+    //> 1: a NEW packet was armed -- the core must snapshot len bytes
+    //> from the tx FIFO (the response is the snapshot's first read).
+    outgoing resp_fresh : Bit {
+        it := resp_fresh_r
+    }
+    //> Router hint: an OUT data packet is expected (route dt_valid here).
+    outgoing ser_busy : Bit {
+        it := armed_out
+    }
+    //> Router hint: our data packet is in flight (route the ACK here).
+    outgoing ser_ack_wait : Bit {
+        it := pkt_pending
+    }
+
+    unused tx_room
+    // The packet payload byte count (unused here: the whole packet is
+    // accepted or rejected on rx_room; the length lives in the core's
+    // rx push).
+    unused dt_len
+
+    // ---- combinational helpers -------------------------------------------
+    //> The data pid the armed OUT expects (toggle-dependent).
+    wire exp_pid : Word[4] {
+        it := mux(tog_rx, 11w4, 3w4)
+    }
+    //> Arm-a-new-packet condition: IN token, no unacknowledged packet,
+    //> and something to send.
+    wire arm_new : Bit {
+        it := tk_in && !pkt_pending && !txfifo_empty
+    }
+    //> min(count, 64): the fresh-arm payload length.
+    wire load_len : Word[7] {
+        it := mux(txfifo_count > 64w7, 64w7, txfifo_count)
+    }
+
+    // ---- protocol registers ----------------------------------------------
+    //> TX data toggle: 0 => the next device data pid is DATA0.
+    //> Toggled by the ACK of our in-flight packet.
+    reg tog_tx : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset || set_cfg => false
+            case hs_ack && pkt_pending => !it
+            else => it
+        }
+    }
+    //> RX data toggle: 0 => the next host data pid is DATA0.
+    //> Toggled per accepted OUT packet.
+    reg tog_rx : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset || set_cfg => false
+            case dt_acc => !it
+            else => it
+        }
+    }
+    //> The snapshot holds an unacknowledged IN packet (retransmit on
+    //> retry, same pid; forgotten at the ACK).
+    reg pkt_pending : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset || set_cfg => false
+            case hs_ack && it => false
+            case arm_new => true
+            else => it
+        }
+    }
+    //> The snapshotted packet's byte count.
+    reg pkt_len : Word[7] on clk {
+        initial it <= 0w7
+        it <= when {
+            case rst || bus_reset || set_cfg => 0w7
+            case arm_new => load_len
+            else => it
+        }
+    }
+    //> An OUT token armed this endpoint: its data packet is expected
+    //> next (cleared at the packet's arrival, registered one clk
+    //> later via dt_acc/dt_rej -- the arrival-cycle clear below is
+    //> exact: the token precedes its data packet).
+    reg armed_out : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset || set_cfg => false
+            case it && dt_valid => false
+            case tk_out => true
+            else => it
+        }
+    }
+    //> Registered accept: good CRC, expected pid, room in the rx
+    //> FIFO (one clk after the data packet strobe).
+    reg dt_acc : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset || set_cfg => false
+            else => armed_out && dt_valid && dt_crc_ok
+                && (dt_pid == exp_pid) && rx_room
+        }
+    }
+    //> Registered reject: anything else that arrives armed.
+    reg dt_rej : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset || set_cfg => false
+            else => armed_out && dt_valid
+                && !(dt_crc_ok && (dt_pid == exp_pid) && rx_room)
+        }
+    }
+
+    // ---- response registers -----------------------------------------------
+    //> resp_req is default low, pulsed by each arm/accept/reject; the
+    //> params are held per-branch (the core's arbiter latches them on
+    //> the pulse).  The accept/reject overrides take priority over
+    //> the token arm exactly as the vendored body's assignment order.
+    reg resp_req_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset || set_cfg => false
+            case dt_acc => true
+            case dt_rej => true
+            case tk_in  => true
+            else => false
+        }
+    }
+    reg resp_pid_r : Word[4] on clk {
+        initial it <= 0w4
+        it <= when {
+            case dt_acc => 2w4
+            case dt_rej => 10w4
+            case tk_in => when {
+                // retransmit the unacknowledged packet, same pid
+                case pkt_pending   => mux(tog_tx, 11w4, 3w4)
+                // arm a new packet from the tx FIFO
+                case !txfifo_empty => mux(tog_tx, 11w4, 3w4)
+                // nothing to send
+                else => 10w4
+            }
+            else => it
+        }
+    }
+    reg resp_len_r : Word[7] on clk {
+        initial it <= 0w7
+        it <= when {
+            case dt_acc => 0w7
+            case dt_rej => 0w7
+            case tk_in => when {
+                case pkt_pending   => pkt_len
+                case !txfifo_empty => load_len
+                else => 0w7
+            }
+            else => it
+        }
+    }
+    //> The fresh-arm strobe: deliberately NOT reset (the vendored body
+    //> left it out of the reset branch, so it holds through reset;
+    //> the core only ever consumes it alongside a resp_req pulse).
+    reg resp_fresh_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset || set_cfg => it
+            case arm_new => true
+            else => false
+        }
+    }
+}
+
 //> usb_tx_phy -- packet records back to pads (USB 2.0 §7.1.x), the
 //> mirror of usb::RxPhy, migrated out of ext/usb_uart.sv.  Drives a
 //> complete FS packet: sync pattern, NRZI-encoded bit-stuffed data,
@@ -2285,6 +2477,776 @@ mod TxPhy {
         it.adv := (state == #Data) && (btc == 2w2) && !cur_stuff
             && is_data && (s >= 16w10) && (s < payload_end_r)
         it.din := raw_bit_r
+    }
+}
+
+//> The two sync FIFOs over usb_fifo16x8 (ext/usb_uart.sv): thin
+//> fixed-parameter wrappers so the Virdant side can instantiate them
+//> as ext mods (Virdant ext mods cannot carry parameters).
+//> Port/behavior contract (the usb_fifo16x8 header): wr_en and rd_en
+//> are CALLER-gated (!full / !empty) -- the count terms never enter
+//> the FIFO's own pointer/count enables (both call sites gate in the
+//> register that produces the strobe).
+
+//> The 16-deep x 8-bit tx FIFO (defaults: flop storage, RAM=0), with
+//> the COMBINATIONAL head on rd_data.
+ext mod TxFifo {
+    //> 48 MHz clock.
+    incoming clk : Clock
+    //> Synchronous reset (both call sites pass rst || bus_reset).
+    incoming rst : Bit
+    //> Write enable (caller pre-gates with !full).
+    incoming wr_en : Bit
+    //> Write byte.
+    incoming wr_data : Word[8]
+    //> Pop enable (caller pre-gates with !empty).
+    incoming rd_en : Bit
+    //> The head byte, combinational.
+    outgoing rd_data : Word[8]
+    //> Bytes stored (0..16).
+    outgoing count : Word[7]
+    //> Full (count == 16).
+    outgoing full : Bit
+    //> Empty.
+    outgoing empty : Bit
+}
+
+//> The 64-deep x 8-bit bulk-OUT rx FIFO (DEPTH=64, AW=6, RAM=1):
+//> block-RAM storage with the head delayed one clk on rd_data (the
+//> registered free-running read takes 512 flops and their per-byte
+//> write-decode cones off the fabric).  DEPTH=64 is a documented
+//> plan deviation: a max-size bulk-OUT packet must be absorbed
+//> atomically under the "whole packet must fit" rule.
+ext mod RxFifo {
+    //> 48 MHz clock.
+    incoming clk : Clock
+    //> Synchronous reset.
+    incoming rst : Bit
+    //> Write enable (caller pre-gates with !full).
+    incoming wr_en : Bit
+    //> Write byte.
+    incoming wr_data : Word[8]
+    //> Pop enable (caller pre-gates with !empty).
+    incoming rd_en : Bit
+    //> The head byte, one clk after rd_en (registered read).
+    outgoing rd_data : Word[8]
+    //> Bytes stored (0..64).
+    outgoing count : Word[7]
+    //> Full (count == 64).
+    outgoing full : Bit
+    //> Empty.
+    outgoing empty : Bit
+}
+
+//> The bulk-IN snapshot RAM (64x8 block RAM): at arm time the
+//> snapshot loader pops min(count,64) bytes from the tx FIFO in
+//> here, so an unacknowledged IN packet is retransmitted
+//> byte-identically until the host ACKs.  One write port (the
+//> loader's index) and one registered sync read (byte_rd_addr ->
+//> rd next clk).  The 7-bit ports index a 64-entry array with
+//> Verilog out-of-range semantics, exactly the old
+//> `snap[li] <= ...; snap_q <= snap[byte_rd_addr]`.
+ext mod SnapRam {
+    //> 48 MHz clock.
+    incoming clk : Clock
+    //> Write enable (the loader's step strobe).
+    incoming we : Bit
+    //> Write address (the loader's index, 0..63; >= 64 is a no-op).
+    incoming wa : Word[7]
+    //> Write byte (the popped tx-FIFO head).
+    incoming wd : Word[8]
+    //> Read address (the tx byte fetch index; out of range reads X,
+    //> exactly the vendored body).
+    incoming ra : Word[7]
+    //> Registered read data: mem[ra] as of the previous posedge.
+    outgoing rd : Word[8]
+}
+
+//> The descriptor ROM (256x8 initialized block RAM, registered
+//> read): contiguous pages -- sel0 device@0 (18 B), sel1 config@18
+//> (75 B), sel2 str0@93, sel3 str1@97 (10 B), sel4 str2@107 (28 B).
+//> sel5 (line coding) and sel6 (status) are dynamic/trivial and
+//> bypass the ROM.  The 256-byte initial block lives in the ext
+//> body (ext/usb_uart.sv); a BRAM read replaces the desc_byte()
+//> case cascade (a 128-deep case is ~20 ns of LUT chain; a BRAM
+//> read is a register).
+ext mod DescRom {
+    //> 48 MHz clock.
+    incoming clk : Clock
+    //> ROM address (page start + transfer offset).
+    incoming ra : Word[8]
+    //> Registered read data: desc_rom[ra] as of the previous posedge.
+    outgoing rd : Word[8]
+}
+
+//> usb_uart -- the core top, migrated out of ext/usb_uart.sv:
+//> descriptor ROM plumbing, token router, response arbiter, bulk
+//> snapshot loader, rx push, FIFOs + byte-stream loopback interface
+//> (the EP0 / Serial / TxPhy / RxPhy / RxPacket instantiations live
+//> here too).  Cycle-exact translation (same discipline as
+//> usb::RxPacket / usb::Ep0): every reg's next-state is the priority
+//> chain the Verilog if/else-if tree encoded, and every
+//> registered-helper structure (the +1/+2-clk token strobes, the
+//> registered EP0 data strobe, the countdown terminations) is
+//> preserved -- see the original comments carried below and
+//> wiki/usb-uart.md.
+mod UsbUart {
+    //> 48 MHz clock: 4 clk cycles per USB FS bit.
+    incoming clk : Clock
+    //> Synchronous reset, active high.  Fed by the registered
+    //> por_done (one clk behind UsbPor's release) -- see the por_rst
+    //> doccomment in UsbController for why the extra register stage
+    //> is load-bearing.
+    incoming rst : Bit
+    //> D+ pad sample in (from UsbPads).
+    incoming dp_rx : Bit
+    //> D- pad sample in (from UsbPads).
+    incoming dn_rx : Bit
+    //> D+ drive level out (to UsbPads).
+    outgoing dp_tx : Bit {
+        it := txphy.dp
+    }
+    //> D- drive level out (to UsbPads).
+    outgoing dn_tx : Bit {
+        it := txphy.dn
+    }
+    //> Pad drive enable: drive the bus while high (SB_IO
+    //> OUTPUT_ENABLE via UsbPads).
+    outgoing output_enable : Bit {
+        it := txphy.output_enable
+    }
+    //> Byte from the host; valid for one cycle with rx_valid.
+    outgoing rx_data : Word[8] {
+        it := rx_data_d
+    }
+    //> 1-clk strobe per received byte (= the rx FIFO pop).
+    outgoing rx_valid : Bit {
+        it := rx_valid_rr
+    }
+    //> The tx FIFO has room for another byte.
+    outgoing tx_ready : Bit {
+        it := tx_ready_r
+    }
+    //> Byte toward the host.
+    incoming tx_data : Word[8]
+    //> 1-clk push strobe for tx_data.
+    incoming tx_strobe : Bit
+    //> Flow control back: low = the rx consumer is full, stop popping
+    //> (the core NAKs bulk-OUT packets instead).
+    incoming rx_ready : Bit
+    //> The core is receiving data (host -> device); stretched ~175 ms
+    //> past the last byte so it is LED-visible (drives led_red).  EP0
+    //> control traffic is not covered (not in rx_valid/tx_strobe).
+    outgoing rxing : Bit {
+        it := rx_led_cnt != 0w23
+    }
+    //> The core is sending data (device -> host); stretched ~175 ms
+    //> past the last byte (drives led_green).
+    outgoing txing : Bit {
+        it := tx_led_cnt != 0w23
+    }
+
+    // ---- RX chain -----------------------------------------------------
+    //> The RX PHY (pads -> decoded bits).  `active` is not needed by
+    //> the core: the packet engines key off sop/eop/pkt_err.
+    mod rxphy of RxPhy {
+        it.clk := clk
+        it.rst := rst
+        it.dp  := dp_rx
+        it.dn  := dn_rx
+        unused it.active
+    }
+    //> Bus reset strobe from the PHY (long SE0): flushes everything.
+    wire bus_reset : Bit {
+        it := rxphy.bus_reset
+    }
+
+    //> The packet assembler (bits -> tk_*/dt_*/hs_* records).  The
+    //> RAM read address is the rx-push byte index push_i (the rx
+    //> push streams the payload out through the registered read
+    //> port).
+    mod rxpkt of RxPacket {
+        it.clk       := clk
+        it.rst       := rst
+        it.bus_reset := bus_reset
+        it.bit_i     := rxphy.bit_o
+        it.bit_valid := rxphy.bit_valid
+        it.sop       := rxphy.sop
+        it.eop       := rxphy.eop
+        it.pkt_err   := rxphy.pkt_err
+        it.dt_rd_addr := push_i[6..0]
+        // SOF frames decode but are ignored (the device does no SOF
+        // bookkeeping).
+        unused it.tk_frame
+    }
+
+    // ---- EP0 + serial protocol modules ---------------------------------
+    //> EP0 (control transfers + CDC requests) and Serial (EP1 bulk
+    //> protocol): see their own banners.  The dt_* fields are shared
+    //> straight off the packet assembler's records (they hold between
+    //> packets); only the per-module data strobes are router-gated.
+    mod ep0 of Ep0 {
+        it.clk       := clk
+        it.rst       := rst
+        it.bus_reset := bus_reset
+        it.tk_setup  := ep0_tk_setup_r
+        it.tk_in     := ep0_tk_in_r
+        it.tk_out    := ep0_tk_out_r
+        it.dt_valid  := ep0_dt_valid_r
+        it.dt_pid    := rxpkt.dt_pid
+        it.dt_len    := rxpkt.dt_len
+        it.dt_head   := rxpkt.dt_head
+        it.dt_crc_ok := rxpkt.dt_crc_ok
+        it.hs_ack    := ep0_hs_ack
+    }
+
+    mod serial of Serial {
+        it.clk       := clk
+        it.rst       := rst
+        it.bus_reset := bus_reset
+        it.set_cfg   := cfg_strobe
+        it.tk_in     := ser_tk_in_r
+        it.tk_out    := ser_tk_out_r
+        it.dt_valid  := ser_dt_valid
+        it.dt_pid    := rxpkt.dt_pid
+        it.dt_len    := rxpkt.dt_len
+        it.dt_crc_ok := rxpkt.dt_crc_ok
+        it.hs_ack    := ser_hs_ack
+        it.txfifo_empty := txfifo.empty
+        it.txfifo_count := txfifo.count
+        it.rx_room      := rx_room_ok
+        it.tx_room      := tx_room
+    }
+
+    // ---- token router -------------------------------------------------
+    //> The device answers only its own address (starts 0; SET_ADDRESS
+    //> latches at status completion); SOF tokens decode but are
+    //> ignored.  The address compare + pid/endp decode is REGISTERED
+    //> (+1 clk on token strobes -- well inside the device turnaround
+    //> budget): the dev_addr compare then sits in ONE register's
+    //> D-cone instead of fanning into every consumer's clock-enable
+    //> logic.  tk_pid/tk_endp hold their values between packets, so
+    //> decoding them one clk late is exact.
+    reg tok_v_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => rxpkt.tk_valid && rxpkt.tk_crc_ok
+                && (rxpkt.tk_addr == ep0.dev_addr)
+        }
+    }
+
+    //> The FULL token strobes, REGISTERED one clk further (the
+    //> pid/endp decode otherwise stays combinational off tok_v_r and
+    //> every consumer's register-enable cone ingests it; no token can
+    //> land in the delay -- the inter-packet gap is >= 2 bit times =
+    //> 8 clks).
+    reg ep0_tk_setup_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => tok_v_r && (rxpkt.tk_pid == 13w4)
+                && (rxpkt.tk_endp == 0w4)
+        }
+    }
+    reg ep0_tk_in_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => tok_v_r && (rxpkt.tk_pid == 9w4)
+                && (rxpkt.tk_endp == 0w4)
+        }
+    }
+    reg ep0_tk_out_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => tok_v_r && (rxpkt.tk_pid == 1w4)
+                && (rxpkt.tk_endp == 0w4)
+        }
+    }
+    reg ser_tk_in_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => tok_v_r && (rxpkt.tk_pid == 9w4)
+                && (rxpkt.tk_endp == 1w4)
+        }
+    }
+    reg ser_tk_out_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => tok_v_r && (rxpkt.tk_pid == 1w4)
+                && (rxpkt.tk_endp == 1w4)
+        }
+    }
+    reg ep2_tk_in_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => tok_v_r && (rxpkt.tk_pid == 9w4)
+                && (rxpkt.tk_endp == 2w4)
+        }
+    }
+    reg ep2_tk_out_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => tok_v_r && (rxpkt.tk_pid == 1w4)
+                && (rxpkt.tk_endp == 2w4)
+        }
+    }
+
+    //> "last valid token was OUT-to-EP0": qualifies EP0's data-stage
+    //> STALL.  During EP_STALL the only data packet EP0 may answer is
+    //> the stalled control transfer's OWN data stage (its token was
+    //> OUT-to-EP0).  Without this qualifier the router handed EVERY
+    //> data packet to a stalled EP0, STALLing the host's bulk-OUT
+    //> writes and killing the echo until the next SETUP (found on
+    //> hardware: the port enumerated but no byte ever flowed after
+    //> the connect script's SET_LINE_CODING stalled).  The token
+    //> precedes its data packet back-to-back, so this register is
+    //> stable across the data packet; the next token re-evaluates it.
+    reg last_out_ep0 : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case tok_v_r => (rxpkt.tk_pid == 1w4) && (rxpkt.tk_endp == 0w4)
+            else => it
+        }
+    }
+
+    //> Data packet router: the module expecting a data packet owns
+    //> it.  EP0's strobe is REGISTERED one clk after arrival: the
+    //> rxpkt EOP outputs (dt_len = bc-2, dt_crc_ok = the 16-bit
+    //> residual compare) carry wide cones, and fanning them into
+    //> EP0's accept enables in the ARRIVAL cycle was the critical
+    //> path.  Every field EP0 reads holds until the next packet's
+    //> EOP, so the delayed read is bit-identical; the +1 clk is free
+    //> (no token can land in the delay).  usb::Serial keeps the
+    //> arrival-cycle strobe: its accept decision is already
+    //> registered one clk later (dt_acc/dt_rej), so its cone was
+    //> never critical.
+    wire ep0_data_take : Bit {
+        it := ep0.ep0_busy || (ep0.ep0_stalling && last_out_ep0)
+    }
+    wire ep0_dt_gate : Bit {
+        it := rxpkt.dt_valid && ep0_data_take
+    }
+    reg ep0_dt_valid_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => ep0_dt_gate
+        }
+    }
+    wire ser_dt_valid : Bit {
+        it := rxpkt.dt_valid && serial.ser_busy && !ep0_data_take
+    }
+
+    //> Handshake router: the module with a response in flight owns
+    //> it.
+    wire ep0_hs_ack : Bit {
+        it := rxpkt.hs_valid && (rxpkt.hs_pid == 2w4) && ep0.ep0_wait_ack
+    }
+    wire ser_hs_ack : Bit {
+        it := rxpkt.hs_valid && (rxpkt.hs_pid == 2w4)
+            && !ep0.ep0_wait_ack && serial.ser_ack_wait
+    }
+
+    // ---- response arbiter -----------------------------------------------
+    //> Requests never overlap in protocol order (one response per
+    //> token/data packet), so a simple priority mux with an in-flight
+    //> owner register suffices.
+
+    //> Notif EP (EP2): the host polls it, the core never arms it --
+    //> every token gets a NAK.  REGISTERED (a combinational NAK off
+    //> the token router would drag the whole token-decode cone into
+    //> the tx engine's state logic; the response comes 1 clk later,
+    //> still far inside the turnaround budget).  NB: rst ONLY, no
+    //> bus_reset -- exactly as the vendored body.
+    reg ep2_nak_req : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst => false
+            else => ep2_tk_in_r || ep2_tk_out_r
+        }
+    }
+
+    wire ep0_resp_req : Bit {
+        it := ep0.resp_req
+    }
+    wire ser_resp_req : Bit {
+        it := serial.resp_req
+    }
+    //> The tx engine start strobe: any pending response request.
+    wire tx_start : Bit {
+        it := ep0_resp_req || ser_resp_req || ep2_nak_req
+    }
+
+    //> In-flight response owner: 0 none, 1 ep0, 2 serial, 3 ep2.
+    //> NB: rst ONLY, no bus_reset -- exactly as the vendored body.
+    reg tx_owner : Word[2] on clk {
+        initial it <= 0w2
+        it <= when {
+            case rst => 0w2
+            case tx_start => when {
+                case ep0_resp_req => 1w2
+                case ser_resp_req => 2w2
+                else => 3w2
+            }
+            case txphy.tx_done => 0w2
+            else => it
+        }
+    }
+
+    //> The response the tx engine launches (EP2 always NAKs).
+    wire tx_pid_w : Word[4] {
+        it := when {
+            case ep0_resp_req => ep0.resp_pid
+            case ser_resp_req => serial.resp_pid
+            else => 10w4
+        }
+    }
+    wire tx_len_w : Word[7] {
+        it := when {
+            case ep0_resp_req => ep0.resp_len
+            case ser_resp_req => serial.resp_len
+            else => 0w7
+        }
+    }
+
+    // ---- snapshot loader ------------------------------------------------
+    //> A fresh bulk-IN arm pops min(count,64) bytes from the tx FIFO
+    //> into the snapshot RAM one byte per clk (byte 0 is first
+    //> needed ~72+ clks after the arm, so the load always wins the
+    //> race).  Termination is a COUNTDOWN, not an address compare:
+    //> rem loads the packet length at arm and decrements once per
+    //> popped byte; the last byte is being written when rem == 1,
+    //> i.e. any(rem[7..1]) -- a 6-input OR into load_run's D; li's
+    //> increment feeds only its own D (the old li-vs-len compare was
+    //> the vir-flow critical path).  Byte schedule identical: one
+    //> pop per clk, snap[0..len-1] in order.
+    wire arm_fresh : Bit {
+        it := tx_start && ser_resp_req && serial.resp_fresh
+    }
+    reg load_run : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case arm_fresh => tx_len_w != 0w7
+            case it        => any(rem[7..1])
+            else => it
+        }
+    }
+    reg li : Word[7] on clk {
+        initial it <= 0w7
+        it <= when {
+            case rst || bus_reset => 0w7
+            case arm_fresh => 0w7
+            case load_run => it + 1w7
+            else => it
+        }
+    }
+    reg rem : Word[7] on clk {
+        initial it <= 0w7
+        it <= when {
+            case rst || bus_reset => 0w7
+            case arm_fresh => tx_len_w
+            case load_run => it - 1w7
+            else => it
+        }
+    }
+    //> The snapshot RAM instance.  we fires exactly where the
+    //> vendored body wrote: a load step -- not the arm cycle, not
+    //> reset (all three terms are current-cycle, so the write edge
+    //> is bit-identical).
+    mod snapram of SnapRam {
+        it.clk := clk
+        it.we  := load_run && !arm_fresh && !(rst || bus_reset)
+        it.wa  := li
+        it.wd  := txfifo.rd_data
+        it.ra  := byte_rd_addr
+    }
+
+    // ---- byte fetch pipeline ---------------------------------------------
+    //> Per byte of the in-flight packet: tx_addr_next (comb from the
+    //> tx PHY's bit index) -> byte_rd_addr (reg) -> snap_q / desc_q
+    //> (the BRAM sync-read output registers live inside the ext
+    //> bodies).  The producer mux below feeds the PHY from
+    //> registered sources only; the PHY's tx_byte register is a
+    //> further stage.
+    reg byte_rd_addr : Word[7] on clk {
+        initial it <= 0w7
+        it <= txphy.tx_addr_next
+    }
+    //> EP0 ROM page start by descriptor select.
+    wire rom_page : Word[8] {
+        it := match ep0.resp_sel {
+            case 0w3 => 0w8
+            case 1w3 => 18w8
+            case 2w3 => 93w8
+            case 3w3 => 97w8
+            case 4w3 => 107w8
+            else => 0w8
+        }
+    }
+    //> The latched EP0 response base: page start + transfer offset,
+    //> latched at arm.  NB: rst ONLY -- exactly as the vendored body.
+    reg rom_base_r : Word[8] on clk {
+        initial it <= 0w8
+        it <= when {
+            case rst => 0w8
+            case ep0_resp_req => rom_page + ep0.resp_base[8..0]
+            else => it
+        }
+    }
+    //> The ROM read address, one stage behind the base (free-running
+    //> adder; only the latched-at-arm base matters).
+    reg rom_addr_r : Word[8] on clk {
+        initial it <= 0w8
+        it <= rom_base_r + word(0w1, byte_rd_addr)
+    }
+    mod descrom of DescRom {
+        it.clk := clk
+        it.ra := rom_addr_r
+    }
+    wire desc_q : Word[8] {
+        it := descrom.rd
+    }
+    //> tx PHY producer mux (registered sources only): serial data
+    //> comes from the snapshot RAM; GET_STATUS (sel 6) reads as zero
+    //> bytes; everything else reads the descriptor ROM.
+    wire tx_byte : Word[8] {
+        it := when {
+            case tx_owner == 2w2 => snapram.rd
+            case ep0.resp_sel == 6w3 => 0w8
+            else => desc_q
+        }
+    }
+
+    // ---- tx PHY -----------------------------------------------------------
+    mod txphy of TxPhy {
+        it.clk := clk
+        it.rst := rst
+        it.tx_start := tx_start
+        it.tx_pid := tx_pid_w
+        it.tx_len := tx_len_w
+        it.tx_byte := tx_byte
+        unused it.tx_addr
+        unused it.tx_busy
+    }
+
+    // ---- FIFOs -------------------------------------------------------------
+    //> The 64-deep bulk-OUT rx FIFO.  wr_en is the REGISTERED push
+    //> strobe (rx_push_run_d -- pre-gated with !full in its own D);
+    //> rd_en is the REGISTERED pop decision (rx_pop_d, pre-gated
+    //> with !empty).
+    mod rxfifo of RxFifo {
+        it.clk     := clk
+        it.rst     := rst || bus_reset
+        it.wr_en   := rx_push_run_d
+        it.wr_data := rxpkt.dt_rd_data
+        it.rd_en   := rx_pop_d
+    }
+
+    //> The 16-deep tx FIFO.  The write gate is REGISTERED
+    //> (txfifo_wr_d): the old comb gate at the write edge put the cnt
+    //> full-compare into every byte's write-enable cone (via the
+    //> echo's do_push chain) -- the vir-flow critical path, 21.8 ns.
+    //> A registered gate is safe here: the overflow scenario the
+    //> comb gate feared needs TWO pushes within 1 clk, and the echo
+    //> pushes at most one byte per ~417 clks (single hold slot) and
+    //> is the only writer of this FIFO.  tx_data (the echo's
+    //> hold_data) is stable across the +1 clk: it only changes on
+    //> the next receiver byte, >= 417 clks later.  rd_en is the
+    //> snapshot loader's pop (the only popper, popping exactly
+    //> min(count,64) counted at arm).
+    mod txfifo of TxFifo {
+        it.clk     := clk
+        it.rst     := rst || bus_reset
+        it.wr_en   := txfifo_wr_d
+        it.wr_data := tx_data
+        it.rd_en   := load_run
+    }
+
+    // ---- rx pop / byte-stream loopback pipe ---------------------------------
+    //> The registered loopback strobe pipeline (three stages on the
+    //> rx side: the BRAM read is registered): the pop decision, then
+    //> the (rx_valid pulse, rx_data byte) pair the consumer latches
+    //> one clk after the BRAM read port has produced the popped
+    //> byte.  (the PoC Top wires the loopback: tx_data = rx_data,
+    //> tx_strobe = rx_valid; the pipelined pair keeps the plan §2
+    //> contract and takes the empty/full decode off the single-cycle
+    //> paths)
+    reg rx_pop_d : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            // Pop while the rx FIFO has a byte, the tx FIFO keeps the
+            // 3-stage pipe's headroom (cnt <= 12: 16 - 3 in flight -
+            // 1 margin, so a landing push never meets a full txfifo
+            // and the comb write gate never drops a popped byte), AND
+            // the byte-stream consumer signals room (rx_ready -- the
+            // echo server throttles the pop rate to the UART's
+            // 115200 drain; when low the rx FIFO fills, the serial
+            // endpoint NAKs bulk-OUT, the host retries: end-to-end
+            // flow control with no byte loss).  Off-by-one fix (stress
+            // S4c, cnt wrap 0->127): block a pop when the in-flight
+            // pop is consuming the last byte -- the scheduled next
+            // pop would find an empty FIFO and the 7-bit cnt
+            // subtract wraps to 127, draining stale BRAM bytes
+            // forever.
+            else => !rxfifo.empty && !(rxfifo.count == 1w7 && it)
+                && (txfifo.count < 13w7) && rx_ready
+        }
+    }
+    reg rx_valid_r : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => rx_pop_d
+        }
+    }
+    reg rx_valid_rr : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => rx_valid_r
+        }
+    }
+    //> The popped byte (rxfifo.rd_data holds it from one clk after
+    //> rx_pop_d), paired with rx_valid_rr.  NO reset: holds.
+    reg rx_data_d : Word[8] on clk {
+        initial it <= 0w8
+        it <= when {
+            case rst || bus_reset => it
+            else => rxfifo.rd_data
+        }
+    }
+
+    // ---- rx push -------------------------------------------------------------
+    //> Accepted bulk-OUT payloads stream from the packet payload RAM
+    //> into the rx FIFO, one byte per clk: the payload RAM registers
+    //> mem[push_i] into dt_rd_data one clk after the index holds it,
+    //> so the 1-stage rx_push_run_d strobe pairs index and byte
+    //> exactly (byte i written at the C(2+i)->C(3+i) posedge, once,
+    //> in order).  wr_en is pre-gated with !full inside rx_push_run's
+    //> own D (the serial accept already required cnt+dt_len <= 64),
+    //> so the rxfifo write port sees two clean registers.
+    //> Termination is a COUNTDOWN (push_rem): the old `push_i+1 >=
+    //> len` compare rode the increment carry chain into push_i's own
+    //> clock enable -- the vir-flow critical path (22.0 ns).  The
+    //> stop test is a 6-input NOR; push_i's increment feeds only its
+    //> own D.  Byte-exact: push_rem==1 in cycle N means cycle N
+    //> pushes the last byte, so run drops at N's edge exactly where
+    //> the old compare dropped it (push_i visits one extra index in
+    //> the trailing cycle; that read is discarded -- run_d is 0 by
+    //> then).
+    wire ser_accept : Bit {
+        it := ser_resp_req && (serial.resp_pid == 2w4)
+    }
+    reg rx_push_run : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            case ser_accept => (rxpkt.dt_len != 0w7) && !rxfifo.full
+            case it => any(push_rem[7..1])
+            else => it
+        }
+    }
+    reg rx_push_run_d : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst || bus_reset => false
+            else => rx_push_run
+        }
+    }
+    reg push_i : Word[7] on clk {
+        initial it <= 0w7
+        it <= when {
+            case rst || bus_reset => 0w7
+            case ser_accept => 0w7
+            case rx_push_run => it + 1w7
+            else => it
+        }
+    }
+    reg push_rem : Word[7] on clk {
+        initial it <= 0w7
+        it <= when {
+            case rst || bus_reset => 0w7
+            case ser_accept => rxpkt.dt_len
+            case rx_push_run => it - 1w7
+            else => it
+        }
+    }
+
+    // ---- tx-side gates, room, LEDs --------------------------------------------
+    //> The REGISTERED txfifo write gate (see the txfifo banner).
+    reg txfifo_wr_d : Bit on clk {
+        initial it <= false
+        it <= tx_strobe && !txfifo.full
+    }
+    //> Free slots in the tx FIFO (for usb::Serial's arm sizing).
+    wire tx_room : Word[7] {
+        it := 16w7 - txfifo.count
+    }
+    //> tx_ready is REGISTERED (+1 clk stale): the echo's do_push
+    //> (its hold_valid clear) then reads only registered terms,
+    //> taking the cnt full-compare out of hold_valid's enable cone.
+    //> Stale room is safe: the echo pushes at most one byte per ~417
+    //> clks (single hold slot) and is the only writer, so no push can
+    //> land inside the 1-clk staleness window; the txfifo_wr_d gate
+    //> re-checks !full at the registered edge as belt-and-braces.
+    reg tx_ready_r : Bit on clk {
+        initial it <= false
+        it <= !txfifo.full
+    }
+    //> Does the whole packet fit the rx FIFO?  adder+compare (carry
+    //> chain), combinational -- usb::Serial registers the DECISION
+    //> one clk later, so this stays out of its response cycle.
+    wire rx_sum : Word[8] {
+        it := word(0w1, rxfifo.count) + word(0w1, rxpkt.dt_len)
+    }
+    wire rx_room_ok : Bit {
+        it := rx_sum <= 64w8
+    }
+
+    //> SET_CONFIGURATION completed -> reset the bulk data toggles
+    //> (USB 2.0 §9.1.1.5): edge detect on ep0.configured.  NB: the
+    //> delayed copy is rst ONLY -- exactly as the vendored body.
+    reg configured_d : Bit on clk {
+        initial it <= false
+        it <= when {
+            case rst => false
+            else => ep0.configured
+        }
+    }
+    wire cfg_strobe : Bit {
+        it := ep0.configured ^^ configured_d
+    }
+
+    //> USB activity indicators: the rx/tx byte-stream strobes
+    //> stretched to ~175 ms (the 1-clk rx_valid/tx_strobe strobes are
+    //> far too fast to see).  Self-contained counters -- deliberately
+    //> outside every USB engine path, NO reset (power-on zero, count
+    //> down to rest).
+    reg rx_led_cnt : Word[23] on clk {
+        initial it <= 0w23
+        it <= when {
+            case rx_valid_rr  => 0x7f_ffffw23
+            case it != 0w23   => it - 1w23
+            else => it
+        }
+    }
+    reg tx_led_cnt : Word[23] on clk {
+        initial it <= 0w23
+        it <= when {
+            case tx_strobe    => 0x7f_ffffw23
+            case it != 0w23   => it - 1w23
+            else => it
+        }
     }
 }
 

@@ -487,7 +487,7 @@ module tb_usb_serial;
         req[0] = 8'h00; req[1] = 8'h09; req[2] = 8'h01; req[3] = 8'h00;
         req[4] = 8'h00; req[5] = 8'h00; req[6] = 8'h00; req[7] = 8'h00;
         ctrl_no_data(7'd42);
-        check(dut.core.u_ep0.configured === 1'b1, "S2: configured");
+        check(dut.core.ep0.configured === 1'b1, "S2: configured");
 
         // ---------------------------------------------------------------
         // 3. negative: token to the OLD address (0) must get NO response
@@ -626,8 +626,8 @@ module tb_usb_serial;
         $display("--- S7: bus reset (10 ms SE0)");
         host.host_reset;
         host.host_idle(256);
-        check(dut.core.u_ep0.dev_addr === 7'd0, "S7: address back to 0");
-        check(dut.core.u_ep0.configured === 1'b0, "S7: unconfigured");
+        check(dut.core.ep0.dev_addr === 7'd0, "S7: address back to 0");
+        check(dut.core.ep0.configured === 1'b0, "S7: unconfigured");
 
         $display("--- S7: re-enumerate at address 7");
         req[0] = 8'h80; req[1] = 8'h06; req[2] = 8'h00; req[3] = 8'h01;
@@ -679,10 +679,10 @@ module tb_usb_serial;
     // Instrumentation: monitor the core's RX packet CRC and length
     // --------------------------------------------------------------
     always @(posedge clk) begin
-        if (dut.core.u_rxpkt.dt_valid) begin
+        if (dut.core.rxpkt.dt_valid) begin
             $display("[%0t] RX pkt: dt_len=%0d dt_crc_ok=%b",
-                     $time, dut.core.u_rxpkt.dt_len,
-                     dut.core.u_rxpkt.dt_crc_ok);
+                     $time, dut.core.rxpkt.dt_len,
+                     dut.core.rxpkt.dt_crc_ok);
         end
     end
 
