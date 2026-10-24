@@ -1,20 +1,22 @@
-# usb_rx_phy — pads to bits
+# `usb::RxPhy` — pads to bits
 
-`usb_rx_phy` is the receiver physical layer of the Fomu USB device. It turns the
-two raw pad signals (`dp`, `dn`) into a clean stream of **decoded** (NRZI-decoded,
-bit-unstuffed) serial bits, plus the packet boundary signals that the rest of the
-core needs: start-of-packet, end-of-packet, per-packet error, and bus reset.
-It is the "pad -> bit stream" stage in the bottom-up chain described in the file
-header (`ext/usb_uart.sv:16`) and sits directly under
-[`usb_rx_packet`](usb-rx-packet.md), which turns this bit stream into packet
-records. If the USB terms below (NRZI, bit stuffing, sync, SE0...) are new to
-you, read the [USB primer](usb-primer.md) first; the [system
+`usb::RxPhy` (the `RxPhy` mod in `src/usb.vir`) is the receiver physical layer
+of the Fomu USB device. It turns the two raw pad signals (`dp`, `dn`) into a
+clean stream of **decoded** (NRZI-decoded, bit-unstuffed) serial bits, plus the
+packet boundary signals that the rest of the core needs: start-of-packet,
+end-of-packet, per-packet error, and bus reset. It is the "pad -> bit stream"
+stage in the bottom-up chain described in the file header of `src/usb.vir`, fed
+by the pad cells of `usb::UsbPads` (body in `ext/usb_pads.sv`) and sitting
+directly under [`usb::RxPacket`](usb-rx-packet.md), which turns this bit stream
+into packet records. If the USB terms below (NRZI, bit stuffing, sync, SE0...)
+are new to you, read the [USB primer](usb-primer.md) first; the [system
 overview](system-overview.md) shows where this block fits in the whole core.
 
-There is no DLL, no PLL, and no clock crossing anywhere in this design: the whole
-core runs on one **48 MHz** clock, and because USB Full-Speed bits are
-**12 Mbit/s**, one bit time is exactly **4 clk cycles** (`ext/usb_uart.sv:7`).
-That 4× oversampling is what makes this PHY simple enough to read in one sitting.
+There is no DLL, no PLL, and no clock crossing anywhere in this design: the
+whole core runs on one **48 MHz** clock, and because USB Full-Speed bits are
+**12 Mbit/s**, one bit time is nominally **4 clk cycles** (the first doc
+comment of `usb::RxPhy`). That 4× oversampling is what makes this PHY simple
+enough to read in one sitting.
 
 ## What a USB wire carries
 
@@ -32,60 +34,58 @@ transformations happen first:
 The receiver PHY therefore has to: recover the bit clock from transitions,
 sample each bit mid-bit, NRZI-decode, un-stuff, and detect the packet
 boundaries — sync pattern at the start, SE0 (both lines low) at the end.
-That is exactly what this module does, as its own header summarizes
-(`ext/usb_uart.sv:171`–`ext/usb_uart.sv:180`).
+That is exactly what this mod does, as its own doc comments summarize.
 
 ## Ports
 
 | Port | Dir | Width | Meaning |
 | --- | --- | --- | --- |
 | `clk` | in | 1 | 48 MHz system clock (4 cycles per USB bit time) |
-| `rst` | in | 1 | synchronous reset, active high |
-| `dp`, `dn` | in | 1 | raw D+/D− pad inputs (no local reset terms on them) |
+| `rst` | in | 1 | synchronous reset (core reset from `UsbController`; deliberately **not** asserted on bus reset — the bus-reset detector lives here) |
+| `dp`, `dn` | in | 1 | raw D+/D− pad samples (SB_IO `D_IN_0` via `usb::UsbPads`; asynchronous to `clk`) |
 | `bit_o` | out | 1 | decoded (unstuffed) data bit |
 | `bit_valid` | out | 1 | 1-clk strobe: `bit_o` is good this cycle |
 | `sop` | out | 1 | 1-clk pulse: J→K transition seen from idle (sync) |
-| `eop` | out | 1 | 1-clk pulse: SE0 held ≥ 2 bit times |
+| `eop` | out | 1 | 1-clk pulse: SE0 held ~1.75 bit times |
 | `active` | out | 1 | inside a packet (from `sop` until `eop`) |
-| `pkt_err` | out | 1 | sticky per-packet error flag, cleared at `sop` |
+| `pkt_err` | out | 1 | sticky per-packet error flag (SE1, or stuff violation), cleared at `sop` |
 | `bus_reset` | out | 1 | 1-clk pulse: SE0 held ≥ 2.5 µs |
 
 `bit_o`/`bit_valid`/`sop`/`eop`/`bus_reset` are all registered, single-cycle
-strobes (`ext/usb_uart.sv:304`–`ext/usb_uart.sv:310`), so downstream logic
-(e.g. `usb_rx_packet`) just watches for one-clk pulses.
+strobes (`sop_r`, `eop_r`, `bit_v_r`, `br_r` — default low, pulsed by their
+event), so downstream logic (e.g. `usb::RxPacket`) just watches for one-clk
+pulses.
 
 ## Signal conditioning: synchronizers and edge history
 
-```
-ext/usb_uart.sv:195-197
-    reg dp_s1, dp_s2, dn_s1, dn_s2;   // 2-FF pad synchronizers
-    reg dp_p, dn_p;                   // previous-cycle sample (edge detect)
-    reg lev_d, lev_n;                 // previous bit sample (NRZI decode)
-```
-
-The raw pads are asynchronous to `clk`, so each line goes through a two-flop
-synchronizer (`dp_s1 -> dp_s2`, `ext/usb_uart.sv:228`–`ext/usb_uart.sv:229`).
-Everything downstream reads only the synchronized versions:
+The raw pads are asynchronous to `clk` — the host's bit rate is only specified
+to ±0.25%, which is why clock recovery below re-aligns on every transition —
+so each line goes through a canonical two-flop synchronizer (the
+`builtin::Sync` instances `sync_dp` and `sync_dn`). Everything downstream
+reads only the synchronized versions:
 
 ```
-ext/usb_uart.sv:205-206
-    wire sdp = dp_s2;
-    wire sdn = dn_s2;
+wire sdp = sync_dp.out;   // synchronized D+
+wire sdn = sync_dn.out;   // synchronized D-
 ```
 
-`dp_p`/`dn_p` hold the *previous clk cycle's* sample
-(`ext/usb_uart.sv:230`), which gives a cheap edge detector used for clock
-recovery (`ext/usb_uart.sv:207`):
+A NB worth knowing: `builtin::Sync` has no reset, so the synchronizers track
+the pads from cycle 0 — including through the ~175 ms power-on reset. The
+detector state does not free-run then, though: `rst` parks every reg (the
+SE0 timer `se0_cnt` included), so no `bus_reset` can pulse while the core is
+held in reset.
+
+`dp_p`/`dn_p` hold the *previous clk cycle's* synchronized sample, which gives
+a cheap edge detector:
 
 ```
-wire trans = (sdp != dp_p) || (sdn != dp_p);
+wire trans = (sdp != dp_p) || (sdn != dn_p);
 ```
 
 …i.e. any change on either line is a transition. `lev_d`/`lev_n` hold the
 *previous bit's sampled level* — the NRZI reference, see below.
 
-The three fundamental line states are derived combinationally
-(`ext/usb_uart.sv:208`–`ext/usb_uart.sv:210`):
+The three fundamental line states are derived combinationally:
 
 | state | dp | dn | name |
 | --- | --- | --- | --- |
@@ -94,37 +94,38 @@ The three fundamental line states are derived combinationally
 | K | 0 | 1 | the opposite polarity |
 | `se1` | 1 | 1 | SE1 — illegal, both high |
 
-The polarity convention ("J = dp=1, dn=0; idle = J") is stated in the module
-header (`ext/usb_uart.sv:180`).
+The polarity convention ("J = dp=1, dn=0; idle = J") is baked into the reset
+values of `lev_d`/`lev_n` (J = D+ high, D− low) and the `k`/`se0`/`se1` wires.
 
 ## Clock recovery: 4× oversampling with a 2-bit phase counter
 
 There is no separate received clock. Instead, a 2-bit phase counter `ph`
 tracks *where inside the current bit time* we are, and any wire transition
-re-aligns it (`ext/usb_uart.sv:273`–`ext/usb_uart.sv:276`):
+re-aligns it:
 
-```systemverilog
-if (trans)
-    ph <= 2'd0;      // clock recovery: re-align on edge
-else
-    ph <= ph + 2'd1;
-if (ph == 2'd2) begin
-    // mid-bit sample
-    ...
-end
+```
+reg ph : Word[2] on clk {
+    case rst       => 0w2
+    case sop_edge  => 0w2
+    case jk        => mux(trans, 0w2, it + 1w2)   // re-align on edge
+    else           => it
+}
 ```
 
-At 48 MHz with 4 cycles per bit, the sample point `ph == 2` is the **middle**
-of the bit time — maximum distance from both edges, maximum noise margin.
-That's the same trick a UART uses with 4× oversampling, except here every
-data transition also *resets* `ph` to 0, so drift and duty-cycle distortion
-are continuously corrected rather than accumulating. A transition can only
-occur at a bit boundary or a stuffed-bit boundary, so re-anchoring on it is
-always legal.
+The mid-bit sample fires when `ph` has counted to **1** (the `sample` wire,
+`jk && ph == 1w2`). Because the re-align zeroes `ph` one clk after a
+transition reaches the synchronized pads, the phase-1 capture lands 2–3 clks
+after the switch reaches `sdp` — inside the bit's visibility window for
+*every* achievable quantized window width (3, 4 or 5 clks), so exactly one
+sample lands per bit window whether a given bit time quantizes to 4n−1, 4n or
+4n+1 clks. That's the same trick a UART uses with 4× oversampling, except
+here every data transition also *resets* `ph` to 0, so drift and duty-cycle
+distortion are continuously corrected rather than accumulating. A transition
+can only occur at a bit boundary or a stuffed-bit boundary, so re-anchoring
+on it is always legal.
 
-Note the sample is taken on the *rising edge* where `ph` **equals** 2 —
-`ph` is incremented in the same clocked block, so the sample happens on the
-third cycle of each bit time.
+Note that `ph` only advances while in-packet at a J/K level (`jk`); the SOP
+edge also zeroes it, so every packet starts sampling from a known phase.
 
 ## SOP: detecting the sync pattern
 
@@ -134,37 +135,32 @@ idle J state means the line starts with a transition to **K**, then no
 transitions for six bit times, then a final transition back.
 
 Rather than literally shift in the 8 bits, this PHY detects the start the
-cheap way: while idle (`!act`), the first J→K transition — a K level where
-idle expects J — is declared SOP (`ext/usb_uart.sv:246`–`ext/usb_uart.sv:257`):
+cheap way: while idle (`!act`), a K level — idle expects J — is declared SOP:
 
-```systemverilog
-if (k) begin
-    sop_r <= 1'b1;
-    act   <= 1'b1;
-    ph    <= 2'd0;
-    lev_d <= 1'b1;      // previous level was idle J
-    lev_n <= 1'b0;
-    perr  <= 1'b0;      // new packet clears the error flag
-end
+```
+wire sop_edge = !act && k;
 ```
 
-The rest of the sync byte is not checked; the downstream
-`usb_rx_packet` counts bits from SOP and skips the first 8 (the sync) before
-the PID — see [usb_rx_packet](usb-rx-packet.md). `lev_d/lev_n` are
-pre-seeded to the idle J level so the very first NRZI decode
-("same level as last bit ⇒ `1`") is correct relative to idle.
+The `sop_edge` case then arms the packet in one shot: `act` is set, `ph` is
+zeroed, and `perr` is cleared (new packet, clean slate). The rest of the sync
+byte is not checked; the downstream `usb::RxPacket` counts bits from SOP and
+skips the first 8 (the sync) before the PID — see
+[usb_rx_packet](usb-rx-packet.md).
 
 ## NRZI decode
 
-The core of the decode is one line (`ext/usb_uart.sv:212`):
+The core of the decode is one line:
 
-```systemverilog
+```
 wire bit_val = (sdp == lev_d) && (sdn == lev_n);
 ```
 
 `1` if the sampled line level is *identical* to the previous bit's level
-(no transition), `0` if it changed. `lev_d`/`lev_n` are then updated to
-the fresh sample at the same mid-bit point (`ext/usb_uart.sv:279`–`ext/usb_uart.sv:280`).
+(no transition), `0` if it changed. `lev_d`/`lev_n` are parked at the idle-J
+level by `rst` and updated to the fresh sample at every mid-bit sample; they
+are never re-seeded at SOP, which is harmless — the first sync samples decode
+against whatever the previous packet left, and the sync byte is skipped
+downstream anyway.
 
 This is textbook NRZI: no transition encodes `1`, transition encodes `0`.
 
@@ -172,96 +168,91 @@ This is textbook NRZI: no transition encodes `1`, transition encodes `0`.
 
 Transmitters insert a `0` after six consecutive `1`s. The receiver must
 recognize that run and *drop the next bit*. Here, a 3-bit counter
-`stuff_cnt` counts consecutive decoded `1`s
-(`ext/usb_uart.sv:290`–`ext/usb_uart.sv:296`):
+`stuff_cnt` counts consecutive decoded `1`s at the mid-bit samples:
 
-- a decoded `1` increments `stuff_cnt`; when it reaches 5 *at the moment
-  the current bit is also 1* (sixth one), `drop_state <= 1`
-  (`ext/usb_uart.sv:292`–`ext/usb_uart.sv:293`);
+- a decoded `1` increments `stuff_cnt`; when the count reaches 5 *and the
+  current bit is also 1* (the sixth one), `drop_state` is armed;
 - a decoded `0` clears the run;
 - when `drop_state` is set, the **next** mid-bit sample is the stuffed bit:
   it is discarded, not emitted (`bit_valid` stays low), the counters reset,
   and — importantly — if that bit decodes to `1` it is a **protocol
   violation**: a stuffed `0` may never NRZI-decode to `1`, so the packet
-  is marked bad (`ext/usb_uart.sv:282`–`ext/usb_uart.sv:288`):
+  is marked bad (`perr`).
 
-```systemverilog
-if (drop_state) begin
-    // this decoded bit is the stuffed 0: drop it
-    drop_state <= 1'b0;
-    stuff_cnt  <= 3'd0;
-    if (bit_val)
-        perr <= 1'b1;    // 6 ones then a 1: violation
-end else begin
-    bit_v_r <= 1'b1;
-    ...
-end
-```
-
-Note the asymmetry: only *actually emitted* bits count toward the run
-counter, and the stuffed bit itself is a forced transition (a decoded `0`)
-so it naturally resets the run.
+The counter is 3 bits wide with just enough headroom: the drop sample zeroes
+it, so it stops at 6 and never wraps. Note the asymmetry: the run counter only
+advances at mid-bit samples (and only in-packet), and the drop sample itself
+zeroes it — the stuffed bit is a forced transition (a decoded `0`), so it
+naturally resets the run.
 
 ## EOP and bus reset: the SE0 timer
 
-End-of-packet is **SE0 held for ≥ 2 bit times**; a bus reset is SE0 held
-for **≥ 2.5 µs = 120 clks** at 48 MHz (USB 2.0 §7.1.7.5). One 7-bit counter
-serves both (`ext/usb_uart.sv:238`–`ext/usb_uart.sv:244`):
+End-of-packet is SE0 held for ~1.75 bit times; a bus reset is SE0 held for
+**≥ 2.5 µs = 120 clks** at 48 MHz (USB 2.0 §7.1.7.5). One 7-bit counter
+serves both — the standalone `se0_cnt` reg, which just counts consecutive
+SE0 clks:
 
-```systemverilog
-if (se0)
-    se0_cnt <= se0_cnt + 7'd1;
-else
-    se0_cnt <= 7'd0;
-if (se0_cnt == 7'd119)
-    br_r <= 1'b1;        // bus_reset pulse
+```
+reg se0_cnt : Word[7] on clk {
+    case rst => 0w7
+    case se0 => it + 1w7
+    else     => 0w7
+}
 ```
 
-- **EOP** (`ext/usb_uart.sv:263`–`ext/usb_uart.sv:270`): while `act`, the first
-  SE0 is *not* immediately EOP — the PHY stays armed, and only when
-  `se0_cnt` reaches 7 (8 clks = 2 bit times) does it pulse `eop` and drop
-  `act`. This is the "≥ 2 bit times" requirement made concrete: a one-bit-time
-  glitch on both lines does not terminate the packet.
+- **EOP** (`eop_now = act && se0 && se0_cnt == 7`): while `act`, the first
+  SE0 is *not* immediately EOP — the PHY stays armed, and only once `se0_cnt`
+  has counted 7 consecutive SE0 clks (~1.75 bit times) does it pulse `eop`
+  and drop `act`. This is the "SE0 must persist" requirement made concrete:
+  a one-bit-time glitch on both lines does not terminate the packet.
 - **bus_reset** runs in parallel on the *same* counter, independent of
-  `act`, via the compare at 119 (120 clks ≈ 2.5 µs). The counter saturates
-  the count; a long reset keeps counting until the host releases the bus.
-- The header notes the deliberate distinction (`ext/usb_uart.sv:263`–`ext/usb_uart.sv:266`):
-  EOP is judged *inside* the active path, bus reset by the standalone timer.
+  `act`, via the compare `se0_cnt == 119` (120 SE0 clks ≈ 2.5 µs). The 7-bit
+  counter *wraps* rather than saturating, so a sustained reset SE0 re-pulses
+  `bus_reset` every 128 clks — and the EP0 FSM downstream treats each pulse
+  identically.
+- The deliberate distinction is worth noting: EOP is judged inside the
+  active path (`eop_now` requires `act`), bus reset by the standalone timer
+  (which runs whenever `rst` is low, in-packet or not).
 
 ## SE1: the illegal state
 
-If both lines are high (`se1`, `ext/usb_uart.sv:259`–`ext/usb_uart.sv:262`),
-the bus state is illegal for Full-Speed. The PHY immediately abandons the
-packet: `pkt_err` is set and `act` drops. Downstream, a flagged packet is
-silently discarded (see [usb-rx-packet](usb-rx-packet.md)).
+If both lines are high (`se1`), the bus state is illegal for Full-Speed. The
+PHY immediately abandons the packet: `abort = act && se1` drops `act` and
+sets `pkt_err` in the same cycle. Downstream, a flagged packet is silently
+discarded (see [usb-rx-packet](usb-rx-packet.md)).
 
-## One-clk-vs-half-bit timing, as implemented
+## One-clk-vs-bit timing, as implemented
 
 A few timing subtleties worth calling out because they are *as implemented*,
 not as an idealized spec:
 
-- **All outputs are registered strobes** (`sop_r`, `eop_r`, `bit_v_r`, `br_r`
-  cleared every cycle at `ext/usb_uart.sv:233`–`ext/usb_uart.sv:236`, set in
-  their events' branches). Downstream logic never needs to do edge detection.
-- **Mid-bit sampling** means `bit_valid`/`bit_o` pulse on the *third* cycle
-  of a nominal 4-cycle bit time, and SOP is detected from synchronized pads,
-  so it is *2 synchronizer cycles late* relative to the pad — but since every
-  downstream consumer works in the same `clk` domain and only counts strobes,
-  the absolute delay is irrelevant; only *strobe ordering* matters, and the
-  PHY guarantees SOP is pulsed before the packet's first `bit_valid`.
-- **`eop` co-inside with dropping `act`** (`ext/usb_uart.sv:267`–`ext/usb_uart.sv:269`):
-  `active` goes low in the same cycle the `eop` pulse fires, so a consumer
-  watching `active` alone would see the packet end one cycle "for free".
-- **`se0_cnt == 7`** means the EOP pulse fires exactly on the *8th*
-  consecutive SE0 clk — i.e. exactly 2 bit times of SE0, the minimum legal
-  EOP width, with no margin for error. In this single-clock FPGA design with
-  short pad routes this is acceptable; a discrete-transceiver design would
-  typically add margin.
+- **All outputs are registered strobes** (`sop_r`, `eop_r`, `bit_v_r`,
+  `br_r` default low, set in their events' branches; `bit_r` holds the last
+  decoded value). Downstream logic never needs to do edge detection.
+- **Phase-1 capture** means `bit_valid`/`bit_o` pulse 2–3 clks after the
+  bit's transition reaches the synchronized pads, and SOP is detected from
+  synchronized pads, so it is *2 synchronizer cycles late* relative to the
+  pad — but since every downstream consumer works in the same `clk` domain
+  and only counts strobes, the absolute delay is irrelevant; only *strobe
+  ordering* matters, and the PHY guarantees SOP is pulsed before the
+  packet's first `bit_valid`.
+- **`eop` co-insides with dropping `act`**: `eop_now` both sets `eop_r` and
+  clears `act`, so `active` goes low in the same cycle the `eop` pulse
+  fires — a consumer watching `active` alone would see the packet end one
+  cycle "for free".
+- **`se0_cnt == 7`** means the EOP pulse fires after ~1.75 bit times of SE0
+  (the strobe appears on the 8th consecutive SE0 clk) — right around the
+  minimum legal EOP width, with little margin. In this single-clock FPGA
+  design with short pad routes this is acceptable; a discrete-transceiver
+  design would typically add margin.
+- **`bit_r` is captured at every sample, including the dropped stuff bit** —
+  the stuffing-violation check reads that same value at the drop sample, so
+  `bit_o` is meaningful even in the cycle `bit_valid` is suppressed.
 
 ## What the next layer sees
 
-Per packet, the consumer ([`usb_rx_packet`](usb-rx-packet.md), and through
-it the [usb_uart](usb-uart.md) router) sees:
+Per packet, the consumer ([`usb::RxPacket`](usb-rx-packet.md), and through
+it the [usb_uart](usb-uart.md) core top) sees:
 
 - a `sop` pulse;
 - a sequence of `bit_valid`/`bit_o` strobes, one per *decoded* bit (stuffed
@@ -274,21 +265,24 @@ it the [usb_uart](usb-uart.md) router) sees:
 
 ## Key takeaways
 
-- `usb_rx_phy` = synchronizers + 4× oversampling clock recovery + NRZI
+- `usb::RxPhy` = synchronizers + 4× oversampling clock recovery + NRZI
   decode + bit unstuff + SOP/EOP/reset detection, all in one 48 MHz clock
   domain (`4 clk = 1 USB bit`).
 - Clock recovery is a 2-bit phase counter re-aligned to 0 on *any* `dp/dn`
-  transition, sampled at `ph == 2` — mid-bit (`ext/usb_uart.sv:273`–`ext/usb_uart.sv:277`).
-- SOP is simply a J→K level seen while idle (`ext/usb_uart.sv:250`); the
-  rest of the sync byte is skipped by bit counting downstream.
+  transition (and at SOP); the phase-1 capture (`sample = jk && ph == 1`)
+  lands inside the bit's visibility window for every achievable quantized
+  window width, so exactly one sample lands per bit.
+- SOP is simply a K level seen while idle (`sop_edge = !act && k`); the rest
+  of the sync byte is skipped by bit counting downstream.
 - NRZI decode is "same level as previous bit ⇒ `1`"
-  (`ext/usb_uart.sv:212`); unstuffing drops the bit after six decoded `1`s
-  and flags a violation if it decodes to `1` (`ext/usb_uart.sv:282`–`ext/usb_uart.sv:287`).
-- EOP = SE0 ≥ 8 clks (`se0_cnt == 7`); bus reset = SE0 ≥ 120 clks
-  (`se0_cnt == 119`), same 7-bit counter, two thresholds
-  (`ext/usb_uart.sv:238`–`ext/usb_uart.sv:244`, `ext/usb_uart.sv:263`–`ext/usb_uart.sv:270`).
+  (`bit_val = (sdp == lev_d) && (sdn == lev_n)`); unstuffing drops the bit
+  after six decoded `1`s and flags a violation if it decodes to `1`.
+- EOP = SE0 counted for 7 clks (`se0_cnt == 7`); bus reset = SE0 counted for
+  120 clks (`se0_cnt == 119`, re-pulsing every 128 clks on sustained SE0) —
+  same 7-bit counter, two thresholds.
 - All outputs are 1-clk registered strobes; `pkt_err` is sticky within a
-  packet and clears at SOP; `active` spans exactly SOP→EOP.
+  packet (SE1 or stuff violation) and clears at SOP; `active` spans exactly
+  SOP→EOP.
 
 Related pages: [usb-primer.md](usb-primer.md) · [system-overview.md](system-overview.md) ·
 [usb-rx-packet.md](usb-rx-packet.md) · [usb-tx-phy.md](usb-tx-phy.md) ·

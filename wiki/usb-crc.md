@@ -1,12 +1,13 @@
-# USB CRCs: `usb_crc5` and `usb_crc16`
+# USB CRCs: `usb::Crc5` and `usb::Crc16`
 
 Every USB packet ends with a CRC (Cyclic Redundancy Check) computed over its
 contents, and every receiver re-computes it to decide whether the packet is
-intact. This page covers the two tiny hardware modules that do that math in
-the fomu-usb core — [`usb_crc5`](#usb_crc5-line-by-line) at `ext/usb_uart.sv:38`
-and [`usb_crc16`](#usb_crc16-line-by-line) at `ext/usb_uart.sv:64` — plus the
-subtle TX and RX wiring around them. If you have never met a CRC or an LFSR
-before, the first three sections are for you.
+intact. This page covers the two tiny Virdant mods that do that math in the
+fomu-usb core — [`usb::Crc5`](#usbcrc5-line-by-line) and
+[`usb::Crc16`](#usbcrc16-line-by-line), both in `src/usb.vir` — plus the
+subtle TX and RX wiring around them (`usb::TxPhy` and `usb::RxPacket`, also
+in `src/usb.vir`). If you have never met a CRC or an LFSR before, the first
+three sections are for you.
 
 - What a CRC is and [why USB needs one](#why-usb-needs-a-crc)
 - The [LFSR](#what-is-an-lfsr) trick that makes it nearly free in hardware
@@ -16,7 +17,7 @@ before, the first three sections are for you.
 
 Related pages: [USB primer](usb-primer.md), [system overview](system-overview.md),
 [rx PHY](usb-rx-phy.md), [rx packet](usb-rx-packet.md), [tx PHY](usb-tx-phy.md),
-[usb_uart top](usb-uart.md), [testbenches](testbenches.md).
+[UsbUart top](usb-uart.md), [testbenches](testbenches.md).
 
 ---
 
@@ -111,18 +112,27 @@ r[0] <= inv                             // the x^0 term
 - **Each non-leading term of the polynomial becomes one XOR tap.** The leading
   term `x^W` is implicit in the shift itself.
 
-You can see the tap mapping directly in our modules:
+In the Virdant source each LFSR is a single `reg` whose next state is written
+as one concatenated word XOR-ed with a tap word — the taps are the 1-bits in
+the second `word(...)`:
 
-| Polynomial term | Code (CRC5, `ext/usb_uart.sv:51`–`55`) | Code (CRC16, `ext/usb_uart.sv:77`–`81`) |
-|-----------------|----------------------------------------|------------------------------------------|
-| x^5 / x^16 (leading) | implicit (the shift) | implicit (the shift) |
-| x^0 | `r[0] <= inv` | `r[0] <= inv` |
-| x^2 | `r[2] <= r[1] ^ inv` | `r[2] <= r[1] ^ inv` |
-| x^15 | — | `r[15] <= r[14] ^ inv` |
-| everything else | plain shift | plain shift |
+```
+// Crc5 (W = 5): {r[3:0], inv} with the x^2 tap XORed into bit 2
+word(it[4..0], inv) ^ word(0w2, inv, 0w2)
+
+// Crc16 (W = 16): {r[14:0], inv} with the x^15 tap XORed into bit 15
+// and the x^2 tap into bit 2
+word(it[15..0], inv) ^ word(inv, 0w12, inv, 0w2)
+```
+
+- `word(a, b, …)` concatenates MSB-first, so `word(it[4..0], inv)` is the
+  plain shift with `inv` entering at bit 0 (`r[0] <= inv`).
+- The tap word has a single possible-1 bit per polynomial term: bit 2 for
+  x^2 in both CRCs, bit 15 for x^15 in CRC16. Everything else is the plain
+  shift.
 
 So "CRC with polynomial x^5+x^2+1" literally compiles to: 5 flops, 2 XOR taps,
-1 shift. That is the whole module.
+1 shift. That is the whole mod.
 
 > Why does the tap look "mirrored" relative to the polynomial (bit k ↔ term
 > x^k, but the stream is LSB-first)? Because this LFSR form implements the
@@ -131,55 +141,63 @@ So "CRC with polynomial x^5+x^2+1" literally compiles to: 5 flops, 2 XOR taps,
 > beyond this page; verify behavior empirically in the
 > [testbenches](testbenches.md) instead.
 
-## `usb_crc5` line by line
+## `usb::Crc5` line by line
 
-Token CRC, USB 2.0 §8.3.5, polynomial x^5+x^2+1, seed `5'h1F`. Module at
-`ext/usb_uart.sv:38`.
+Token CRC, USB 2.0 §8.3.5, polynomial x^5+x^2+1, seed `5'h1F`. Mod `Crc5` in
+`src/usb.vir`; receive-side only — the device never transmits tokens, so
+`usb::RxPacket` is its only user.
 
-```systemverilog
-module usb_crc5(
-    input  wire       clk,     // 48 MHz core clock
-    input  wire       rst,     // sync reset (active high): seed 5'h1F
-    input  wire       adv,     // advance one serial bit
-    input  wire       din,     // serial bit, wire order (LSB first)
-    output wire [4:0] crc
-);
-    reg [4:0] r;
-    wire inv = din ^ r[4];
-    always @(posedge clk) begin
-        if (rst)
-            r <= 5'h1F;
-        else if (adv) begin
-            r[0] <= inv;
-            r[1] <= r[0];
-            r[2] <= r[1] ^ inv;
-            r[3] <= r[2];
-            r[4] <= r[3];
-        end
-    end
-    assign crc = r;
-endmodule
+```virdant
+mod Crc5 {
+    incoming clk : Clock
+    incoming rst : Bit
+    incoming adv : Bit
+    incoming din : Bit
+    outgoing crc : Word[5] {
+        it := r
+    }
+
+    // Feedback bit: din XOR the x^5 tap (r[4]).
+    wire inv : Bit {
+        it := din ^ r[4]
+    }
+
+    // The 5-bit shift register. Next state = {r[3:0], inv} with the
+    // x^2 tap XORed into bit 2; seeds to 0x1F.
+    reg r : Word[5] on clk {
+        initial it <= 31w5
+        it <= when {
+            case rst => 31w5
+            case adv => word(it[4..0], inv) ^ word(0w2, inv, 0w2)
+            else     => it
+        }
+    }
+}
 ```
 
-Walking through it (`ext/usb_uart.sv:38`–`59`):
+Walking through it:
 
 - **`adv`** — the LFSR is *idle unless strobed*. The core clock is 48 MHz and
   a USB-FS bit lasts 4 clocks, so the receiver produces a one-clock `bit_valid`
   strobe per decoded bit (see [rx PHY](usb-rx-phy.md)) and gates `adv` with
   it. Between strobes, `r` just holds.
-- **`rst` seeds `5'h1F`** (line 49) — the all-ones initial remainder. On RX
-  the reset is actually `sop | rst | bus_reset` (`ext/usb_uart.sv:411`), i.e.
+- **`rst` seeds `5'h1F`** (`31w5` — the all-ones initial remainder). On RX the
+  reset is actually `sop || rst || bus_reset` (wired in `usb::RxPacket`), i.e.
   re-seeded at every start of packet.
-- **`inv = din ^ r[4]`** (line 46) — incoming bit folded against the top of
-  the partial remainder.
-- **Lines 51–55** — the shift plus the two polynomial taps (x^0, x^2).
+- **`inv = din ^ r[4]`** — incoming bit folded against the top of the partial
+  remainder (the x^5 tap).
+- **The `adv` line** — the shift plus the two polynomial taps (x^0 via `inv`
+  at bit 0, x^2 via the tap word).
 
-That is the entire token-CRC engine: 5 flip-flops, 2 XORs.
+That is the entire token-CRC engine: 5 flip-flops, 2 XORs. The `crc` output is
+the raw LFSR state; in this checker-only role the caller compares it against
+the residual `5'h0C` (see [RX side](#rx-side-checking-by-residual)).
 
-## `usb_crc16` line by line
+## `usb::Crc16` line by line
 
-Data-payload CRC, polynomial x^16+x^15+x^2+1, seed `16'hFFFF`. Module at
-`ext/usb_uart.sv:64`. Structurally identical, with one Verilog nicety.
+Data-payload CRC, polynomial x^16+x^15+x^2+1, seed `16'hFFFF`. Mod `Crc16` in
+`src/usb.vir`; dual-role: checker in `usb::RxPacket`, generator for TX data
+packets in `usb::TxPhy`. Structurally identical to `Crc5`, one width up.
 
 | Port | Dir | Width | Meaning |
 |------|-----|-------|---------|
@@ -189,78 +207,90 @@ Data-payload CRC, polynomial x^16+x^15+x^2+1, seed `16'hFFFF`. Module at
 | `din` | in | 1 | serial bit, wire order (LSB first) |
 | `crc` | out | 16 | current LFSR state |
 
-The interesting lines (`ext/usb_uart.sv:71`–`83`):
+The interesting lines:
 
-```systemverilog
-reg [15:0] r;
-wire inv = din ^ r[15];
-always @(posedge clk) begin
-    if (rst)
-        r <= 16'hFFFF;
-    else if (adv) begin
-        r[0]   <= inv;
-        r[1]   <= r[0];
-        r[2]   <= r[1] ^ inv;
-        r[14:3] <= r[13:2];      // 12 plain shifts in one assignment
-        r[15]  <= r[14] ^ inv;
-    end
-end
-assign crc = r;
+```virdant
+// Feedback bit: din XOR the x^16 tap (r[15]).
+wire inv : Bit {
+    it := din ^ r[15]
+}
+
+// The 16-bit shift register. Next state = {r[14:0], inv} with
+// the x^15 tap XORed into bit 15 and the x^2 tap into bit 2;
+// seeds to 0xFFFF.
+reg r : Word[16] on clk {
+    initial it <= 65535w16
+    it <= when {
+        case rst => 65535w16
+        case adv => word(it[15..0], inv) ^ word(inv, 0w12, inv, 0w2)
+        else     => it
+    }
+}
 ```
 
-- `r[14:3] <= r[13:2]` (line 80) is just 12 boring middle taps collapsed into
-  one part-select assignment — the polynomial has no terms between x^2 and
-  x^15.
-- The three taps are exactly the non-leading terms: x^0 (`r[0]`), x^2
-  (`r[2]`), x^15 (`r[15]`).
-- Total cost: 16 flops, 3 XORs, plus small muxing for reset/hold. Two of
-  these (one in `usb_rx_packet`, one in `usb_tx_phy`) plus one `usb_crc5` is
-  the whole CRC budget of the device.
+- The tap word `word(inv, 0w12, inv, 0w2)` puts `inv` at bit 15 (x^15) and
+  bit 2 (x^2), zeros elsewhere — the polynomial has no terms between x^2 and
+  x^15, so the middle 12 bits are a plain shift.
+- The three taps are exactly the non-leading terms: x^0 (`inv` into bit 0),
+  x^2, x^15.
+- Total cost: 16 flops, 3 XORs, plus small muxing for reset/hold. Two
+  `Crc16` instances (one in `usb::RxPacket`, one in `usb::TxPhy`) plus one
+  `Crc5` in `usb::RxPacket` is the whole CRC budget of the device.
 
 ## TX side: complement + bit-reverse
 
 The device never transmits tokens (only the host does), so the TX path needs
-only CRC16 — instantiated inside `usb_tx_phy` at `ext/usb_uart.sv:822`:
+only CRC16 — instantiated in `usb::TxPhy` as `mod crc16 of Crc16`:
 
-```systemverilog
-usb_crc16 u_crc16(
-    .clk(clk),
-    .rst(tx_start),                          // re-seed at every packet
-    .adv(state == S_DATA && (btc == 2'd2) && !cur_stuff
-         && is_data && (s >= 10'd16) && (s < payload_end_r)),
-    .din(raw_bit_r),
-    .crc(u_crc16_crc));
+```virdant
+mod crc16 of Crc16 {
+    it.clk := clk
+    it.rst := tx_start
+    it.adv := (state == #Data) && (btc == 2w2) && !cur_stuff
+        && is_data && (s >= 16w10) && (s < payload_end_r)
+    it.din := raw_bit_r
+}
 ```
 
 - `rst = tx_start` re-seeds per packet.
-- `adv` runs **only over payload bits** (`16 <= s < payload_end`, line 826).
-  The TX knows its own payload length, so it knows exactly when to stop
-  advancing — the LFSR then *holds* the remainder while the engine starts
-  transmitting it.
+- `adv` runs **only over payload bits** (`16 <= s < payload_end_r`, one
+  advance at `btc == 2` of each non-stuffed bit time). The TX knows its own
+  payload length, so it knows exactly when to stop advancing — the LFSR then
+  *holds* the remainder while the engine starts transmitting it.
 
-The transmitted bits come from one dense line, `ext/usb_uart.sv:813`–`814`:
+The transmitted bits do not come from a live mux over the LFSR: `usb::TxPhy`
+computes the complemented CRC as a word and loads it into a dedicated shift
+register, `crc_shift`, at the edge that consumes the last payload raw bit:
 
-```systemverilog
-// CRC16 wire bits: crc_wire[i] = ~crc[15-i]
-raw_bit = ~u_crc16_crc[15 - (s - payload_end_r)];
+```virdant
+// The CRC16 wire bits, complemented (crc_wire[i] = ~crc[i]; the
+// MSB-first wire order comes from shifting crc_shift right, bit
+// 15 first).
+wire crc_wire : Word[16] {
+    it := crc16.crc ^ 65535w16
+}
 ```
 
-Decoded: the first wire bit (index 0) is `~crc[15]`, the next is `~crc[14]`,
-…, the last is `~crc[0]`. That is the **complement + bit-reverse** the file
-header documents (`ext/usb_uart.sv:29`):
+`crc_shift` then shifts one bit per consumed raw bit (stuffed bit times do
+not shift), and `raw_bit`'s CRC branch is a single register read,
+`crc_shift[15]` — the output tap. Since the shift walks the word from bit 15
+down, the *stream* order is `crc_wire[i] = ~crc[15-i]` with `i = 0` the first
+bit on the wire: the **complement + bit-reverse** convention documented in
+the `ext/usb_uart.sv` header and in the `Crc16` doc comment in `src/usb.vir`.
 
-- **Complement (`~`)** — USB mandates the transmitted CRC be the inverted
-  remainder.
+- **Complement (`^ 65535w16`)** — USB mandates the transmitted CRC be the
+  inverted remainder.
 - **Bit-reverse (`15 - i`)** — the LFSR above is a LSB-first serial machine,
   so its internal bit order is mirrored relative to the bit order USB
-  specifies for the CRC on the wire; indexing with `15 - i` un-mirrors it.
+  specifies for the CRC on the wire; shifting the complemented word out
+  MSB-first un-mirrors it.
 
 **Worked example** (verified in simulation, see [testbenches](testbenches.md)).
 A CDC `SET_LINE_CODING` request carries a 7-byte data payload —
 `00 C2 01 00 00 00 08` (115200 baud, 8 data bits, 1 stop, no parity; see
 [usb-serial.md](usb-serial.md)):
 
-1. Feed the 56 payload bits (each byte LSB first) through `usb_crc16` with
+1. Feed the 56 payload bits (each byte LSB first) through `usb::Crc16` with
    seed `16'hFFFF` → register ends at `0xEC27`.
 2. Wire bits are `~crc[15], ~crc[14], …, ~crc[0]` → the byte sent first
    (the "low" CRC byte) is `0xC8`, followed by `0x1B`.
@@ -269,31 +299,38 @@ A CDC `SET_LINE_CODING` request carries a 7-byte data payload —
 ## RX side: checking by residual
 
 Here is the interesting design problem. The receiver instantiates both CRCs
-inside `usb_rx_packet` (`ext/usb_uart.sv:409`–`421`):
+inside `usb::RxPacket`:
 
-```systemverilog
-usb_crc5 u_crc5(
-    .clk(clk),
-    .rst(sop | rst | bus_reset),
-    .adv(bit_valid && (st == ST_BODY) && !sec
-         && (nb >= 5'd8) && (nb <= 5'd23)),   // token data + received CRC bits
-    .din(bit_i),
-    .crc(c5));
-usb_crc16 u_crc16(
-    .clk(clk),
-    .rst(sop | rst | bus_reset),
-    .adv(bit_valid && (st == ST_BODY) && sec), // every data-section bit
-    .din(bit_i),
-    .crc(c16));
+```virdant
+// CRC5 advances on token bits nb = 8..23 (data + received crc5
+// wire bits; residual 5'h0C).  NOT gated by pkt_err: a bad
+// packet's residual is never sampled.
+mod crc5 of Crc5 {
+    it.clk := clk
+    it.rst := sop || rst || bus_reset
+    it.adv := bit_valid && (st == #Body) && !sec
+        && (nb >= 8w5) && (nb < 24w5)
+    it.din := bit_i
+}
+// CRC16 advances on every data-section bit (payload + received
+// crc16 wire bits; residual 16'h800D).
+mod crc16 of Crc16 {
+    it.clk := clk
+    it.rst := sop || rst || bus_reset
+    it.adv := bit_valid && (st == #Body) && sec
+    it.din := bit_i
+}
 ```
 
-- `rst = sop | rst | bus_reset` — re-seed at every start of packet.
-- `sec` means "second section" (the variable-length part after the PID).
-- CRC5 advances on bit numbers 8…23 (`ext/usb_uart.sv:412`–`413`): the 11
-  token bits **plus the 5 received CRC wire bits** — notice it does *not*
-  stop at the token/CRC boundary.
-- CRC16 advances on **every** data-section bit (`ext/usb_uart.sv:419`):
-  payload bits *and* the 16 received CRC wire bits, with no boundary at all.
+- `rst = sop || rst || bus_reset` — re-seed at every start of packet.
+- `sec` is the section flag inside the `#Body` state: 0 = PID section,
+  1 = token/data section.
+- `nb` counts post-sync packet bits: PID byte 0..7, token data 8..18, CRC5
+  wire bits 19..23 (parked at 24 in the data section). So CRC5 advances on
+  bits 8…23: the 11 token bits **plus the 5 received CRC wire bits** —
+  notice it does *not* stop at the token/CRC boundary.
+- CRC16 advances on **every** data-section bit: payload bits *and* the 16
+  received CRC wire bits, with no boundary at all.
 
 ### Why not compute one CRC and compare with the other?
 
@@ -320,12 +357,21 @@ known-good token vectors (see
 [testbenches](testbenches.md)), and for CRC16 payloads from empty to the
 64-byte bulk maximum.
 
-So the check is just an equality against a constant, sampled at EOP:
+So the check is just an equality against a constant, sampled at EOP. The
+equalities live in their own registered flags in `usb::RxPacket`:
 
-```systemverilog
-crc5_res_r  <= (c5 == 5'h0C);      // ext/usb_uart.sv:443
-crc16_res_r <= (c16 == 16'h800D);  // ext/usb_uart.sv:444
+```virdant
+// CRC5 residual compare (5'h0C), registered: the 5-bit equality
+// tree ends at its own flop instead of riding tk_crc_ok's cone.
+reg crc5_res_r : Bit on clk { ... else => c5 == 12w5 }
+
+// CRC16 residual compare (16'h800D), registered likewise.
+reg crc16_res_r : Bit on clk { ... else => c16 == 0x800dw16 }
 ```
+
+and are sampled at EOP into the per-packet verdicts: `tk_crc_ok_r` captures
+`crc5_res_r` on `eop && tok_cap` (token packets), `dt_crc_ok_r` captures
+`crc16_res_r` on `eop && dat_cap` (data packets).
 
 (Tokens have fixed length, so computed-vs-received *would* be possible for
 CRC5; the design still uses the residual mechanism there for uniformity —
@@ -333,11 +379,11 @@ same hardware shape, same check, one less special case.)
 
 Two implementation details worth stealing for your own designs:
 
-- The equalities are **registered** (`ext/usb_uart.sv:395`–`396` and
-  `423`–`428`): a 16-bit compare is a long XOR tree, and ending it at its own
-  flip-flop keeps that tree out of the downstream timing path. The residual
-  is only *sampled* at EOP, when the LFSR has consumed the whole packet, so
-  mid-packet values are harmless.
+- The equalities are **registered** (`crc5_res_r` / `crc16_res_r`): a 16-bit
+  compare is a long XOR tree, and ending it at its own flip-flop keeps that
+  tree out of the downstream timing path. The residual is only *sampled* at
+  EOP, when the LFSR has consumed the whole packet, so mid-packet values are
+  harmless.
 - The `rst` term includes `bus_reset` so a bus reset re-seeds both LFSRs
   even mid-packet.
 
@@ -347,11 +393,11 @@ Host sends `IN` to device address 5, endpoint 1. Post-PID bits on the wire
 (LSB first): `1,0,1,0,0,0,0` (addr 5) then `1,0,0,0` (endp 1), then the
 received CRC5 wire bits `0,0,1,1,0`:
 
-1. Feed the first 11 bits through `usb_crc5` (seed `5'h1F`) → register
+1. Feed the first 11 bits through `usb::Crc5` (seed `5'h1F`) → register
    `5'b11001` (`0x19`). (The host computed the same value and transmitted its
    complement, reversed: `~crc[4..0] = 0,0,1,1,0`.)
 2. Keep feeding the 5 received wire bits → 16 bits total, matching the
-   `nb <= 23` window.
+   `nb < 24` window.
 3. Final register: `5'h0C`. Residual check passes, token is accepted.
 
 Corrupt **one** payload bit anywhere and the final value lands elsewhere —
@@ -366,16 +412,17 @@ host retry. That is the whole error-control story of USB in one register.
 - A CRC is polynomial long division in mod-2 (XOR) arithmetic; an **LFSR**
   performs it serially — one input bit per `adv` strobe — costing only W
   flops plus one XOR tap per non-leading polynomial term.
-- Each polynomial term x^k maps to a literal code line `r[k] <= r[k-1] ^ inv`;
-  everything else is a plain shift (`ext/usb_uart.sv:51`–`55`, `77`–`81`).
-- **TX** advances the LFSR over payload bits only and sends
-  `crc_wire[i] = ~crc[W-1-i]` — complement because the spec says so,
-  bit-reverse because the serial LFSR's bit order is mirrored
-  (`ext/usb_uart.sv:813`).
+- Each polynomial term x^k maps to a literal XOR tap into bit k of the shift
+  register: x^0 and x^2 in `Crc5`, x^0/x^2/x^15 in `Crc16` (the tap words in
+  the `adv` next-state lines of `src/usb.vir`).
+- **TX** advances the LFSR over payload bits only and sends the complemented
+  CRC MSB-first out of `crc_shift`, i.e. `crc_wire[i] = ~crc[15-i]` as a
+  stream — complement because the spec says so, bit-reverse because the
+  serial LFSR's bit order is mirrored.
 - **RX** cannot know the payload/CRC boundary before EOP, so it feeds *all*
   post-PID bits through the LFSR and compares the final state (the residual)
-  against the fixed constants `5'h0C` / `16'h800D`
-  (`ext/usb_uart.sv:412`–`419`, `443`–`444`).
+  against the fixed constants `5'h0C` / `16'h800D` (the `crc5` / `crc16`
+  instances and `crc5_res_r` / `crc16_res_r` in `usb::RxPacket`).
 - The residual is constant for every uncorrupted payload — verified by
   simulation in the [testbenches](testbenches.md) — and any single-bit error
   breaks it, which is what makes host retries safe.

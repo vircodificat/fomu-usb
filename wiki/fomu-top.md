@@ -1,68 +1,81 @@
-# `\top::FomuTop` — pad glue, power-on reset, and the LED heartbeat
+# Fomu board glue — pads, power-on reset, attach, and the LEDs
 
-**Source:** `ext/fomu_top.sv:23` · **Back:** [Home.md](Home.md) · **Next:** [echo-fifo.md](echo-fifo.md)
+**Source:** `ext/usb_pads.sv` + `usb::UsbPor` in `src/usb.vir` + pin map in `fomu.pcf` · **Back:** [Home.md](Home.md) · **Next:** [echo-fifo.md](echo-fifo.md)
 
-`\top::FomuTop` is the hand-written Verilog half of the Fomu top level: everything Virdant cannot express lives here — the tristate USB pads, the power-on reset, and the pin drivers. The Virdant half ([top-vir.md](top-vir.md)) instantiates this module and hangs the [echo server](echo-server.md) off its byte-stream ports. See [system-overview.md](system-overview.md) for the big picture.
+This page is the board-level half of the top level: the tristate USB pads, the power-on reset / attach delay, and the LEDs. Everything here exists because the FPGA fabric or the platform cannot do it in plain Virdant — and it is all wired together by the platform export ([top-vir.md](top-vir.md)). See [system-overview.md](system-overview.md) for the big picture.
 
-## Why this module is ext Verilog
+## The pin map (`fomu.pcf`)
 
-Plain Verilog-2005 was chosen because nothing Virdant-emitted instantiates it and because it needs iCE40 primitives (`SB_IO`) that Virdant has no syntax for. See [build-flow.md](build-flow.md) for how ext modules get vendored into the build.
+| Pin | Signal | Role |
+|---|---|---|
+| `F4` | `clock` | 48 MHz board clock (`set_frequency clock 48.0`) |
+| `A1` | `usb_dp` | USB D+ (inout, via `SB_IO` cells) |
+| `A2` | `usb_dn` | USB D− (inout, via `SB_IO` cells) |
+| `A4` | `usb_dp_pu` | D+ 1.5 kΩ pull-up enable — **this is how the device "attaches"** |
+| `B5` / `A5` / `C5` | `led_red/green/blue` | LEDs, active low; red = receiving, green = sending |
 
-## Power-on reset (~175 ms)
+(The `touch*`/`flash*` pins in the pcf are the platform's standard set; they must be constrained or nextpnr errors out, but the design leaves them dangling.)
 
-```verilog
-parameter [23:0] POR_CYCLES = 24'd8_400_000   // ~175 ms @ 48 MHz
-```
-
-A 24-bit counter counts up to `POR_CYCLES` and then sticks at done:
-
-- `por_cnt` / `por_done` (`ext/fomu_top.sv:46-55`)
-- `core_rst = ~por_done` — the USB core is held in reset the whole time
-- `usb_dp_pu = por_done` — **the D+ 1.5 kΩ pull-up is released only after POR**
-
-The pull-up timing is not cosmetic — it is **attach signalling**. USB is a wired-OR bus: the host sees a device on a Full-Speed port only when D+ is pulled up. If the device asserted the pull-up before its core came out of reset, the host would start enumerating a device that cannot answer. Holding `usb_dp_pu` low through POR guarantees the host's attach detection happens only once the core is alive. `POR_CYCLES` is a parameter so a testbench can shorten power-on; the host sees ~175 ms of "cable unplugged" first. (Full-Speed vs Low-Speed attach is D+ vs D− — see [usb-primer.md](usb-primer.md).)
-
-## SB_IO tristate pads
+## SB_IO tristate pads (`ext/usb_pads.sv`)
 
 USB needs a **bidirectional** pad: the device drives D± during packet transmission and releases the pair to receive. On iCE40 that is a `SB_IO` cell with PIN_TYPE `6'b101001` (tristate output + input on D_IN_0):
 
 ```verilog
 SB_IO #(.PIN_TYPE(6'b101001)) sb_io_dp (
-    .PACKAGE_PIN(usb_dp), .OUTPUT_ENABLE(oe),
+    .PACKAGE_PIN(usb_dp), .OUTPUT_ENABLE(output_enable),
     .D_OUT_0(dp_tx), .D_IN_0(dp_rx));
 ```
 
-- `PACKAGE_PIN` is `inout` on the module — the pin itself.
-- `OUTPUT_ENABLE` (`oe` from the core) selects drive vs release; **one `oe` is shared for the D+/D− pair**, since USB always drives or releases both lines together.
-- This is exactly the lowering migen performs for a 1-bit `Tristate` on iCE40, and what valentyusb rides on real Fomu hardware.
+`ext/usb_pads.sv` is the body of the `usb::UsbPads` ext mod (declared in `src/usb.vir`) and contains exactly two such cells (one per line) — no clock, no reset, no state. This is exactly the lowering migen performs for a 1-bit `Tristate` on iCE40.
 
-## Byte-stream pass-through ports
+- `PACKAGE_PIN` is `inout` in Verilog — the pin itself.
+- `OUTPUT_ENABLE` (the core's `output_enable`) selects drive vs release; **one `oe` is shared for the D+/D− pair**, since USB always drives or releases both lines together (while low, the pads float to the idle J state held by the host and the D+ pull-up).
+- The design's **only bidirectional nets** live inside this module. From Virdant's view every wire is unidirectional: the core drives via `dp_tx`/`dn_tx` gated by `output_enable`, samples via `dp_rx`/`dn_rx`, and the ext mod declaration types the pad side `outgoing Bit` — the `inout` is the Verilog-side plumbing that gets the `SB_IO` `PACKAGE_PIN` nets out to the `Top` ports and the PCF pins. Virdant cannot express a bidirectional pad yet, so the bidirectionality never crosses the Virdant boundary.
 
-The module itself contains **no byte-level logic**. It exposes the USB core's stream directly:
+## Power-on reset / attach delay (`usb::UsbPor` in `src/usb.vir`)
 
-| Port | Dir | Meaning |
-|---|---|---|
-| `rx_data` | out | byte from the host |
-| `rx_valid` | out | 1-clk strobe per byte |
-| `tx_ready` | out | tx FIFO has room |
-| `tx_data` | in | byte toward the host |
-| `tx_strobe` | in | 1-clk push strobe |
-| `rx_ready` | in | low = consumer full: stop popping |
+A 24-bit counter counts up to **8_400_000 cycles (~175 ms @ 48 MHz)** and then raises `por_done`, sticky:
 
-The consumer of this stream is the [echo server](echo-server.md), wired in [top-vir.md](top-vir.md). The CDC-ACM layer that makes it a serial port is the core's business — see [usb-serial.md](usb-serial.md).
+```text
+mod UsbPor {
+    incoming clock  : Clock
+    outgoing por_done : Bit
+    // por_cnt: counts while !por_done_r, holds at 8_400_000
+    // por_done_r: set when por_cnt >= 8_400_000, never cleared
+}
+```
 
-## LED heartbeat
+The count **is the USB attach delay**: how long the device waits before releasing the D+ pull-up and attaching to the host. It is inlined — there is no parameter — so the sim testbench eats the full ~175 ms attach delay too (see [testbenches.md](testbenches.md)).
 
-`hb_cnt` free-runs; `led_red = por_done ? hb_cnt[22] : 1` blinks at ~5.7 Hz once POR finishes and is **off** during POR (active-low on the PVT board). The LED is your one-bit diagnostic: no blink → no 48 MHz clock or stuck in POR. Green/blue are tied off.
+`por_done` fans out two ways in `src/top.vir`:
 
-## The `inout` vs `outgoing Bit` port contract
+- `usb_dp_pu := por_done` — **the D+ 1.5 kΩ pull-up is released only after POR**.
+- into `usb::UsbController`, where it is registered one more clk (`por_rst`) and inverted to form `core_rst` — the USB core is held in reset through the whole count plus one clk.
 
-`src/top.vir:6-7` declares `usb_dp`/`usb_dn` as `outgoing Bit`, but the Verilog module needs them `inout` for the `SB_IO` `PACKAGE_PIN`. That mismatch is deliberate: **Virdant cannot express a bidirectional pad yet**, so the platform export drives the pins one-way and the ext module owns the real tristate. The real `export mod Top for ice40::Fomu` would replace this file and fix the contract.
+### Why the pull-up timing is not cosmetic
+
+The pull-up is **attach signalling**. USB is a wired-OR bus: the host sees a device on a Full-Speed port only when D+ is pulled up (D− would be the low-speed pull-up — see [usb-primer.md](usb-primer.md)). If the device asserted the pull-up before its core came out of reset, the host would start enumerating a device that cannot answer. Holding `usb_dp_pu` low through POR guarantees the host's attach detection happens only once the core is alive — and because the core's reset (`por_rst`) is registered one clk behind `por_done`, the pull-up rises one clk before the core leaves reset; the core still cannot drive the bus until then (`output_enable` is gated by the in-reset core).
+
+The same unwiring trap exists one level up: **unwired platform ports default to low**, and `usb_dp_pu` low = pull-up off = the host never sees the device. `src/top.vir`'s own comment warns that a wrapper leaving it unwired produces an image no host can ever see.
+
+## Activity LEDs (`src/top.vir` + `usb::UsbUart`)
+
+The LEDs are wired at the top level, mapped onto the core's activity signals:
+
+```text
+led_red   := !actual_top.rxing     // active low on the PVT board
+led_green := !actual_top.txing
+led_blue  := true                  // tied off
+```
+
+`rxing`/`txing` come from `usb::UsbUart` inside the core: two free-running 23-bit countdown counters, reloaded to `0x7F_FFFF` (~175 ms) on every `rx_valid`/`tx_strobe` strobe and counting down to rest. The 1-clk strobes are far too fast to see; the stretch makes sustained traffic read as a solid light and a single packet still visible. Deliberately **no reset** on these counters (power-on zero is enough), and EP0 control traffic does not light them — only bulk data pulses `rx_valid`/`tx_strobe`.
+
+Red lights while the USB is **receiving** (host → device), green while **sending** (device → host). The LED is your one-bit diagnostic: no light under traffic → check the clock, POR, and the pull-up wiring first.
 
 ## Key takeaways
 
-- POR (~175 ms) holds the core in reset **and** D+ pull-up low; releasing the pull-up *is* USB attach signalling.
-- D± go through `SB_IO` cells (PIN_TYPE `6'b101001`) with one shared `OUTPUT_ENABLE` for the pair.
-- The module is pure glue: USB core's byte stream straight to ports; the echo server hangs off them in Virdant.
-- `usb_dp`/`usb_dn` are `inout` in Verilog but `outgoing Bit` in Virdant — Virdant has no bidirectional-pad syntax yet.
-- Red LED blinks ~5.7 Hz after POR — your "is it alive" bit.
+- D± go through two `SB_IO` cells (`PIN_TYPE 6'b101001`, one shared `OUTPUT_ENABLE`) in `ext/usb_pads.sv` — the design's only bidirectional nets.
+- The Virdant pad-facing wires are unidirectional (`dp_tx`/`dn_tx`/`output_enable` out, `dp_rx`/`dn_rx` in); the `inout` is Verilog-side plumbing only.
+- `usb::UsbPor` counts 8_400_000 cycles (~175 ms) with no parameter; `por_done` releases the D+ pull-up (attach) and, registered once more, forms the core reset.
+- Attach = releasing the 1.5 kΩ D+ pull-up (pin A4); getting that wiring wrong makes the device invisible.
+- LEDs are active low: red = rxing, green = txing, blue off; the ~175 ms stretch makes activity visible.

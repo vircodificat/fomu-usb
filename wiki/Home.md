@@ -7,10 +7,18 @@ iCE40 UP5K FPGA (5K LUTs, 48 MHz clock) — whose application is a
 onto a raw 115200 8N1 UART line, and bytes read back from that line are
 echoed to the host.
 
-The entire USB device core is **hand-written Verilog-2005**
-(`ext/usb_uart.sv`), small enough to read end-to-end in an afternoon
-(~2300 lines, eight modules), and the application layer is written in
-**Virdant HDL** (`src/echo.vir`, `src/uart.vir`). Nothing is hidden
+The USB device core and the application layer are both written in
+**Virdant HDL**: the whole core — the pad interface, the power-on
+reset, the CRC LFSRs, the RX/TX PHYs, the packet decoder, EP0, the EP1
+bulk protocol, the token router, the response arbiter and the
+descriptor paging — lives in `src/usb.vir` (~3450 lines of Virdant
+mods), and the application layer lives in `src/top.vir`, `src/echo.vir`
+and `src/uart.vir`. Only what Virdant cannot express stays as small
+vendored Verilog **ext bodies**: `ext/usb_uart.sv` (~460 lines — the
+generic `usb_fifo16x8` sync FIFO plus the fixed-shape wrappers
+`\usb::TxFifo` / `\usb::RxFifo` / `\usb::DescRom`), `ext/usb_pads.sv`
+(the two `SB_IO` tristate pad cells — the design's only `inout`), and
+`ext/echo_fifo.sv` (the echo queue's 16×8 storage). Nothing is hidden
 behind an IP block or a vendor stack — every wire of the protocol is
 in this repo.
 
@@ -78,20 +86,20 @@ the transmit/application path, and finally the flow:
 
 | Page | Contents |
 |---|---|
-| [usb-crc.md](usb-crc.md) | `usb_crc5` / `usb_crc16` serial LFSR CRCs |
-| [usb-rx-phy.md](usb-rx-phy.md) | `usb_rx_phy` — pads → bit stream (NRZI, bit stuffing, sync/EOP/reset detect) |
-| [usb-rx-packet.md](usb-rx-packet.md) | `usb_rx_packet` — bit stream → packet records |
-| [usb-tx-phy.md](usb-tx-phy.md) | `usb_tx_phy` — packet records → pads |
-| [usb-ep0.md](usb-ep0.md) | `usb_ep0` — control transfers, descriptors, enumeration |
-| [usb-serial.md](usb-serial.md) | `usb_serial` — EP1 bulk protocol, toggles, ACK/NAK |
-| [usb-fifo.md](usb-fifo.md) | `usb_fifo16x8` — the core's 16×8 sync FIFOs |
-| [usb-uart.md](usb-uart.md) | `usb_uart` — core top: router, arbiter, ROM, FIFOs |
+| [usb-crc.md](usb-crc.md) | `usb::Crc5` / `usb::Crc16` serial LFSR CRCs |
+| [usb-rx-phy.md](usb-rx-phy.md) | `usb::RxPhy` — pads → bit stream (NRZI, bit stuffing, sync/EOP/reset detect) |
+| [usb-rx-packet.md](usb-rx-packet.md) | `usb::RxPacket` — bit stream → packet records |
+| [usb-tx-phy.md](usb-tx-phy.md) | `usb::TxPhy` — packet records → pads |
+| [usb-ep0.md](usb-ep0.md) | `usb::Ep0` — control transfers, descriptors, enumeration |
+| [usb-serial.md](usb-serial.md) | `usb::Serial` — EP1 bulk protocol, toggles, ACK/NAK |
+| [usb-fifo.md](usb-fifo.md) | `usb_fifo16x8` — the core's generic sync FIFO (16×8 flops / 64×8 BRAM) |
+| [usb-uart.md](usb-uart.md) | `usb::UsbUart` (`src/usb.vir`) — core top: token router, response arbiter, descriptor paging, FIFOs |
 
 ### Application (the echo server)
 
 | Page | Contents |
 |---|---|
-| [fomu-top.md](fomu-top.md) | `ext/fomu_top.sv` — pad glue, POR, pull-up timing, LED heartbeat |
+| [fomu-top.md](fomu-top.md) | Board glue: the `SB_IO` pad cells, the POR/attach delay, the LED mapping |
 | [top-vir.md](top-vir.md) | `src/top.vir` — platform export, ext mod contract, loopback jumper |
 | [echo-fifo.md](echo-fifo.md) | `EchoFifo` — 16×8 queue between USB core and UART sender |
 | [echo-server.md](echo-server.md) | `EchoServer` — the Virdant echo data path and its flow control |
@@ -109,7 +117,7 @@ Virdant HDL tutorial: `mod`/`ext mod`, `reg ... on clock`, `wire`,
 
 | Page | Contents |
 |---|---|
-| [testbenches.md](testbenches.md) | The iverilog testbenches: `tb_crc`, `tb_usb_phy`, `tb_usb_serial`, and the host BFM |
+| [testbenches.md](testbenches.md) | The iverilog testbenches: `tb_crc`, `tb_usb_phy`, `tb_usb_serial`, the host BFM, and the `SB_IO`/`SB_RAM` cell sim models |
 
 ### Build
 
