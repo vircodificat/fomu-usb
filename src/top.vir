@@ -8,10 +8,10 @@ export mod Top for ice40::Fomu {
     outgoing usb_dn : Bit
     // D+ pull-up enable: MUST be wired through — the platform default is
     // low (= disconnected), so a wrapper that leaves it unwired produces
-    // an image no host can ever see (the P0 found when the first upload
-    // build tied it to 1'b0).  Driven by the POR: attach only after the
-    // ~175 ms power-on count (usb::UsbPor in src/usb.vir; its count is
-    // inlined -- no parameter -- so the sim TB eats the full delay).
+    // an image no host can ever see.  Driven by the POR: attach only
+    // after the ~175 ms power-on count (usb::UsbPor in src/usb.vir; its
+    // count is inlined -- no parameter -- so the sim TB eats the full
+    // delay).
     outgoing usb_dp_pu : Bit
     // heartbeat LEDs (active low on PVT), driven by the core's
     // activity signals
@@ -81,12 +81,12 @@ export mod Top for ice40::Fomu {
     // echo server -- replace it (and bring the wires to real pins) to
     // talk to an external UART instead.
     wire uart_tx_line : Bit { it := echo.txd }
-    // The loopback jumper is REGISTERED: the raw wire made
-    // sender.data_buf -> bit_idx mux -> txd -> rxd -> receiver.state /
-    // baud_counter decode one combinational path, which was the
-    // vir-flow critical path (22.3 ns, 15 ns of it routing).  One clk
-    // of loop latency is 1/417 of a UART bit time -- invisible to the
-    // 8N1 receiver (mid-bit sampling shifts by one cycle of 417).
+    // The loopback jumper is REGISTERED: without the register the raw
+    // wire forms one long combinational path through the UART
+    // (sender.data_buf -> bit_idx mux -> txd -> rxd -> receiver.state /
+    // baud_counter), which dominates the vir-flow critical path.  One
+    // clk of loop latency is 1/417 of a UART bit time -- invisible to
+    // the 8N1 receiver (mid-bit sampling shifts by one cycle of 417).
     reg uart_rx_reg : Bit on clock {
         it <= uart_tx_line
     }

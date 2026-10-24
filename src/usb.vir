@@ -201,10 +201,10 @@ mod Crc16 {
     }
 }
 
-//> usb_rx_phy -- pads to decoded bits (USB 2.0 §7.1.x), migrated out
-//> of ext/usb_uart.sv.  Single 48 MHz domain, 4 clks per FS bit, no
-//> DLL/PLL/CDC.  Turn the raw D+/D- pad samples into an NRZI-decoded,
-//> bit-unstuffed serial bit stream plus the packet-boundary signals
+//> usb_rx_phy -- pads to decoded bits (USB 2.0 §7.1.x).  Single
+//> 48 MHz domain, 4 clks per FS bit, no DLL/PLL/CDC.  Turn the raw
+//> D+/D- pad samples into an NRZI-decoded, bit-unstuffed serial bit
+//> stream plus the packet-boundary signals
 //> the rest of the core consumes (all one-clk strobes):
 //>
 //>   sop   J->K seen from idle (start of packet)
@@ -214,11 +214,10 @@ mod Crc16 {
 //>           cleared at the next sop)
 //>   bus_reset SE0 held >= 2.5 us (120 clks)
 //>
-//> Cycle-exact translation of the original always block: every reg's
-//> next-state below is the same priority chain the Verilog if/else-if
-//> tree encoded.  The bit-sampling details (phase-1 capture, re-align
-//> on every transition, 7-clk EOP arming) are load-bearing -- see the
-//> original comments preserved on each reg and wiki/usb-rx-phy.md.
+//> Every reg's next-state below is a priority chain.  The
+//> bit-sampling details (phase-1 capture, re-align on every
+//> transition, 7-clk EOP arming) are load-bearing -- see the
+//> per-reg comments and wiki/usb-rx-phy.md.
 mod RxPhy {
     //> 48 MHz clock: 4 clk cycles per USB FS bit.
     incoming clk : Clock
@@ -229,7 +228,7 @@ mod RxPhy {
     //> clk -- see the synchronizer note below.
     incoming dp  : Bit
     //> Raw D- pad sample (SB_IO D_IN_0 via UsbPads); asynchronous to
-    //> clk, ditto.
+    //> clk -- see the synchronizer note below.
     incoming dn  : Bit
 
     //> Decoded (NRZI-decoded, bit-unstuffed) data bit.
@@ -253,7 +252,7 @@ mod RxPhy {
         it := act
     }
     //> Sticky per-packet error: SE1 seen, or 6 ones then a 1; cleared
-    //> at the next sop.
+    //> at the next sop (or by rst).
     outgoing pkt_err   : Bit {
         it := perr
     }
@@ -270,12 +269,17 @@ mod RxPhy {
     //> a canonical two-flop synchronizer (builtin::Sync) before
     //> anything looks at them.
     //>
-    //> NB, a deliberate behavior change vs the hand-rolled reset-held
-    //> synchronizers this replaces: Sync has no reset, so the pads are
-    //> tracked from cycle 0.  With no host attached (pull-up off) the
-    //> pads can read SE0-ish, so se0_cnt free-runs during the ~175 ms
-    //> POR and bus_reset may pulse pre-attach -- into a core that is
-    //> still held in core_rst, so it is unobservable downstream.
+    //> NB: builtin::Sync has no reset, so the synchronizers track the
+    //> pads from cycle 0 -- including through the ~175 ms POR.  The
+    //> detector state does not free-run then, though: rst parks every
+    //> reg below (se0_cnt included), so no bus_reset can pulse while
+    //> the core is held in reset.  And by the time rst drops, the D+
+    //> pull-up has been on for a clk (usb_dp_pu := por_done directly
+    //> in src/top.vir; the core reset por_rst is that same por_done
+    //> registered one clk later in UsbController), so an unattached
+    //> bus reads D+ high -- J or SE1, never SE0 -- and se0_cnt stays
+    //> at 0.  bus_reset therefore fires only for a real host-issued
+    //> reset.
     mod sync_dp of Sync {
         it.inp   := dp
         it.clock := clk
@@ -290,8 +294,8 @@ mod RxPhy {
     wire sdn : Bit {
         it := sync_dn.out
     }
-    //> Previous-cycle synchronized D+ sample; with dn_p it forms the
-    //> transition detect (`trans`).
+    //> Previous-cycle synchronized D+ sample; compared against sdp it
+    //> forms the D+ half of the transition detect (`trans`).
     reg dp_p : Bit on clk {
         initial it <= false
         it <= when {
@@ -299,8 +303,8 @@ mod RxPhy {
             else     => sdp
         }
     }
-    //> Previous-cycle synchronized D- sample; the other half of
-    //> `trans`.
+    //> Previous-cycle synchronized D- sample; compared against sdn,
+    //> the D- half of `trans`.
     reg dn_p : Bit on clk {
         initial it <= false
         it <= when {
@@ -415,7 +419,8 @@ mod RxPhy {
 
     //> Consecutive-ones counter for bit destuffing: the 6th
     //> consecutive decoded 1 arms drop_state, so the next (stuffed 0)
-    //> bit is dropped.  3 bits, wraps (harmless: the drop resets it).
+    //> bit is dropped.  3 bits is enough headroom: the drop sample
+    //> resets the count to 0, so it stops at 6 and never wraps.
     reg stuff_cnt : Word[3] on clk {
         initial it <= 0w3
         it <= when {
@@ -441,10 +446,10 @@ mod RxPhy {
     }
 
     //> Standalone SE0 timer: the EOP threshold is checked off
-    //> `eop_now` (~1.75 bit times = 7 clks); 119 clks = 2.5 us = bus
-    //> reset.  The 7-bit counter wraps, so sustained reset SE0
-    //> re-pulses every 128 clks (the ep0 FSM treats each pulse
-    //> identically).
+    //> `eop_now` (~1.75 bit times = 7 clks); bus_reset fires when the
+    //> count reaches 119, i.e. after 120 SE0 clks = 2.5 us.  The
+    //> 7-bit counter wraps, so sustained reset SE0 re-pulses every
+    //> 128 clks (the ep0 FSM treats each pulse identically).
     reg se0_cnt : Word[7] on clk {
         initial it <= 0w7
         it <= when {
@@ -484,8 +489,8 @@ mod RxPhy {
         }
     }
     //> Decoded NRZI bit value, captured at every mid-bit sample
-    //> (including the dropped one -- its value is what the perr
-    //> violation check reads).
+    //> (including the dropped stuff bit -- the perr violation check
+    //> reads that same value, via bit_val, at the drop sample).
     reg bit_r : Bit on clk {
         initial it <= false
         it <= when {
@@ -505,13 +510,11 @@ mod RxPhy {
     }
 }
 
-//> usb_rx_packet -- bit stream -> packet records, migrated out of
-//> ext/usb_uart.sv.  Cycle-exact translation of the original always
-//> blocks (same discipline as usb::RxPhy): every reg's next-state
-//> below is the same priority chain the Verilog if/else-if tree
-//> encoded, and the registered-helper structure (the cap precompute
-//> + qualify dance) is load-bearing for the 48 MHz timing -- see
-//> wiki/usb-rx-packet.md and the original comments carried below.
+//> usb_rx_packet -- assembles the serial bit stream into packet
+//> records (PID, tokens, data payloads, handshakes).  The
+//> registered-helper structure (the cap precompute + qualify dance)
+//> is load-bearing for the 48 MHz timing -- see
+//> wiki/usb-rx-packet.md.
 //>
 //> Bit counting: nb counts PID-section bits (sync 0..7 ignored, PID
 //> byte 0..7, token data 8..18, crc5 wire bits 19..23, parked at 24
@@ -528,24 +531,26 @@ enum type RxPktState {
     Body = 0b10
 }
 
-//> The 64x8 payload block RAM (dt_ram in the old usb_rx_packet), a
-//> plain Virdant mod over one iCE40 SB_RAM40_4K cell
-//> (ice40::SbRam40_4k, WRITE_MODE/READ_MODE 0 = NORMAL).  The 8-bit
-//> payload rides the cell's low byte (WDATA zero-extended, MASK
-//> 0xFF00 freezes the upper byte) and the 6-bit byte index rides the
-//> low 6 address bits (zext to the cell's Word[11]).  One write port
-//> (registered address, one enable -- no decode tree, no per-byte
-//> enable fanout) and one registered sync read port (present ra,
-//> the byte is on rd the NEXT clk: SB_RAM40_4K NORMAL read mode is
-//> registered, RCLKE/RE tied high = free-running read).  yosys maps
-//> the cell directly -- no inference, no ram_style hint needed.
+//> The payload RAM: 64 x 8-bit, one iCE40 SB_RAM40_4K cell
+//> (ice40::SbRam40_4k) with WRITE_MODE/READ_MODE left at the default
+//> 0 = NORMAL.  The 8-bit payload rides the cell's low byte (WDATA
+//> zero-extended, MASK 0xFF00 masks the upper byte out of the write)
+//> and the 6-bit byte index rides the low 6 address bits (zext to
+//> the cell's Word[11]).  One write port (single enable -- no decode
+//> tree, no per-byte enable fanout) and one registered synchronous
+//> read port (present ra this clk, the byte is on rd the NEXT clk:
+//> SB_RAM40_4K NORMAL read mode is registered, and RCLKE/RE tied
+//> high make the read side free-running).  The cell is instantiated
+//> explicitly, so yosys maps it directly -- no inference, no
+//> ram_style hint needed.
 mod RxRam {
     //> 48 MHz clock.
     incoming clk : Clock
     //> Write enable: byte-complete strobe, pre-gated with !(bc >= 64)
-    //> by the caller (writes beyond byte 63 are dropped -- over-length
-    //> packets go bad and dt_valid never fires, so no consumer ever
-    //> sees a dropped byte).
+    //> by the caller usb::RxPacket (we = dt_wr && !bc[6]; writes
+    //> beyond byte 63 are dropped -- over-length packets go bad and
+    //> dt_valid never fires, so no consumer ever sees a dropped
+    //> byte).
     incoming we : Bit
     //> Write address: the byte-count index, 0..63.
     incoming wa : Word[6]
@@ -687,8 +692,8 @@ mod RxPacket {
 
     // ---- CRC LFSRs ----------------------------------------------------
     //> CRC5 advances on token bits nb = 8..23 (data + received crc5
-    //> wire bits; residual 5'h0C).  NOT gated by pkt_err, exactly as
-    //> the vendored body: a bad packet's residual is never sampled.
+    //> wire bits; residual 5'h0C).  NOT gated by pkt_err: a bad
+    //> packet's residual is never sampled.
     mod crc5 of Crc5 {
         it.clk := clk
         it.rst := sop || rst || bus_reset
@@ -993,9 +998,9 @@ mod RxPacket {
         }
     }
     //> Registered byte-count admission for dat_cap (bc in 1..65 as of
-    //> the last bit); NOT cleared at sop (holds through, exactly as
-    //> the vendored body -- a sop-edge recompute would drag bc's
-    //> D-cone into the strobe path).
+    //> the last bit); NOT cleared at sop (holds through, since a
+    //> sop-edge recompute would drag bc's D-cone into the strobe
+    //> path).
     reg dat_bc_ok_r : Bit on clk {
         initial it <= false
         it <= when {
@@ -1021,16 +1026,11 @@ mod RxPacket {
     }
 
     //> Flopped payload head shadow, packet bytes 0..7 (bc < 8) -- eight
-    //> SEPARATE byte-regs, exactly the vendored body's per-byte flops:
-    //> each byte's enable is its own shallow decode (dt_wr && bc == k
-    //> -- k < 8, so the equality subsumes the head-window test) and
-    //> its D is dt_byte_new directly; the bc compare runs in PARALLEL
-    //> with the dt_wr cone instead of serially behind it.  A single Word[64]
-    //> reg with an 8-way splice mux was tried instead and was a
-    //> MEASURED REGRESSION (abc9 shared the whole dt_wr cone into every
-    //> bit's enable: the 21.6 ns vir-flow critical path, synth FAIL at
-    //> 46.24 MHz); the per-byte structure re-closed.  A bad packet's
-    //> payload is still written (same as the vendored body); dt_valid
+    //> SEPARATE byte-regs: each byte's enable is its own shallow decode
+    //> (dt_wr && bc == k -- k < 8, so the equality subsumes the
+    //> head-window test) and its D is dt_byte_new directly; the bc
+    //> compare runs in PARALLEL with the dt_wr cone instead of serially
+    //> behind it.  A bad packet's payload is still written; dt_valid
     //> just never fires for it.
     reg head0 : Word[8] on clk {
         initial it <= 0w8
@@ -1098,9 +1098,9 @@ mod RxPacket {
     }
 
     // ---- output strobes + captured fields --------------------------------
-    //> FLAT equations, one always block in the vendored body: the caps
-    //> are MUTUALLY EXCLUSIVE by construction (tok: nb==23 in the PID
-    //> section; hs: nb==7 in the PID section; dat: data section), so
+    //> FLAT equations: the caps are MUTUALLY EXCLUSIVE by construction
+    //> (tok: nb==23 in the PID section; hs: nb==7 in the PID section;
+    //> dat: data section), so
     //> the caps close each strobe as one 2-input AND of registers, and
     //> reading them AT the eop edge is safe (same edge clears them;
     //> nonblocking semantics see the pre-edge values).
@@ -1215,14 +1215,11 @@ mod RxPacket {
 }
 
 //> usb_ep0 -- control transfer state machine (USB 2.0 §8.5.5) + CDC
-//> requests, migrated out of ext/usb_uart.sv.  Cycle-exact
-//> translation of the original always blocks (same discipline as
-//> usb::RxPacket): every reg's next-state below is the same priority
-//> chain the Verilog if/else-if tree encoded, including the
-//> registered-accept pipeline (req_acc_r / sto_acc_r, +1 clk after
-//> the router strobes) and the EP_PARSE -> EP_SETUP -> EP_ARM
-//> request-decode pipeline -- all load-bearing for the 48 MHz timing
-//> (see wiki/usb-ep0.md and the original comments carried below).
+//> requests.  Every reg's next-state below is a priority chain,
+//> including the registered-accept pipeline (req_acc_r / sto_acc_r,
+//> +1 clk after the router strobes) and the EP_PARSE -> EP_SETUP ->
+//> EP_ARM request-decode pipeline -- all load-bearing for the
+//> 48 MHz timing (see wiki/usb-ep0.md).
 //>
 //> Supported: GET_DESCRIPTOR (device/config/string), SET_ADDRESS
 //> (latched at status-stage completion), SET_CONFIGURATION,
@@ -1247,11 +1244,18 @@ enum type Ep0State {
     Arm     = 10w4
 }
 
-//> EP0: the control endpoint.  Consumes the router-gated token /
-//> data / handshake strobes and answers with 1-clk tx response
-//> requests (resp_req + held params) for the core's response
-//> arbiter, plus the device status (dev_addr, configured) and the
-//> router hints (ep0_busy / ep0_stalling / ep0_wait_ack).
+//> EP0: the control endpoint.  Runs one control transfer at a time:
+//> SETUP (tk_setup + the 8-byte request packet) -> parse / setup /
+//> arm pipeline -> data stage (descriptor bytes served by
+//> usb::DescRom through resp_sel / resp_base) -> status handshake.
+//> Supported requests: GET_DESCRIPTOR (device / config / string
+//> 0-2), GET_STATUS(device), SET_ADDRESS, SET_CONFIGURATION(0/1),
+//> SET_CONTROL_LINE_STATE; anything else is STALLed until the next
+//> SETUP.  Consumes the router-gated token / data / handshake
+//> strobes and answers with 1-clk tx response requests (resp_req +
+//> held params) for the core's response arbiter, plus the device
+//> status (dev_addr, configured) and the router hints (ep0_busy /
+//> ep0_stalling / ep0_wait_ack).
 mod Ep0 {
     //> 48 MHz clock: 4 clk cycles per USB FS bit.
     incoming clk : Clock
@@ -1278,8 +1282,9 @@ mod Ep0 {
     //> Data packet payload byte count.
     incoming dt_len : Word[7]
     //> Payload head window, packet bytes 0..7 (usb::RxPacket's flopped
-    //> shadow -- EP0 only ever needs the request / line-coding window,
-    //> never the RAM bytes 8..63).
+    //> head shadow -- EP0 only ever reads the 8-byte request header:
+    //> the SETUP packet, or the status-stage ZLP which has no payload;
+    //> never the payload RAM bytes 8..63).
     incoming dt_head : Word[64]
     //> Data packet CRC16 verdict.
     incoming dt_crc_ok : Bit
@@ -1326,8 +1331,10 @@ mod Ep0 {
     outgoing ep0_busy : Bit {
         it := (st == #RcvReq) || (st == #StatusO)
     }
-    //> EP0 is STALLing (its data packets still route here until the
-    //> next SETUP).
+    //> EP0 is STALLing.  The router still routes data packets here
+    //> while the last token was OUT-to-EP0 (this transfer's own data
+    //> stage); IN tokens to EP0 also get STALL responses.  The state
+    //> persists until the next SETUP or reset.
     outgoing ep0_stalling : Bit {
         it := st == #Stall
     }
@@ -1420,7 +1427,8 @@ mod Ep0 {
             else => it
         }
     }
-    //> wValue low (descriptor type / SET_ADDRESS value / SET_CONFIGURATION value).
+    //> wValue low (SET_ADDRESS address / SET_CONFIGURATION value /
+    //> GET_DESCRIPTOR string index).
     reg rq2 : Word[8] on clk {
         initial it <= 0w8
         it <= when {
@@ -1428,7 +1436,7 @@ mod Ep0 {
             else => it
         }
     }
-    //> wValue high (descriptor sub-type: 1 device, 2 config, 3 string).
+    //> wValue high (descriptor type: 1 device, 2 config, 3 string).
     reg rq3 : Word[8] on clk {
         initial it <= 0w8
         it <= when {
@@ -1456,9 +1464,8 @@ mod Ep0 {
     // ---- decode-stage registers (EP_PARSE: one-hot flags + raw wLength)
     //> The request case tree is too deep for one 48 MHz cycle, so the
     //> decode is split across two: PARSE computes these flags, SETUP
-    //> routes them, ARM applies.  No reset here, exactly as the
-    //> vendored body -- every flag is written in PARSE before any
-    //> reader looks at it.
+    //> routes them, ARM applies.  Deliberately unreset: every flag is
+    //> rewritten in PARSE before any reader (SETUP) looks at it.
 
     //> Decoded descriptor select.
     reg p_sel : Word[3] on clk {
@@ -1476,7 +1483,9 @@ mod Ep0 {
             else => it
         }
     }
-    //> GET_DESCRIPTOR with a valid select.
+    //> GET_DESCRIPTOR with a valid select (computed but not read:
+    //> the Arm action tree treats GET_DESCRIPTOR as the fall-through
+    //> action).
     reg p_is_desc : Bit on clk {
         initial it <= false
         it <= when {
@@ -1611,11 +1620,11 @@ mod Ep0 {
             else => it
         }
     }
-    //> Descriptor data-stage length, min(wLength, desc_len(p_sel))
-    //> PRECOMPUTED in EP_SETUP: the 15-bit compare against dlen was a
-    //> full carry chain ending at remain's clock enable.  dlen <= 75 <
-    //> 128, so the compare only needs the low bits: wLength >= 128
-    //> means the descriptor length wins outright.
+    //> Descriptor data-stage length, min(wLength, dlen(p_sel)),
+    //> precomputed in SETUP so remain's Arm load is
+    //> register-to-register.  dlen <= 75 < 128, so the compare only
+    //> needs the low bits: wLength >= 128 means the descriptor
+    //> length wins outright.
     reg p_dremain_r : Word[7] on clk {
         initial it <= 0w7
         it <= when {
@@ -1629,10 +1638,9 @@ mod Ep0 {
     }
 
     // ---- the FSM and datapath -----------------------------------------
-    //> Transfer state.  Every reg below is the priority chain the
-    //> Verilog if/else-if tree encoded: reset, then tk_setup (SETUP
-    //> aborts any transfer in progress, re-initializing the toggle),
-    //> then the state cases.
+    //> Transfer state.  Next-state is one priority chain: reset,
+    //> then tk_setup (SETUP aborts any transfer in progress,
+    //> re-initializing the toggle), then the state cases.
     reg st : Ep0State on clk {
         initial it <= #Idle
         it <= when {
@@ -1786,9 +1794,9 @@ mod Ep0 {
     }
 
     // ---- tx response registers ----------------------------------------
-    //> resp_req is default low, pulsed by each arm; the params are
-    //> held per-branch (unchanged between pulses, exactly as the
-    //> vendored body -- the arbiter latches them on the pulse).
+    //> resp_req is default low, pulsed by each arm; the params hold
+    //> between pulses (the tx PHY latches pid / len at the pulse,
+    //> sel / base are consumed while the packet streams).
     reg resp_req_r : Bit on clk {
         initial it <= false
         it <= when {
@@ -1844,21 +1852,20 @@ mod Ep0 {
     }
 }
 
-//> usb_serial -- EP1 bulk endpoint protocol, migrated out of
-//> ext/usb_uart.sv.  Cycle-exact translation: data toggles + ACK/NAK/
-//> ARM decisions only -- data movement lives in the core top (FIFOs,
+//> usb_serial -- EP1 bulk endpoint protocol.  Data toggles + ACK/NAK/
+//> arm decisions only -- data movement lives in the core top (FIFOs,
 //> snapshot RAM, tx PHY mux).  IN packets are snapshotted from the
-//> tx FIFO into the snapshot RAM at arm time, so an unacknowledged
-//> packet is retransmitted byte-identically (same data pid) until
-//> the host ACKs.  Data toggles reset on bus reset and
-//> SET_CONFIGURATION (USB 2.0 §9.1.1.5).
+//> tx FIFO into the snapshot RAM at arm time (via resp_fresh), so an
+//> unacknowledged packet is retransmitted byte-identically (same
+//> data pid) until the host ACKs.  Data toggles reset on bus reset
+//> and SET_CONFIGURATION (USB 2.0 §9.1.1.5).
 //>
 //> The OUT data accept/reject is REGISTERED one clk after arrival
 //> (dt_acc/dt_rej): the room check (an add+compare crossing the rx
 //> FIFO count) and the response/toggle registers then land in
 //> separate cycles (+1 clk response latency is well inside the
-//> device turnaround budget).  The core top streams the payload on
-//> the serial ACK pulse.
+//> device turnaround budget).  An OUT packet that does not fit the
+//> rx FIFO whole is NAKed.
 mod Serial {
     //> 48 MHz clock: 4 clk cycles per USB FS bit.
     incoming clk : Clock
@@ -1892,11 +1899,12 @@ mod Serial {
     //> 1: the whole OUT packet fits the rx FIFO (core-side add+compare;
     //> the decision here is registered one clk after arrival).
     incoming rx_room : Bit
-    //> Free slots in the tx FIFO (unused -- kept for interface
-    //> completeness with the old vendored port).
+    //> Free slots in the tx FIFO (unused here -- arm sizing reads
+    //> txfifo_count directly).
     incoming tx_room : Word[7]
 
-    //> Response request (1-clk pulse).
+    //> 1-clk pulse: launch this module's response (the core's arbiter
+    //> latches resp_pid/resp_len/resp_fresh on it).
     outgoing resp_req : Bit {
         it := resp_req_r
     }
@@ -1908,8 +1916,9 @@ mod Serial {
     outgoing resp_len : Word[7] {
         it := resp_len_r
     }
-    //> 1: a NEW packet was armed -- the core must snapshot len bytes
-    //> from the tx FIFO (the response is the snapshot's first read).
+    //> 1-clk pulse alongside resp_req: a NEW packet was armed (vs a
+    //> retransmit of the pending snapshot) -- the core starts the
+    //> snapshot load on it.
     outgoing resp_fresh : Bit {
         it := resp_fresh_r
     }
@@ -1923,9 +1932,10 @@ mod Serial {
     }
 
     unused tx_room
-    // The packet payload byte count (unused here: the whole packet is
-    // accepted or rejected on rx_room; the length lives in the core's
-    // rx push).
+    // Unused inputs: tx_room (arm sizing reads txfifo_count directly)
+    // and dt_len (the core's rx push counts the packet's bytes
+    // itself; the whole packet is accepted or rejected on rx_room
+    // alone).
     unused dt_len
 
     // ---- combinational helpers -------------------------------------------
@@ -1985,9 +1995,9 @@ mod Serial {
         }
     }
     //> An OUT token armed this endpoint: its data packet is expected
-    //> next (cleared at the packet's arrival, registered one clk
-    //> later via dt_acc/dt_rej -- the arrival-cycle clear below is
-    //> exact: the token precedes its data packet).
+    //> next (ser_busy routes dt_valid here while it is set).  Cleared
+    //> at the data packet's arrival edge; the accept/reject decision
+    //> is registered one clk later (dt_acc/dt_rej).
     reg armed_out : Bit on clk {
         initial it <= false
         it <= when {
@@ -2020,8 +2030,8 @@ mod Serial {
     // ---- response registers -----------------------------------------------
     //> resp_req is default low, pulsed by each arm/accept/reject; the
     //> params are held per-branch (the core's arbiter latches them on
-    //> the pulse).  The accept/reject overrides take priority over
-    //> the token arm exactly as the vendored body's assignment order.
+    //> the pulse).  The accept/reject branches take priority over the
+    //> token arm.
     reg resp_req_r : Bit on clk {
         initial it <= false
         it <= when {
@@ -2048,6 +2058,8 @@ mod Serial {
             else => it
         }
     }
+    //> Held response length: the pending packet's pkt_len on a
+    //> retransmit, min(count,64) on a fresh arm, 0 for ACK/NAK.
     reg resp_len_r : Word[7] on clk {
         initial it <= 0w7
         it <= when {
@@ -2061,9 +2073,9 @@ mod Serial {
             else => it
         }
     }
-    //> The fresh-arm strobe: deliberately NOT reset (the vendored body
-    //> left it out of the reset branch, so it holds through reset;
-    //> the core only ever consumes it alongside a resp_req pulse).
+    //> The fresh-arm strobe: NOT reset (holds through rst/bus_reset/
+    //> set_cfg); harmless because the core only ever consumes it
+    //> alongside a resp_req pulse.
     reg resp_fresh_r : Bit on clk {
         initial it <= false
         it <= when {
@@ -2075,28 +2087,27 @@ mod Serial {
 }
 
 //> usb_tx_phy -- packet records back to pads (USB 2.0 §7.1.x), the
-//> mirror of usb::RxPhy, migrated out of ext/usb_uart.sv.  Drives a
-//> complete FS packet: sync pattern, NRZI-encoded bit-stuffed data,
-//> and EOP, plus the output enable that connects the driver to the
-//> pads only while transmitting.
+//> mirror of the RxPhy in ext/usb_uart.sv.  Drives a complete FS
+//> packet: sync pattern, NRZI-encoded bit-stuffed data, and EOP,
+//> plus the output enable that connects the driver to the pads only
+//> while transmitting.
 //>
-//> Cycle-exact translation of the original always block (same
-//> discipline as usb::RxPhy): every reg's next-state below is the
-//> same priority chain the Verilog case/if tree encoded, including
-//> the registered one-clk-ahead decision flags (s_lt_end_r,
+//> Every reg's next-state below is a plain priority when-chain,
+//> including the registered one-clk-ahead decision flags (s_lt_end_r,
 //> guard_last_r, bit_end_r, crc_load_r) that keep the big compare
 //> cones off the single-cycle engine path.  Timeline conventions
-//> (load-bearing -- see wiki/usb-tx-phy.md and the original comments
-//> preserved on each reg):
+//> (load-bearing -- see wiki/usb-tx-phy.md):
 //>
-//>   - the level DURING bit time T encodes raw bit f(S_T - 1); the
-//>     transition for a 0 bit appears at that bit time's start;
+//>   - the level DURING bit time T encodes raw bit f(S_T - 1) (S_T =
+//>     s's value during bit time T); the transition for a 0 bit
+//>     appears at that bit time's start;
 //>   - s is the raw bit index of the NEXT bit time (it advances at
 //>     bit-time boundaries, i.e. it names the bit whose encoding
 //>     follows); stuffed bit times do not advance it;
-//>   - the CRC16 instance consumes each payload raw bit exactly once,
-//>     at btc==2 of the bit time whose encoding drives that bit
-//>     (stuffed bit times are gated off via cur_stuff).
+//>   - the CRC16 instance consumes each payload raw bit exactly once:
+//>     raw bit r at the btc==2 cycle of bit time r-1 -- the bit time
+//>     whose end decides r's NRZI level (stuffed bit times are gated
+//>     off via cur_stuff).
 enum type TxPhyState {
     Idle  = 0b000w3
     Guard = 0b001
@@ -2114,11 +2125,13 @@ mod TxPhy {
     incoming tx_start : Bit
     //> PID nibble (the upper complement is generated here).
     incoming tx_pid : Word[4]
-    //> Payload byte count, 0..64 (0 => zero-length packet).
+    //> Payload byte count, 0..64 (0 => zero-length packet; a data PID
+    //> still appends its 16 CRC wire bits).
     incoming tx_len : Word[7]
-    //> Producer payload byte, combinational at tx_addr.  The engine is
-    //> a one-bit-time lookahead: tx_addr leads the consumed bit by one
-    //> bit time, and tx_byte_r (below) re-times it into the engine.
+    //> Producer payload byte: the core top's mux over registered
+    //> snapshot-RAM / descriptor-ROM read stages (addressed through
+    //> tx_addr_next, see below).  tx_byte_r (below) re-times it into
+    //> the engine, one load per payload byte.
     incoming tx_byte : Word[8]
 
     //> s - 16: the payload bit index (only meaningful for payload
@@ -2131,15 +2144,21 @@ mod TxPhy {
     wire s_m9 : Word[10] {
         it := s - 9w10
     }
-    //> Byte index currently being consumed (a pure bit-slice of s, no
-    //> state term; only meaningful while payload bits are read).
+    //> Byte index of raw bit f(s) -- the byte the NEXT bit time's
+    //> encoding will draw from (equals the byte currently being
+    //> consumed except during a byte's last bit time).  A pure
+    //> bit-slice of s, no state term; it wraps to 126/127 before the
+    //> payload.  Unused by the core's instantiation (the fetch
+    //> pipeline runs off tx_addr_next); informational only.
     outgoing tx_addr : Word[7] {
         it := s_m16[10..3]
     }
-    //> Byte index the NEXT bit time will consume (preload hint):
-    //> (s-9)>>3 is byte-stable across every bit time of a byte, so a
-    //> registered copy can address the source one byte ahead without
-    //> flipping mid-byte.
+    //> Fetch preload hint: (s-9)>>3 names the payload byte one ahead
+    //> of the byte currently being consumed.  Byte-stable across every
+    //> bit time of a byte, so a registered copy can address the source
+    //> one byte ahead without flipping mid-byte.  Holds 0 through the
+    //> PID bit times (preloading payload byte 0); for s < 9 the
+    //> subtraction wraps in Word[10] (landing on 126/127, never read).
     outgoing tx_addr_next : Word[7] {
         it := s_m9[10..3]
     }
@@ -2216,9 +2235,9 @@ mod TxPhy {
                         crc_shift[15],
                         false))))
     }
-    //> The CRC16 wire bits, complemented (wire convention:
-    //> crc_wire[i] = ~crc[W-1-i]; the bit-reverse is the MSB-first
-    //> shift-out of crc_shift).
+    //> The CRC16 wire bits, complemented (crc_wire[i] = ~crc[i]; the
+    //> MSB-first wire order comes from shifting crc_shift right, bit
+    //> 15 first).
     wire crc_wire : Word[16] {
         it := crc16.crc ^ 65535w16
     }
@@ -2240,8 +2259,8 @@ mod TxPhy {
     }
     //> Final S_GUARD cycle (gcnt == 6), REGISTERED one clk ahead: the
     //> bit-time phase decisions read a 1-bit register instead of a
-    //> compare cone (the raw compares chained through 4 enable LUTs
-    //> into s's clock enable -- the old vir-flow critical path).
+    //> compare cone (the raw compares would chain through 4 enable
+    //> LUTs into s's clock enable).
     reg guard_last_r : Bit on clk {
         initial it <= false
         it <= when {
@@ -2466,12 +2485,12 @@ mod TxPhy {
     //> The CRC wire bits are SHIFTED out of this register instead of
     //> muxed live from the LFSR: the raw-bit CRC branch would otherwise
     //> compute 15 - (s - payload_end_r) -- a per-cycle 10-bit subtract
-    //> + compare cone off the crc16 flops (the old vir-flow critical
-    //> path).  Loaded with the final wire-ordered CRC (crc_wire) at the
-    //> edge that consumes the last payload raw bit, then shifted right
-    //> (MSB first) once per consumed raw bit; raw_bit's CRC branch is a
-    //> single register bit.  Stuffed bit times don't shift; a re-load
-    //> on a following stuffed edge is harmless (see crc_load_r).
+    //> + compare cone off the crc16 flops.  Loaded with the final
+    //> wire-ordered CRC (crc_wire) at the edge that consumes the last
+    //> payload raw bit, then shifted right (MSB first) once per
+    //> consumed raw bit; raw_bit's CRC branch is a single register
+    //> bit.  Stuffed bit times don't shift; a re-load on a following
+    //> stuffed edge is harmless (see crc_load_r).
     reg crc_shift : Word[16] on clk {
         initial it <= 0w16
         it <= when {
@@ -2513,9 +2532,11 @@ mod TxPhy {
     }
 
     //> Payload CRC16 (usb::Crc16).  Re-seeded by tx_start; advances one
-    //> serial bit at btc==2 of every non-stuffed bit time whose raw bit
-    //> is a payload bit (16 <= s < payload_end_r); consumes raw_bit_r,
-    //> i.e. exactly the bit the current bit time's encoding drives.
+    //> serial bit at btc==2 of every non-stuffed bit time whose s is a
+    //> payload raw-bit index (16 <= s < payload_end_r); din is
+    //> raw_bit_r = f(s), the raw bit whose NRZI level decision fires
+    //> at this bit time's end -- one ahead of the bit the current
+    //> level encodes.
     mod crc16 of Crc16 {
         it.clk := clk
         it.rst := tx_start
@@ -2528,88 +2549,123 @@ mod TxPhy {
 //> The two sync FIFOs over usb_fifo16x8 (ext/usb_uart.sv): thin
 //> fixed-parameter wrappers so the Virdant side can instantiate them
 //> as ext mods (Virdant ext mods cannot carry parameters).
-//> Port/behavior contract (the usb_fifo16x8 header): wr_en and rd_en
-//> are CALLER-gated (!full / !empty) -- the count terms never enter
-//> the FIFO's own pointer/count enables (both call sites gate in the
-//> register that produces the strobe).
+//> Port/behavior contract (the usb_fifo16x8 header): the FIFO has NO
+//> internal protection -- wr_en must be pre-gated with !full and
+//> rd_en with !empty by the caller; the enables carry no count
+//> terms, so the count compares never sit in a write/read
+//> clock-enable cone (a hard requirement at 48 MHz).  Both call
+//> sites comply (usb::UsbUart below): the rx push gate (!rxfifo.full
+//> inside rx_push_run) and pop gate (!rxfifo.empty inside rx_pop_d)
+//> sit in the strobe pipeline's registers' next-state, the tx write
+//> gate is the registered txfifo_wr_d (= tx_strobe && !txfifo.full),
+//> and the tx FIFO's only popper -- the snapshot loader -- pops
+//> exactly the arm-time min(count,64), so it can never meet empty
+//> mid-load.  Simultaneous push+pop is supported; count is 7 bits
+//> wide regardless of depth.
 
-//> The 16-deep x 8-bit tx FIFO (defaults: flop storage, RAM=0), with
-//> the COMBINATIONAL head on rd_data.
+//> The 16-deep x 8-bit tx FIFO (usb_fifo16x8 defaults: DEPTH=16,
+//> AW=4, RAM=0 -- flop storage, combinational head).
 ext mod TxFifo {
     //> 48 MHz clock.
     incoming clk : Clock
-    //> Synchronous reset (both call sites pass rst || bus_reset).
+    //> Synchronous reset: clears both pointers and the count (the
+    //> caller passes rst || bus_reset).
     incoming rst : Bit
-    //> Write enable (caller pre-gates with !full).
+    //> Push strobe: wr_data is stored at the next posedge.  The
+    //> caller pre-gates with !full (the FIFO has no internal
+    //> protection); here that gate is the registered txfifo_wr_d.
     incoming wr_en : Bit
-    //> Write byte.
+    //> Byte to store at the push edge.
     incoming wr_data : Word[8]
-    //> Pop enable (caller pre-gates with !empty).
+    //> Pop strobe: the head is removed at the next posedge.  The
+    //> caller pre-gates with !empty; here the only popper is the
+    //> snapshot loader, one byte per clk during a bulk-IN load.
     incoming rd_en : Bit
-    //> The head byte, combinational.
+    //> The head byte, combinational -- valid the whole cycle, so the
+    //> snapshot loader captures it into SnapRam on the same edge it
+    //> pops (rd_en and snapram.we fire together).
     outgoing rd_data : Word[8]
     //> Bytes stored (0..16).
     outgoing count : Word[7]
     //> Full (count == 16).
     outgoing full : Bit
-    //> Empty.
+    //> Empty (count == 0).
     outgoing empty : Bit
 }
 
 //> The 64-deep x 8-bit bulk-OUT rx FIFO (DEPTH=64, AW=6, RAM=1):
-//> block-RAM storage with the head delayed one clk on rd_data (the
-//> registered free-running read takes 512 flops and their per-byte
-//> write-decode cones off the fabric).  DEPTH=64 is a documented
-//> plan deviation: a max-size bulk-OUT packet must be absorbed
-//> atomically under the "whole packet must fit" rule.
+//> block-RAM storage with the registered free-running read port
+//> (keeps 512 flops and their per-byte write-decode cones off the
+//> fabric, at the cost of a one-clk-delayed rd_data).  DEPTH=64,
+//> not a generic 16: a max-size (64 B) bulk-OUT packet must be
+//> absorbed atomically under the whole-packet-must-fit admission
+//> rule (usb::Serial NAKs an OUT that does not fit whole), which a
+//> 16-deep FIFO could never accept.
 ext mod RxFifo {
     //> 48 MHz clock.
     incoming clk : Clock
-    //> Synchronous reset.
+    //> Synchronous reset: clears both pointers and the count (the
+    //> caller passes rst || bus_reset).
     incoming rst : Bit
-    //> Write enable (caller pre-gates with !full).
+    //> Push strobe: wr_data is stored at the next posedge.  The
+    //> caller pre-gates with !full -- the gate lives in rx_push_run's
+    //> next-state and the strobe is retimed one clk into
+    //> rx_push_run_d (the FIFO has no internal protection).
     incoming wr_en : Bit
-    //> Write byte.
+    //> Byte to store at the push edge (the payload RAM's registered
+    //> read, paired with the strobe one clk later).
     incoming wr_data : Word[8]
-    //> Pop enable (caller pre-gates with !empty).
+    //> Pop strobe: the head is removed at the next posedge.  The
+    //> caller pre-gates with !empty (plus a one-clk bubble that
+    //> blocks a pop in the cycle after the last byte's pop, so the
+    //> 7-bit count can never underflow -- see rx_pop_d).
     incoming rd_en : Bit
-    //> The head byte, one clk after rd_en (registered read).
+    //> The registered read output, trailing the read pointer by one
+    //> clk: while the FIFO sits idle it is the current head; the clk
+    //> after an rd_en pop it still holds the just-popped byte, and
+    //> the new head appears one clk later.  (The caller pairs the
+    //> popped byte with the delayed valid strobe -- rx_valid_rr /
+    //> rx_data_d.)
     outgoing rd_data : Word[8]
     //> Bytes stored (0..64).
     outgoing count : Word[7]
     //> Full (count == 64).
     outgoing full : Bit
-    //> Empty.
+    //> Empty (count == 0).
     outgoing empty : Bit
 }
 
-//> The bulk-IN snapshot RAM (64x8 block RAM): at arm time the
-//> snapshot loader pops min(count,64) bytes from the tx FIFO in
-//> here, so an unacknowledged IN packet is retransmitted
-//> byte-identically until the host ACKs.  A plain Virdant mod over
-//> one iCE40 SB_RAM40_4K cell.  The 7-bit ports index a 64-entry
-//> window of the cell's 256-deep space with the old out-of-range
-//> semantics preserved: writes are gated to !wa[6] (>= 64 is a
-//> no-op), and a read index >= 64 lands on entries 64..127, which
-//> are NEVER written -- X in simulation, zero in the bitstream --
-//> not an aliased byte from 0..63.  (The tx fetch index can lead
-//> the consumed bytes during the packet tail; the fetched byte is
-//> never sent because tx_len caps the PHY, so either value is
-//> harmless, but fresh-X matches the vendored body's simulation
-//> semantics exactly.)
+//> The bulk-IN snapshot RAM (64x8 over one iCE40 SB_RAM40_4K cell):
+//> at arm time the snapshot loader pops min(count,64) bytes from the
+//> tx FIFO in here (one byte per clk), so an unacknowledged IN
+//> packet is retransmitted byte-identically until the host ACKs.
+//> The 7-bit ports index a 64-entry window of the cell's 256-deep
+//> space: writes are gated to !wa[6] (index >= 64 never writes), and
+//> a read index >= 64 lands on entries 64..127, which are NEVER
+//> written -- X in simulation (tb/sb_ram_sim.v), zero in the
+//> bitstream -- never an aliased byte from 0..63.  (The tx fetch
+//> index can lead the consumed bytes during the packet tail; the
+//> over-fetched byte is never serialized because tx_len caps the
+//> PHY, so the read value is harmless either way -- the
+//> never-written upper half just keeps an out-of-range fetch visibly
+//> X in simulation instead of silently aliasing a stored byte.)
 mod SnapRam {
     //> 48 MHz clock.
     incoming clk : Clock
-    //> Write enable (the loader's step strobe).
+    //> Write enable: the snapshot loader's per-byte step strobe (one
+    //> byte per clk while it drains the tx FIFO).
     incoming we : Bit
-    //> Write address (the loader's index, 0..63; >= 64 is a no-op).
+    //> Write address: the loader's store index, 0..63 (>= 64 is a
+    //> no-op -- the !wa[6] write gate).
     incoming wa : Word[7]
-    //> Write byte (the popped tx-FIFO head).
+    //> Write byte: the tx FIFO's popped head, captured on the same
+    //> edge as the pop (the tx FIFO's head is combinational).
     incoming wd : Word[8]
-    //> Read address (the tx byte fetch index; out of range reads X,
-    //> exactly the vendored body).
+    //> Read address: the tx byte fetch index (usb::TxPhy's
+    //> tx_addr_next); >= 64 hits the never-written upper half.
     incoming ra : Word[7]
-    //> Registered read data: mem[ra] as of the previous posedge.
+    //> Registered read data: mem[ra] as of the previous posedge
+    //> (free-running read side: RE/RCLKE tied high, NORMAL mode).
     outgoing rd : Word[8]
 
     mod ram of ice40::SbRam40_4k {
@@ -2627,56 +2683,60 @@ mod SnapRam {
     }
 }
 
-//> The descriptor ROM (256x8 initialized block RAM, registered
+//> The descriptor ROM (256x8 initialized block RAM, registered sync
 //> read): contiguous pages -- sel0 device@0 (18 B), sel1 config@18
-//> (75 B), sel2 str0@93, sel3 str1@97 (10 B), sel4 str2@107 (28 B).
-//> sel5 (line coding) and sel6 (status) are dynamic/trivial and
-//> bypass the ROM.  The 256-byte initial block lives in the ext
-//> body (ext/usb_uart.sv); a BRAM read replaces the desc_byte()
-//> case cascade (a 128-deep case is ~20 ns of LUT chain; a BRAM
-//> read is a register).
+//> (75 B), sel2 str0@93 (4 B), sel3 str1@97 (10 B), sel4 str2@107
+//> (32 B declared: bLength 0x20 -- 28 B of UTF-16 string data
+//> followed by zero pad up to the declared length).  Only sel0..4
+//> ever reach the ROM: GET_STATUS (sel6) bypasses it -- the tx
+//> producer mux in usb::UsbUart returns zero bytes for sel6 -- and
+//> sel5 does not exist (usb::Ep0 implements no line-coding request;
+//> an invalid GET_DESCRIPTOR select STALLs instead of arming).
+//> The 256-byte initial block lives in the ext body
+//> (ext/usb_uart.sv) -- a plain mod over an ice40::SbRam40_4k cell
+//> would need an INIT_FILE hex image instead -- and reads are
+//> registered: present ra this clk, the byte is on rd the next clk.
 ext mod DescRom {
     //> 48 MHz clock.
     incoming clk : Clock
-    //> ROM address (page start + transfer offset).
+    //> Read address: the latched response base (EP0 page start +
+    //> transfer offset, see rom_addr_r in usb::UsbUart) plus the
+    //> in-flight byte fetch index.
     incoming ra : Word[8]
     //> Registered read data: desc_rom[ra] as of the previous posedge.
     outgoing rd : Word[8]
 }
 
-//> usb_uart -- the core top, migrated out of ext/usb_uart.sv:
-//> descriptor ROM plumbing, token router, response arbiter, bulk
-//> snapshot loader, rx push, FIFOs + byte-stream loopback interface
-//> (the EP0 / Serial / TxPhy / RxPhy / RxPacket instantiations live
-//> here too).  Cycle-exact translation (same discipline as
-//> usb::RxPacket / usb::Ep0): every reg's next-state is the priority
-//> chain the Verilog if/else-if tree encoded, and every
-//> registered-helper structure (the +1/+2-clk token strobes, the
-//> registered EP0 data strobe, the countdown terminations) is
-//> preserved -- see the original comments carried below and
+//> usb_uart -- the core top: descriptor ROM plumbing, token router,
+//> response arbiter, bulk snapshot loader, rx push, FIFOs +
+//> byte-stream loopback interface (the EP0 / Serial / TxPhy /
+//> RxPhy / RxPacket instantiations live here too).  Every reg's
+//> next-state is a priority chain, and every registered-helper
+//> structure (the +1/+2-clk token strobes, the registered EP0 data
+//> strobe, the countdown terminations) is load-bearing -- see
 //> wiki/usb-uart.md.
 mod UsbUart {
-    //> 48 MHz clock: 4 clk cycles per USB FS bit.
+    //> 48 MHz system clock: each USB FS bit spans 4 clk cycles.
     incoming clk : Clock
     //> Synchronous reset, active high.  Fed by the registered
     //> por_done (one clk behind UsbPor's release) -- see the por_rst
     //> doccomment in UsbController for why the extra register stage
     //> is load-bearing.
     incoming rst : Bit
-    //> D+ pad sample in (from UsbPads).
+    //> D+ pad sample in (from the bus transceiver inside UsbPads).
     incoming dp_rx : Bit
-    //> D- pad sample in (from UsbPads).
+    //> D- pad sample in (from the bus transceiver inside UsbPads).
     incoming dn_rx : Bit
-    //> D+ drive level out (to UsbPads).
+    //> D+ drive level out (to UsbPads, gated by output_enable).
     outgoing dp_tx : Bit {
         it := txphy.dp
     }
-    //> D- drive level out (to UsbPads).
+    //> D- drive level out (to UsbPads, gated by output_enable).
     outgoing dn_tx : Bit {
         it := txphy.dn
     }
-    //> Pad drive enable: drive the bus while high (SB_IO
-    //> OUTPUT_ENABLE via UsbPads).
+    //> Pad drive enable: high while the tx PHY is driving the bus
+    //> (SB_IO OUTPUT_ENABLE via UsbPads; low during receive/SIDLE).
     outgoing output_enable : Bit {
         it := txphy.output_enable
     }
@@ -2692,9 +2752,10 @@ mod UsbUart {
     outgoing tx_ready : Bit {
         it := tx_ready_r
     }
-    //> Byte toward the host.
+    //> Byte toward the host (held stable by the producer across the
+    //> strobe).
     incoming tx_data : Word[8]
-    //> 1-clk push strobe for tx_data.
+    //> 1-clk push strobe for tx_data into the tx FIFO.
     incoming tx_strobe : Bit
     //> Flow control back: low = the rx consumer is full, stop popping
     //> (the core NAKs bulk-OUT packets instead).
@@ -2712,8 +2773,8 @@ mod UsbUart {
     }
 
     // ---- RX chain -----------------------------------------------------
-    //> The RX PHY (pads -> decoded bits).  `active` is not needed by
-    //> the core: the packet engines key off sop/eop/pkt_err.
+    //> The RX PHY (pads -> decoded bit stream).  `active` is unused
+    //> here: the packet engines key off sop/eop/pkt_err instead.
     mod rxphy of RxPhy {
         it.clk := clk
         it.rst := rst
@@ -2721,15 +2782,16 @@ mod UsbUart {
         it.dn  := dn_rx
         unused it.active
     }
-    //> Bus reset strobe from the PHY (long SE0): flushes everything.
+    //> Bus reset strobe from the PHY (detected long SE0).  Fans out
+    //> to every USB engine and FIFO to flush state.
     wire bus_reset : Bit {
         it := rxphy.bus_reset
     }
 
     //> The packet assembler (bits -> tk_*/dt_*/hs_* records).  The
-    //> RAM read address is the rx-push byte index push_i (the rx
-    //> push streams the payload out through the registered read
-    //> port).
+    //> payload RAM read address is the rx-push index push_i: the rx
+    //> push streams the accepted payload out through the registered
+    //> read port.
     mod rxpkt of RxPacket {
         it.clk       := clk
         it.rst       := rst
@@ -2747,9 +2809,10 @@ mod UsbUart {
 
     // ---- EP0 + serial protocol modules ---------------------------------
     //> EP0 (control transfers + CDC requests) and Serial (EP1 bulk
-    //> protocol): see their own banners.  The dt_* fields are shared
-    //> straight off the packet assembler's records (they hold between
-    //> packets); only the per-module data strobes are router-gated.
+    //> data): see their own banners.  The dt_* data fields are shared
+    //> straight off the packet assembler (they hold between packets);
+    //> only the per-module data strobes are gated by the router
+    //> below.
     mod ep0 of Ep0 {
         it.clk       := clk
         it.rst       := rst
@@ -2784,14 +2847,16 @@ mod UsbUart {
     }
 
     // ---- token router -------------------------------------------------
-    //> The device answers only its own address (starts 0; SET_ADDRESS
-    //> latches at status completion); SOF tokens decode but are
-    //> ignored.  The address compare + pid/endp decode is REGISTERED
-    //> (+1 clk on token strobes -- well inside the device turnaround
-    //> budget): the dev_addr compare then sits in ONE register's
-    //> D-cone instead of fanning into every consumer's clock-enable
-    //> logic.  tk_pid/tk_endp hold their values between packets, so
-    //> decoding them one clk late is exact.
+    //> Token-valid gate: the device answers only tokens whose CRC5
+    //> checks out AND whose address matches its current dev_addr
+    //> (starts 0; SET_ADDRESS latches at status completion inside
+    //> ep0).  SOF tokens decode but are ignored.  The address
+    //> compare + pid/endp decode are REGISTERED (+1 clk on every
+    //> token strobe -- well inside the device turnaround budget): the
+    //> dev_addr compare then feeds ONE register's D-cone instead of
+    //> fanning into every consumer's clock-enable logic.  tk_pid and
+    //> tk_endp hold their values between packets, so decoding them
+    //> one clk late is exact.
     reg tok_v_r : Bit on clk {
         initial it <= false
         it <= when {
@@ -2801,11 +2866,13 @@ mod UsbUart {
         }
     }
 
-    //> The FULL token strobes, REGISTERED one clk further (the
-    //> pid/endp decode otherwise stays combinational off tok_v_r and
-    //> every consumer's register-enable cone ingests it; no token can
-    //> land in the delay -- the inter-packet gap is >= 2 bit times =
-    //> 8 clks).
+    //> The per-endpoint token strobes, REGISTERED one clk further
+    //> (the pid/endp decode otherwise stays combinational off
+    //> tok_v_r and lands in every consumer's register-enable cone;
+    //> no token can land in the delay -- the inter-packet gap is
+    //> >= 2 bit times = 8 clks).  ROUTING: pid 13w4 (SETUP) and 9w4
+    //> (IN) and 1w4 (OUT) at endp 0w4 go to ep0; IN/OUT at endp
+    //> 1w4 go to serial; IN/OUT at endp 2w4 only feed ep2's NAK.
     reg ep0_tk_setup_r : Bit on clk {
         initial it <= false
         it <= when {
@@ -2864,15 +2931,12 @@ mod UsbUart {
     }
 
     //> "last valid token was OUT-to-EP0": qualifies EP0's data-stage
-    //> STALL.  During EP_STALL the only data packet EP0 may answer is
-    //> the stalled control transfer's OWN data stage (its token was
-    //> OUT-to-EP0).  Without this qualifier the router handed EVERY
-    //> data packet to a stalled EP0, STALLing the host's bulk-OUT
-    //> writes and killing the echo until the next SETUP (found on
-    //> hardware: the port enumerated but no byte ever flowed after
-    //> the connect script's SET_LINE_CODING stalled).  The token
-    //> precedes its data packet back-to-back, so this register is
-    //> stable across the data packet; the next token re-evaluates it.
+    //> STALL.  While EP0 stalls, the only data packet EP0 may own is
+    //> the stalled transfer's OWN data stage (its token was
+    //> OUT-to-EP0); every other data packet is left for serial or
+    //> ignored.  The token precedes its data packet back-to-back, so
+    //> this register is stable across the data packet; the next token
+    //> re-evaluates it.
     reg last_out_ep0 : Bit on clk {
         initial it <= false
         it <= when {
@@ -2885,14 +2949,13 @@ mod UsbUart {
     //> Data packet router: the module expecting a data packet owns
     //> it.  EP0's strobe is REGISTERED one clk after arrival: the
     //> rxpkt EOP outputs (dt_len = bc-2, dt_crc_ok = the 16-bit
-    //> residual compare) carry wide cones, and fanning them into
-    //> EP0's accept enables in the ARRIVAL cycle was the critical
-    //> path.  Every field EP0 reads holds until the next packet's
-    //> EOP, so the delayed read is bit-identical; the +1 clk is free
-    //> (no token can land in the delay).  usb::Serial keeps the
-    //> arrival-cycle strobe: its accept decision is already
-    //> registered one clk later (dt_acc/dt_rej), so its cone was
-    //> never critical.
+    //> residual compare) carry wide cones, so gating them into EP0's
+    //> accept enables in the arrival cycle is a long path.  Every
+    //> field EP0 reads holds until the next packet's EOP, so the
+    //> delayed read is bit-identical; the +1 clk is free (no token
+    //> can land in the delay).  usb::Serial keeps the arrival-cycle
+    //> strobe: its accept decision is already registered one clk
+    //> later (dt_acc/dt_rej), so its cone is not critical.
     wire ep0_data_take : Bit {
         it := ep0.ep0_busy || (ep0.ep0_stalling && last_out_ep0)
     }
@@ -2929,8 +2992,8 @@ mod UsbUart {
     //> every token gets a NAK.  REGISTERED (a combinational NAK off
     //> the token router would drag the whole token-decode cone into
     //> the tx engine's state logic; the response comes 1 clk later,
-    //> still far inside the turnaround budget).  NB: rst ONLY, no
-    //> bus_reset -- exactly as the vendored body.
+    //> still far inside the turnaround budget).  Reset by rst ONLY,
+    //> not bus_reset.
     reg ep2_nak_req : Bit on clk {
         initial it <= false
         it <= when {
@@ -2950,8 +3013,9 @@ mod UsbUart {
         it := ep0_resp_req || ser_resp_req || ep2_nak_req
     }
 
-    //> In-flight response owner: 0 none, 1 ep0, 2 serial, 3 ep2.
-    //> NB: rst ONLY, no bus_reset -- exactly as the vendored body.
+    //> In-flight response owner: 0 none, 1 ep0, 2 serial, 3 ep2
+    //> (ep2 is the registered NAK, the else arm of the start mux).
+    //> Reset by rst ONLY, not bus_reset.
     reg tx_owner : Word[2] on clk {
         initial it <= 0w2
         it <= when {
@@ -2986,13 +3050,12 @@ mod UsbUart {
     //> A fresh bulk-IN arm pops min(count,64) bytes from the tx FIFO
     //> into the snapshot RAM one byte per clk (byte 0 is first
     //> needed ~72+ clks after the arm, so the load always wins the
-    //> race).  Termination is a COUNTDOWN, not an address compare:
-    //> rem loads the packet length at arm and decrements once per
-    //> popped byte; the last byte is being written when rem == 1,
-    //> i.e. any(rem[7..1]) -- a 6-input OR into load_run's D; li's
-    //> increment feeds only its own D (the old li-vs-len compare was
-    //> the vir-flow critical path).  Byte schedule identical: one
-    //> pop per clk, snap[0..len-1] in order.
+    //> race).  Termination is a COUNTDOWN: rem loads the packet
+    //> length at arm and decrements once per popped byte; the last
+    //> byte is being written when rem == 1, i.e. any(rem[7..1]) -- a
+    //> 6-input OR into load_run's D; li's increment feeds only its
+    //> own D.  Byte schedule: one pop per clk, snap[0..len-1] in
+    //> order.
     wire arm_fresh : Bit {
         it := tx_start && ser_resp_req && serial.resp_fresh
     }
@@ -3023,10 +3086,9 @@ mod UsbUart {
             else => it
         }
     }
-    //> The snapshot RAM instance.  we fires exactly where the
-    //> vendored body wrote: a load step -- not the arm cycle, not
-    //> reset (all three terms are current-cycle, so the write edge
-    //> is bit-identical).
+    //> The snapshot RAM instance.  we fires on a load step -- not
+    //> the arm cycle, not reset -- so each write edge lands exactly
+    //> where load_run (and its gated pop) say it should.
     mod snapram of SnapRam {
         it.clk := clk
         it.we  := load_run && !arm_fresh && !(rst || bus_reset)
@@ -3058,7 +3120,7 @@ mod UsbUart {
         }
     }
     //> The latched EP0 response base: page start + transfer offset,
-    //> latched at arm.  NB: rst ONLY -- exactly as the vendored body.
+    //> latched at arm.  Reset by rst ONLY, not bus_reset.
     reg rom_base_r : Word[8] on clk {
         initial it <= 0w8
         it <= when {
@@ -3117,17 +3179,15 @@ mod UsbUart {
     }
 
     //> The 16-deep tx FIFO.  The write gate is REGISTERED
-    //> (txfifo_wr_d): the old comb gate at the write edge put the cnt
-    //> full-compare into every byte's write-enable cone (via the
-    //> echo's do_push chain) -- the vir-flow critical path, 21.8 ns.
-    //> A registered gate is safe here: the overflow scenario the
-    //> comb gate feared needs TWO pushes within 1 clk, and the echo
-    //> pushes at most one byte per ~417 clks (single hold slot) and
-    //> is the only writer of this FIFO.  tx_data (the echo's
-    //> hold_data) is stable across the +1 clk: it only changes on
-    //> the next receiver byte, >= 417 clks later.  rd_en is the
-    //> snapshot loader's pop (the only popper, popping exactly
-    //> min(count,64) counted at arm).
+    //> (txfifo_wr_d) so the cnt full-compare stays out of every
+    //> byte's write-enable cone.  A registered gate is safe here:
+    //> the overflow scenario (two pushes within 1 clk) cannot occur
+    //> because the echo in src/top.vir pushes at most one byte per
+    //> ~417 clks (single hold slot) and is the only writer of this
+    //> FIFO; tx_data is held stable across the +1 clk (it only
+    //> changes on the next receiver byte, >= 417 clks later).  rd_en
+    //> is the snapshot loader's pop (the only popper, popping
+    //> exactly min(count,64) counted at arm).
     mod txfifo of TxFifo {
         it.clk     := clk
         it.rst     := rst || bus_reset
@@ -3137,32 +3197,28 @@ mod UsbUart {
     }
 
     // ---- rx pop / byte-stream loopback pipe ---------------------------------
-    //> The registered loopback strobe pipeline (three stages on the
+    //> The registered pop-to-consumer pipeline (three stages on the
     //> rx side: the BRAM read is registered): the pop decision, then
     //> the (rx_valid pulse, rx_data byte) pair the consumer latches
     //> one clk after the BRAM read port has produced the popped
-    //> byte.  (the PoC Top wires the loopback: tx_data = rx_data,
-    //> tx_strobe = rx_valid; the pipelined pair keeps the plan §2
-    //> contract and takes the empty/full decode off the single-cycle
-    //> paths)
+    //> byte.  In src/top.vir the consumer is the loopback echo:
+    //> tx_data = rx_data, tx_strobe = rx_valid; the pipelined pair
+    //> takes the empty/full decode off the single-cycle paths.
     reg rx_pop_d : Bit on clk {
         initial it <= false
         it <= when {
             case rst || bus_reset => false
-            // Pop while the rx FIFO has a byte, the tx FIFO keeps the
-            // 3-stage pipe's headroom (cnt <= 12: 16 - 3 in flight -
-            // 1 margin, so a landing push never meets a full txfifo
-            // and the comb write gate never drops a popped byte), AND
-            // the byte-stream consumer signals room (rx_ready -- the
-            // echo server throttles the pop rate to the UART's
-            // 115200 drain; when low the rx FIFO fills, the serial
-            // endpoint NAKs bulk-OUT, the host retries: end-to-end
-            // flow control with no byte loss).  Off-by-one fix (stress
-            // S4c, cnt wrap 0->127): block a pop when the in-flight
-            // pop is consuming the last byte -- the scheduled next
-            // pop would find an empty FIFO and the 7-bit cnt
-            // subtract wraps to 127, draining stale BRAM bytes
-            // forever.
+            // Pop while the rx FIFO has a byte, the tx FIFO keeps
+            // 3-stage-pipe headroom (cnt <= 12: 16 deep - 3 in flight
+            // - 1 margin, so a landing push never meets a full txfifo
+            // and a pop is never silently dropped), AND the byte-
+            // stream consumer signals room (rx_ready -- when low the
+            // rx FIFO fills, the serial endpoint NAKs bulk-OUT, the
+            // host retries: end-to-end flow control with no byte
+            // loss).  Also block a pop when the in-flight pop is
+            // consuming the last byte: the scheduled next pop would
+            // find an empty FIFO and the 7-bit cnt subtract would
+            // wrap to 127, draining stale BRAM bytes forever.
             else => !rxfifo.empty && !(rxfifo.count == 1w7 && it)
                 && (txfifo.count < 13w7) && rx_ready
         }
@@ -3200,15 +3256,12 @@ mod UsbUart {
     //> in order).  wr_en is pre-gated with !full inside rx_push_run's
     //> own D (the serial accept already required cnt+dt_len <= 64),
     //> so the rxfifo write port sees two clean registers.
-    //> Termination is a COUNTDOWN (push_rem): the old `push_i+1 >=
-    //> len` compare rode the increment carry chain into push_i's own
-    //> clock enable -- the vir-flow critical path (22.0 ns).  The
-    //> stop test is a 6-input NOR; push_i's increment feeds only its
-    //> own D.  Byte-exact: push_rem==1 in cycle N means cycle N
-    //> pushes the last byte, so run drops at N's edge exactly where
-    //> the old compare dropped it (push_i visits one extra index in
-    //> the trailing cycle; that read is discarded -- run_d is 0 by
-    //> then).
+    //> Termination is a COUNTDOWN (push_rem): the stop test is a
+    //> 6-input NOR; push_i's increment feeds only its own D.
+    //> Byte-exact: push_rem==1 in cycle N means cycle N pushes the
+    //> last byte, so run drops at N's edge with the last byte
+    //> written (push_i visits one extra index in the trailing
+    //> cycle; that read is discarded -- run_d is 0 by then).
     wire ser_accept : Bit {
         it := ser_resp_req && (serial.resp_pid == 2w4)
     }
@@ -3257,13 +3310,13 @@ mod UsbUart {
     wire tx_room : Word[7] {
         it := 16w7 - txfifo.count
     }
-    //> tx_ready is REGISTERED (+1 clk stale): the echo's do_push
-    //> (its hold_valid clear) then reads only registered terms,
-    //> taking the cnt full-compare out of hold_valid's enable cone.
-    //> Stale room is safe: the echo pushes at most one byte per ~417
-    //> clks (single hold slot) and is the only writer, so no push can
-    //> land inside the 1-clk staleness window; the txfifo_wr_d gate
-    //> re-checks !full at the registered edge as belt-and-braces.
+    //> tx_ready is REGISTERED (+1 clk stale): the consumer's push
+    //> decision then reads only registered terms, keeping the cnt
+    //> full-compare out of its enable cone.  Stale room is safe: the
+    //> only writer pushes at most one byte per ~417 clks (single
+    //> hold slot), so no push can land inside the 1-clk staleness
+    //> window; the txfifo_wr_d gate re-checks !full at the
+    //> registered edge as belt-and-braces.
     reg tx_ready_r : Bit on clk {
         initial it <= false
         it <= !txfifo.full
@@ -3279,8 +3332,9 @@ mod UsbUart {
     }
 
     //> SET_CONFIGURATION completed -> reset the bulk data toggles
-    //> (USB 2.0 §9.1.1.5): edge detect on ep0.configured.  NB: the
-    //> delayed copy is rst ONLY -- exactly as the vendored body.
+    //> (USB 2.0 §9.1.1.5): edge detect on ep0.configured.  The
+    //> delayed copy is reset by rst ONLY (survives bus resets until
+    //> reconfigured).
     reg configured_d : Bit on clk {
         initial it <= false
         it <= when {
@@ -3318,13 +3372,12 @@ mod UsbUart {
 mod UsbController {
     //> 48 MHz board clock.
     incoming clock : Clock
-    //> From UsbPor (instantiated at the top, mirroring the sim TB's
-    //> instantiate-the-pieces topology): high once the ~175 ms power-on
-    //> count is done.
+    //> From UsbPor (instantiated at the top level alongside this
+    //> controller): high once the ~175 ms power-on count is done.
     incoming por_done : Bit
 
-    // Byte-stream interface (plan §2), identical contract to the old
-    // ext mod UsbController this structure replaces.
+    // Byte-stream interface to the byte-stream consumer (the echo
+    // server in src/top.vir).
     //> Byte from the host; valid for one cycle with rx_valid.
     outgoing rx_data   : Word[8]
     //> 1-clk strobe per received byte.
@@ -3335,8 +3388,9 @@ mod UsbController {
     incoming tx_data   : Word[8]
     //> 1-clk push strobe for tx_data.
     incoming tx_strobe : Bit
-    //> Flow control back: low = the rx consumer is full, stop popping
-    //> (the core NAKs bulk-OUT packets instead).
+    //> Flow control from the rx consumer: low = consumer full, stop
+    //> popping (the core NAKs bulk-OUT packets and the host retries
+    //> instead).
     incoming rx_ready  : Bit
 
     //> The core is receiving data (host -> device); stretched ~175 ms
@@ -3348,7 +3402,7 @@ mod UsbController {
 
     // Pad-facing side: unidirectional wires to/from the UsbPads ext
     // mod (wired by export mod Top in src/top.vir).
-    //> D+ drive level out to UsbPads.
+    //> D+ drive level out to UsbPads (gated by output_enable).
     outgoing dp_tx         : Bit
     //> D- drive level out to UsbPads.
     outgoing dn_tx         : Bit
@@ -3359,19 +3413,21 @@ mod UsbController {
     //> D- pad sample in from UsbPads.
     incoming dn_rx         : Bit
 
-    //> The core reset is REGISTERED one clk behind por_done: the
-    //> por_done flop must sit next to the usb_dp_pu pad (its dominant
-    //> load), and a pad-adjacent flop sourcing the core-wide reset
-    //> forced the placer to route the reset OUT of the IO region and
-    //> back into the fabric (the 4.9 ns first hop of the vir-flow
-    //> critical path).  A dedicated flop with no IO load is placed in
-    //> the core region instead.  +1 clk of reset assertion at a
-    //> ~175 ms POR is free; the core still leaves reset before it can
-    //> drive the bus (output_enable is gated by the in-reset core).
+    //> The core reset is REGISTERED one clk behind por_done: a
+    //> pad-adjacent flop (por_done sits next to the usb_dp_pu pad)
+    //> sourcing the core-wide reset forces the reset net into the IO
+    //> region and back into the fabric, costing the critical path a
+    //> long first hop.  A dedicated fabric flop (no IO load) sources
+    //> core_rst instead; the extra +1 clk of reset assertion during
+    //> the ~175 ms POR is free.  The core still leaves reset before
+    //> it can drive the bus (output_enable is gated by the in-reset
+    //> core).
     reg por_rst : Bit on clock {
         initial it <= false
         it <= por_done
     }
+    //> Synchronous reset for the whole core (inverted por_rst, so
+    //> high while power-on and for one clk after por_done rises).
     wire core_rst : Bit {
         it := !por_rst
     }
