@@ -16,7 +16,7 @@
 //   usb_fifo16x8          16x8 sync FIFO
 //   (usb_rx_phy, the RX PHY, migrated to src/usb.vir as usb::RxPhy)
 //   usb_rx_packet         bit stream -> packet records
-//   usb_tx_phy            packet records -> pads
+//   (usb_tx_phy, the TX PHY, migrated to src/usb.vir as usb::TxPhy)
 //   usb_ep0               control SM + CDC requests (USB 2.0 §8.5.5)
 //   usb_serial            EP1 OUT/IN bulk protocol (toggles, ACK/NAK)
 //   usb_uart              core top: ROM, router, arbiter, FIFOs, loopback
@@ -527,304 +527,6 @@ module usb_rx_packet(
 endmodule
 
 // ===========================================================================
-// usb_tx_phy — packet records -> pads.
-//
-// A bit-time engine: every transmitted bit time is 4 clk cycles (btc 0..3).
-// `s` is the raw bit index of the NEXT bit time to be computed; the level
-// for it is registered at the btc==3 edge of the current bit time (one clk
-// before it drives).  Raw stream: sync 00000001 (bits 0..7), PID byte
-// (8..15), payload (16..16+8L-1, LSB first, pulled byte-by-byte via
-// tx_byte/tx_addr), CRC16 wire bits (data pids only).  A stuffed-0 bit
-// time is inserted after six consecutive raw 1s (the run counter counts
-// raw bits only and is cleared entering the PID; the sync pattern is
-// exempt).  The CRC16 LFSR is fed each payload raw bit at btc==0 of its
-// bit time, so the final state is stable 3+ clks before the first CRC
-// wire bit time is computed.  EOP: 2 bit times SE0 + 1 bit time J, then
-// release.  Handshake pids send sync + PID + EOP only.  An 8-clk (2 bit
-// times) guard precedes SOP; response SOP lands ~11 clks (~2.75 bit
-// times) after the triggering packet's EOP — well inside the USB 2.0
-// device turnaround window.
-// ===========================================================================
-module usb_tx_phy(
-    input  wire        clk,
-    input  wire        rst,
-    input  wire        tx_start,   // 1-clk pulse: begin packet
-    input  wire [3:0]  tx_pid,
-    input  wire [6:0]  tx_len,     // payload byte count (0..64; 0 => ZLP)
-    input  wire [7:0]  tx_byte,    // producer data (comb, at tx_addr)
-    output wire [6:0]  tx_addr,    // byte index currently consumed
-    output wire [6:0]  tx_addr_next,// byte index of the NEXT bit time's byte
-    output wire        tx_busy,
-    output wire        tx_done,    // 1-clk pulse at packet release
-    output wire        dp,
-    output wire        dn,
-    output wire        oe
-);
-    localparam [2:0] S_IDLE = 3'd0, S_GUARD = 3'd1,
-                     S_DATA = 3'd2, S_EOP0 = 3'd3, S_EOPJ = 3'd4;
-
-    reg [2:0] state;
-    reg [1:0] btc;            // clk phase within the current bit time
-    reg [2:0] gcnt;           // guard clk counter
-    reg [2:0] ecnt;           // EOP bit-time counter
-    reg [9:0] s;              // raw bit index of the next bit time
-    reg [3:0] pid_r;
-    reg [6:0] len_r;
-    reg       lvl;            // current drive level: 0 = J, 1 = K
-    reg [2:0] ones;           // consecutive raw 1s (stuff run)
-    reg       stuff_pending;  // next bit time is a stuffed 0
-    reg       cur_stuff;      // current bit time is a stuffed 0
-    reg       oe_r;
-    reg       done_r;
-
-    wire is_data = (pid_r[1:0] == 2'b11);
-    // payload_end / total_bits are registered at packet start (the
-    // {3'b0, len_r, 3'b0} adder would otherwise sit inside the
-    // raw-bit comparison path)
-    reg [9:0] payload_end_r, total_bits_r;
-    reg [9:0] payload_end_m1_r;   // payload_end-1, precomputed at arm
-    // (s < total_bits_r) REGISTERED one cycle ahead: the 10-bit compare
-    // is a carry chain, and it fed cur_stuff's D-cone every bit time
-    // (the tx-engine critical path).  s changes only at btc==3 edges, so
-    // the flag captured at the previous cycle is exact at the decision
-    // edge — +0 clk latency, the compare cone now ends at its own
-    // register.
-    reg       s_lt_end_r;
-    // Bit-time phase decisions are REGISTERED one clk ahead: at btc==2
-    // the engine latches "final guard cycle" (guard_last_r) / "last clk
-    // of the bit time" (bit_end_r), so every enable below reads a 1-bit
-    // register instead of a btc==3 / gcnt==7 compare cone.  The raw
-    // compares chained through 4 enable LUTs into s's clock enable —
-    // the vir-flow critical path (22.5 ns).
-    reg       guard_last_r;   // final S_GUARD cycle (gcnt == 7)
-    reg       bit_end_r;      // last clk of a bit time (DATA/EOP0/EOPJ)
-    // The CRC wire bits are SHIFTED out of a register instead of muxed
-    // live from the LFSR: raw_bit's CRC branch computed
-    // 15 - (s - payload_end_r) — a per-cycle 10-bit subtract + compare
-    // cone off the crc16 flops, the vir-flow critical path (21.7 ns).
-    // crc_shift is loaded with the final wire-ordered CRC at the edge
-    // that consumes the last payload raw bit (the LFSR is final there:
-    // its advance fired at that bit time's btc==2) and shifts right
-    // once per consumed raw bit; raw_bit's CRC branch is then a single
-    // register bit.  Stuffed bit times don't shift (they consume no
-    // raw bit); a re-load on the following edge is harmless (the LFSR
-    // is static there, so the value is identical).
-    reg [15:0] crc_shift;
-    reg        crc_load_r;     // 1 while s holds the last payload raw bit
-
-    // producer byte pipeline: tx_addr leads the engine's read by one
-    // bit time (s advances at the btc==3 edge, the byte is stable for
-    // the whole 4-clk bit time), so one register stage splits the big
-    // producer mux (64:1 snapshot / descriptor ROM) out of the
-    // single-cycle engine path.  The engine reads tx_byte_r only.
-    reg [7:0] tx_byte_r;
-    // load once per payload byte.  The engine is a one-bit-time
-    // lookahead: during bit time k, s = k+1, and bit 0 of byte b
-    // (s = 16+8b) is CONSUMED at the end of the previous byte's last bit
-    // time.  So the reload fires when s[2:0]==0 (s = 16+8b, during byte
-    // b-1's bit 7); the registered producer (snap_q / desc_q /
-    // ep0_small_q) holds THIS byte's data from the previous byte's fetch
-    // window, and the single load per byte keeps it stable through all
-    // eight bit times.
-    always @(posedge clk)
-        if (state == S_DATA && btc == 2'd0 && (s[2:0] == 3'd0)
-                && (s >= 10'd16))
-            tx_byte_r <= tx_byte;
-
-    // raw bit f(s): sync, PID, payload (LSB first), CRC wire bits.
-    // f(s) is evaluated against the REGISTERED s (stable for the whole
-    // 4-clk bit time), then pipelined into raw_bit_r: the engine reads
-    // raw_bit_r one clk later, which splits the compare/select chain
-    // and the stuff/NRZI tail into separate cycles.
-    reg raw_bit;
-    always @* begin
-        if (s < 10'd8)
-            // sync = 00000001 (bit 7 is the trailing 1)
-            raw_bit = (s == 10'd7);
-        else if (s < 10'd16)
-            // PID byte: {~pid[3:0], pid[3:0]}, LSB first
-            raw_bit = (s[2:0] < 4'd4) ? pid_r[s[2:0]]
-                                     : ~pid_r[s[2:0] - 4'd4];
-        else if (is_data && (s < payload_end_r))
-            raw_bit = tx_byte_r[(s - 10'd16) & 7];
-        else if (is_data)
-            // CRC16 wire bits, shifted out of crc_shift MSB-first
-            // (see the crc_shift declaration comment)
-            raw_bit = crc_shift[15];
-        else
-            raw_bit = 1'b0;      // unreachable for handshake pids
-    end
-    reg raw_bit_r;
-    always @(posedge clk) raw_bit_r <= raw_bit;
-
-    wire [15:0] u_crc16_crc;
-    \usb::Crc16 u_crc16 (
-        .clk(clk),
-        .rst(tx_start),
-        .adv(state == S_DATA && (btc == 2'd2) && !cur_stuff
-             && is_data && (s >= 10'd16) && (s < payload_end_r)),
-        .din(raw_bit_r),
-        .crc(u_crc16_crc));
-
-    // byte index requested from the producer.  Pure bit-slice of s (no
-    // state term): the engine only reads payload bits while
-    // 16 <= s < payload_end, which only happens in S_DATA, so the value
-    // outside S_DATA is a don't-care — keeping the producer path short
-    // matters (the snap/ROM mux + tx_byte_r stage is the critical path).
-    wire [9:0] s_m16 = s - 10'd16;
-    assign tx_addr = s_m16[9:3];
-    // next byte's index, byte-stable: during bit time k, s = k+1, so
-    // (s-9)>>3 equals b for EVERY bit time of byte b-1 (and 0 during the
-    // PID byte) — a registered copy addresses the source one byte ahead
-    // without flipping mid-byte
-    wire [9:0] s_m9 = s - 10'd9;
-    assign tx_addr_next = s_m9[9:3];
-
-    // pad drive: J/K/SE0 (levels only matter while oe_r is set)
-    assign dp = (state == S_EOP0) ? 1'b0 : (lvl ? 1'b0 : 1'b1);
-    assign dn = (state == S_EOP0) ? 1'b0 : (lvl ? 1'b1 : 1'b0);
-    assign oe = oe_r;
-
-    assign tx_busy = (state != S_IDLE);
-    assign tx_done = done_r;
-
-    always @(posedge clk) begin
-        if (rst) begin
-            state <= S_IDLE;
-            btc <= 2'd0;
-            gcnt <= 3'd0;
-            ecnt <= 3'd0;
-            s <= 10'd0;
-            pid_r <= 4'd0;
-            len_r <= 7'd0;
-            lvl <= 1'b0;
-            ones <= 3'd0;
-            stuff_pending <= 1'b0;
-            cur_stuff <= 1'b0;
-            oe_r <= 1'b0;
-            done_r <= 1'b0;
-            s_lt_end_r <= 1'b0;
-            guard_last_r <= 1'b0;
-            bit_end_r <= 1'b0;
-            crc_shift <= 16'd0;
-            crc_load_r <= 1'b0;
-            payload_end_m1_r <= 10'd0;
-        end else begin
-            done_r <= 1'b0;
-            s_lt_end_r <= (s < total_bits_r);
-            guard_last_r <= (state == S_GUARD) && (gcnt == 3'd6);
-            bit_end_r    <= ((state == S_DATA) || (state == S_EOP0)
-                          || (state == S_EOPJ)) && (btc == 2'd2);
-            crc_load_r   <= (state == S_DATA)
-                         && (s == payload_end_m1_r);
-
-            case (state)
-            S_IDLE: begin
-                if (tx_start) begin
-                    pid_r <= tx_pid;
-                    len_r <= tx_len;
-                    payload_end_r <= {3'b0, tx_len, 3'b0} + 10'd16;
-                    payload_end_m1_r <= {3'b0, tx_len, 3'b0} + 10'd15;
-                    total_bits_r  <= {3'b0, tx_len, 3'b0}
-                                   + ((tx_pid[1:0] == 2'b11)
-                                      ? 10'd32 : 10'd16);
-                    state <= S_GUARD;
-                    gcnt  <= 3'd0;
-                end
-            end
-            S_GUARD: begin
-                // 8 clks (2 bit times) inter-packet guard, bus released.
-                // guard_last_r is 1 exactly in the final guard cycle
-                // (registered one clk ahead, from gcnt==6).
-                if (guard_last_r) begin
-                    state <= S_DATA;
-                    btc   <= 2'd0;
-                    s     <= 10'd1;     // bit time 0 (K) computed here
-                    lvl   <= ~lvl;      // sync bit 0 is a 0: J -> K
-                    ones  <= 3'd0;
-                    stuff_pending <= 1'b0;
-                    cur_stuff <= 1'b0;
-                    oe_r  <= 1'b1;
-                end else
-                    gcnt <= gcnt + 3'd1;
-            end
-            S_DATA: begin
-                // bit-time engine: at the bit end (bit_end_r, the
-                // registered btc==3 flag) compute the next bit time
-                if (bit_end_r) begin
-                    btc <= 2'd0;
-                    cur_stuff <= 1'b0;
-                    if (stuff_pending) begin
-                        // stuffed 0 bit time (raw index not consumed)
-                        lvl <= ~lvl;
-                        stuff_pending <= 1'b0;
-                        ones <= 3'd0;
-                        cur_stuff <= 1'b1;
-                    end else if (s_lt_end_r) begin
-                        // raw bit time s (flag registered 1 clk ahead —
-                        // exact, see the declaration comment)
-                        lvl <= raw_bit_r ? lvl : ~lvl;
-                        if (s == 10'd8)
-                            ones <= 3'd0;    // run counter fresh at the PID
-                        else if (raw_bit_r) begin
-                            if (ones == 3'd5) begin
-                                stuff_pending <= 1'b1;
-                                ones <= 3'd0;
-                            end else
-                                ones <= ones + 3'd1;
-                        end else
-                            ones <= 3'd0;
-                        s <= s + 10'd1;
-                        crc_shift <= {crc_shift[14:0], 1'b0};
-                    end else begin
-                        // raw stream complete: EOP (SE0, 2 bit times)
-                        state <= S_EOP0;
-                        ecnt  <= 3'd0;
-                        btc   <= 2'd0;
-                    end
-                end else
-                    btc <= btc + 2'd1;
-            end
-            S_EOP0: begin
-                if (bit_end_r) begin
-                    btc <= 2'd0;
-                    if (ecnt == 3'd1) begin
-                        state <= S_EOPJ;
-                        lvl   <= 1'b0;     // J for the EOP's last bit time
-                    end else
-                        ecnt <= ecnt + 3'd1;
-                end else
-                    btc <= btc + 2'd1;
-            end
-            S_EOPJ: begin
-                if (bit_end_r) begin
-                    btc    <= 2'd0;
-                    oe_r   <= 1'b0;        // release the bus
-                    done_r <= 1'b1;
-                    state  <= S_IDLE;
-                end else
-                    btc <= btc + 2'd1;
-            end
-            endcase
-            // CRC load overrides the shift on the edge that consumes
-            // the last payload raw bit (see the crc_shift declaration
-            // comment).  A re-load on the stuffed-bit-time edge that
-            // may follow is harmless: the LFSR is static there, so the
-            // captured value is identical.
-            if (bit_end_r && crc_load_r)
-                crc_shift <= ~{u_crc16_crc[15], u_crc16_crc[14],
-                               u_crc16_crc[13], u_crc16_crc[12],
-                               u_crc16_crc[11], u_crc16_crc[10],
-                               u_crc16_crc[9],  u_crc16_crc[8],
-                               u_crc16_crc[7],  u_crc16_crc[6],
-                               u_crc16_crc[5],  u_crc16_crc[4],
-                               u_crc16_crc[3],  u_crc16_crc[2],
-                               u_crc16_crc[1],  u_crc16_crc[0]};
-        end
-    end
-endmodule
-
-// ===========================================================================
 // usb_ep0 — control transfer state machine (USB 2.0 §8.5.5) + CDC requests.
 //
 // Supported: GET_DESCRIPTOR (device/config/string), SET_ADDRESS (latched
@@ -836,7 +538,7 @@ endmodule
 // device data stage starts at DATA1; the status-stage data packet is a
 // zero-length DATA1 packet: the DEVICE sends it in response to an IN token
 // (control write / no data stage) and ACKs the host's DATA1 ZLP after an
-// OUT token (control read).  Descriptor bytes are pulled by usb_tx_phy
+// OUT token (control read).  Descriptor bytes are pulled by usb::TxPhy
 // from the usb_uart ROM via (resp_sel, resp_base + tx_addr).
 //
 // Request pipeline (48 MHz timing; each stage is one clk):
@@ -2112,12 +1814,12 @@ module \usb::UsbUart (
                       : desc_q;
 
     wire [6:0] tx_addr_next_w;
-    usb_tx_phy u_txphy(
+    \usb::TxPhy u_txphy (
         .clk(clk), .rst(rst),
         .tx_start(tx_start), .tx_pid(tx_pid_w), .tx_len(tx_len_w),
         .tx_byte(tx_byte), .tx_addr(), .tx_addr_next(tx_addr_next_w),
         .tx_busy(tx_busy), .tx_done(tx_done),
-        .dp(dp_tx), .dn(dn_tx), .oe(output_enable));
+        .dp(dp_tx), .dn(dn_tx), .output_enable(output_enable));
 
     // SET_CONFIGURATION completed -> reset bulk data toggles (§9.1.1.5)
     reg configured_d;

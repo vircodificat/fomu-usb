@@ -66,12 +66,12 @@ module tb_usb_phy;
     wire [6:0] tx_addr;
     wire [7:0] tx_byte = tx_bytes[tx_addr];
     wire tx_busy, tx_done, dut_dp, dut_dn, dut_oe;
-    usb_tx_phy txphy(
+    \usb::TxPhy txphy(
         .clk(clk), .rst(rst),
         .tx_start(tx_start), .tx_pid(tx_pid), .tx_len(tx_len),
         .tx_byte(tx_byte), .tx_addr(tx_addr),
         .tx_busy(tx_busy), .tx_done(tx_done),
-        .dp(dut_dp), .dn(dut_dn), .oe(dut_oe));
+        .dp(dut_dp), .dn(dut_dn), .output_enable(dut_oe));
     assign usb_dp = dut_oe ? dut_dp : 1'bz;
     assign usb_dn = dut_oe ? dut_dn : 1'bz;
 

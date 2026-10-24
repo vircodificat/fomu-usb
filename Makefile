@@ -27,7 +27,7 @@ PADS_SV  := ext/usb_pads.sv
 POR_SV   := ext/usb_por.sv
 ECHO_SV  := ext/echo_fifo.sv
 EXT_SRVS := $(USB_SRVS) $(PADS_SV) $(POR_SV) $(ECHO_SV)
-USB_BUILD := build/usb.sv build/echo.sv build/uart.sv
+USB_BUILD := build/builtin.sv build/usb.sv build/echo.sv build/uart.sv
 
 # Testbench sources.  tb/usb_host_bfm.v is an include file (tasks/macros
 # meant to be `include`d inside a TB module) and is never compiled on its own.
@@ -83,12 +83,12 @@ build:
 test: build test-crc test-usb-phy test-usb-serial
 
 test-crc: tools
-	$(IVERILOG) -g2012 -gspecify -o build/tb_crc.vvp $(USB_SRVS) build/usb.sv tb/tb_crc.v
+	$(IVERILOG) -g2012 -gspecify -o build/tb_crc.vvp $(USB_SRVS) build/builtin.sv build/usb.sv tb/tb_crc.v
 	$(VVP) build/tb_crc.vvp
 
 test-usb-phy: tools
 	$(IVERILOG) -g2012 -gspecify -o build/tb_usb_phy.vvp \
-	    $(USB_SRVS) build/usb.sv tb/usb_host_bfm.v tb/tb_usb_phy.v
+	    $(USB_SRVS) build/builtin.sv build/usb.sv tb/usb_host_bfm.v tb/tb_usb_phy.v
 	$(VVP) build/tb_usb_phy.vvp
 
 test-usb-serial: tools
