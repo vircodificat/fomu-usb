@@ -2,12 +2,15 @@
 // Part of ~/projects/fomu-usb (see FOMU_UART_OVER_USB_PLANv2.md §7).
 // Hand-written Verilog-2005 for iverilog.
 //
-// Instantiates the ext core `\top::FomuTop` directly (ext/fomu_top.sv,
-// with sb_io_sim for the pads): the Virdant platform wrapper (the
-// generated build/top.sv `module Top`, from src/top.vir's
-// `export mod Top for ice40::Fomu`) ties usb_dp_pu/led_* constant and
-// has no POR_CYCLES parameter, so the full-device acceptance runs
-// against the ext core, not the wrapper — on a dp/dn net pair with
+// Instantiates the post-split pieces directly (with sb_io_sim for the
+// pads), mirroring export mod Top in src/top.vir: the ext POR
+// (\usb::UsbPor, POR_CYCLES parameterized so sim can shorten it), the
+// Virdant USB controller (the generated build/usb.sv
+// \usb::UsbController), and the ext SB_IO pad pair (\usb::UsbPads,
+// ext/usb_pads.sv -- the only `inout` in the design).  The Virdant
+// platform wrapper (the generated build/top.sv `module Top`) ties
+// usb_dp_pu/led_* constant and has no parameters, so the full-device
+// acceptance runs against the pieces — on a dp/dn net pair with
 // the BFM, exercising the plan's acceptance sequence:
 //   1. reset; wait for usb_dp_pu (connect)
 //   2. enumerate (device descriptor, SET_ADDRESS(42), config descriptor,
@@ -35,13 +38,20 @@ module tb_usb_serial;
     integer sof_frame = 0;
 
     // ------------------------------------------------------------------
-    // DUT (short POR for sim; hardware default is ~175 ms)
+    // DUT (short POR for sim; hardware default is ~175 ms) -- the
+    // post-split topology of export mod Top in src/top.vir.
     // ------------------------------------------------------------------
-    wire usb_dp_pu, rxing, txing;
-    \top::FomuTop #(.POR_CYCLES(24'd200)) dut(
+    wire por_done;
+    \usb::UsbPor #(.POR_CYCLES(24'd200)) por(
+        .clock(clk), .por_done(por_done));
+
+    wire usb_dp_pu = por_done;    // wired at the top in src/top.vir
+    wire rxing, txing;
+    wire dp_tx, dn_tx, output_enable, dp_rx, dn_rx;
+
+    \usb::UsbController dut(
         .clock(clk),
-        .usb_dp(usb_dp), .usb_dn(usb_dn),
-        .usb_dp_pu(usb_dp_pu),
+        .por_done(por_done),
         .rxing(rxing), .txing(txing),
         // byte-stream interface (the Virdant echo server consumes it,
         // exactly as the platform top in build/top.sv wires it)
@@ -50,7 +60,16 @@ module tb_usb_serial;
         .tx_ready(core_tx_ready),
         .tx_data(echo_tx_data),
         .tx_strobe(echo_tx_strobe),
-        .rx_ready(echo_room));
+        .rx_ready(echo_room),
+        // pad-facing side (wired to \usb::UsbPads below, as src/top.vir
+        // wires it)
+        .dp_tx(dp_tx), .dn_tx(dn_tx), .output_enable(output_enable),
+        .dp_rx(dp_rx), .dn_rx(dn_rx));
+
+    \usb::UsbPads pads(
+        .usb_dp(usb_dp), .usb_dn(usb_dn),
+        .dp_tx(dp_tx), .dn_tx(dn_tx), .output_enable(output_enable),
+        .dp_rx(dp_rx), .dn_rx(dn_rx));
 
     // The Virdant echo server (generated Verilog from src/echo.vir) and
     // the raw UART loop wires -- mirrors export mod Top in src/top.vir:
@@ -466,7 +485,7 @@ module tb_usb_serial;
         req[0] = 8'h00; req[1] = 8'h09; req[2] = 8'h01; req[3] = 8'h00;
         req[4] = 8'h00; req[5] = 8'h00; req[6] = 8'h00; req[7] = 8'h00;
         ctrl_no_data(7'd42);
-        check(dut.u_core.u_ep0.configured === 1'b1, "S2: configured");
+        check(dut.core.u_ep0.configured === 1'b1, "S2: configured");
 
         // ---------------------------------------------------------------
         // 3. negative: token to the OLD address (0) must get NO response
@@ -605,8 +624,8 @@ module tb_usb_serial;
         $display("--- S7: bus reset (10 ms SE0)");
         host.host_reset;
         host.host_idle(256);
-        check(dut.u_core.u_ep0.dev_addr === 7'd0, "S7: address back to 0");
-        check(dut.u_core.u_ep0.configured === 1'b0, "S7: unconfigured");
+        check(dut.core.u_ep0.dev_addr === 7'd0, "S7: address back to 0");
+        check(dut.core.u_ep0.configured === 1'b0, "S7: unconfigured");
 
         $display("--- S7: re-enumerate at address 7");
         req[0] = 8'h80; req[1] = 8'h06; req[2] = 8'h00; req[3] = 8'h01;
@@ -658,10 +677,10 @@ module tb_usb_serial;
     // Instrumentation: monitor the core's RX packet CRC and length
     // --------------------------------------------------------------
     always @(posedge clk) begin
-        if (dut.u_core.u_rxpkt.dt_valid) begin
+        if (dut.core.u_rxpkt.dt_valid) begin
             $display("[%0t] RX pkt: dt_len=%0d dt_crc_ok=%b",
-                     $time, dut.u_core.u_rxpkt.dt_len,
-                     dut.u_core.u_rxpkt.dt_crc_ok);
+                     $time, dut.core.u_rxpkt.dt_len,
+                     dut.core.u_rxpkt.dt_crc_ok);
         end
     end
 

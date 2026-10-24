@@ -1,0 +1,155 @@
+//> The USB controller, in Virdant.
+//>
+//> This is the "rest of the USB controller" half of the Virdant/Verilog
+//> split (see wiki/top-vir.md and HANDOFF.md): everything between the
+//> byte stream and the pads except the two things Virdant cannot
+//> express -- the bidirectional USB pads (UsbPads, ext) and the
+//> parameterized power-on reset (UsbPor, ext; the TB overrides
+//> POR_CYCLES, which only a hand-written Verilog body can offer).
+//>
+//> Topology (wired by export mod Top in src/top.vir):
+//>
+//>     UsbPor (ext, ~175 ms) --por_done--> UsbController --byte stream--> echo
+//>     UsbController --dp_tx/dn_tx/output_enable--> UsbPads (ext, SB_IO)
+//>     UsbPads --dp_rx/dn_rx--> UsbController
+//>
+//> The pad-facing side is deliberately UNIDIRECTIONAL: the only
+//> bidirectional nets in the whole design live inside UsbPads.
+
+//> The two USB D+/D- tristate pad cells (iCE40 SB_IO, PIN_TYPE
+//> 6'b101001) -- the one ext mod that touches a bidirectional net.
+//> Body in ext/usb_pads.sv.  From Virdant's point of view every wire
+//> here is unidirectional: we drive the pad via dp_tx/dn_tx gated by
+//> output_enable, and sample it back via dp_rx/dn_rx; the electrical
+//> bidirectionality never crosses this boundary (the ext body's
+//> `inout` port declarations are the Verilog-side plumbing that gets
+//> the SB_IO PACKAGE_PIN nets out to the Top ports / PCF pins).
+ext mod UsbPads {
+    //> Pad side, out to the Top ports (PCF pins A1/A2).
+    outgoing usb_dp : Bit
+    outgoing usb_dn : Bit
+    //> Core side, into the pads: drive levels and the tristate control.
+    incoming dp_tx         : Bit
+    incoming dn_tx         : Bit
+    incoming output_enable : Bit
+    //> Core side, out of the pads: pad samples.
+    outgoing dp_rx : Bit
+    outgoing dn_rx : Bit
+}
+
+//> Power-on reset: counts to POR_CYCLES at 48 MHz, then releases
+//> `por_done`.  The default (~8.4M cycles = ~175 ms) is how long the
+//> device waits before releasing the D+ pull-up and attaching to the
+//> host; testbenches override it to a few hundred cycles.  The
+//> parameter lives in the hand-written Verilog body
+//> (ext/usb_por.sv) so the sim TB can override it at instantiation --
+//> a plain Virdant `mod` would bake the count into generated code the
+//> TB cannot reach.
+//>
+//> NB: Virdant's `@parameter` annotation mechanism (declared on an ext
+//> mod def, overridden at the instantiation) was tried here and DOES
+//> elaborate -- but its Verilog emission is currently broken: a
+//> trailing comma after the last `#(.NAME(value))` entry whenever the
+//> ext mod has ports, which iverilog rejects (yosys tolerates it).
+//> Left unused until upstream fixes the emitter; the body's Verilog
+//> `parameter` is the parameterization that matters for the TB.
+ext mod UsbPor {
+    incoming clock  : Clock
+    outgoing por_done : Bit
+}
+
+//> The USB Full-Speed CDC-ACM device core, vendored Verilog
+//> (ext/usb_uart.sv, module inventory in its file header).  This is
+//> the migration boundary: the core stays an ext mod today and its
+//> internals (usb_crc5/16, usb_fifo16x8, usb_rx_phy, usb_rx_packet,
+//> usb_tx_phy, usb_ep0, usb_serial) move into .vir one at a time, all
+//> with unidirectional interfaces.
+ext mod UsbUart {
+    incoming clk : Clock
+    //> Synchronous reset, active high.  Fed by the registered
+    //> por_done below (one clk behind UsbPor's release) -- see
+    //> ext/usb_controller.sv's placement note in git history for why
+    //> the extra register stage is load-bearing.
+    incoming rst : Bit
+    //> Pad side: samples in, drive levels + tristate control out.
+    incoming dp_rx         : Bit
+    incoming dn_rx         : Bit
+    outgoing dp_tx         : Bit
+    outgoing dn_tx         : Bit
+    outgoing output_enable : Bit
+    //> Byte-stream interface (plan §2); the echo server consumes it.
+    outgoing rx_data   : Word[8]
+    outgoing rx_valid  : Bit
+    outgoing tx_ready  : Bit
+    incoming tx_data   : Word[8]
+    incoming tx_strobe : Bit
+    incoming rx_ready  : Bit
+    //> USB activity indicators (stretched ~175 ms past the last byte;
+    //> mapped onto the heartbeat LEDs by the platform top).
+    outgoing rxing : Bit
+    outgoing txing : Bit
+}
+
+mod UsbController {
+    incoming clock : Clock
+    //> From UsbPor (instantiated at the top so the sim TB can
+    //> parameterize it): high once the ~175 ms power-on count is done.
+    incoming por_done : Bit
+
+    //> Byte-stream interface (plan §2); identical contract to the old
+    //> ext mod UsbController this structure replaces.
+    outgoing rx_data   : Word[8]
+    outgoing rx_valid  : Bit
+    outgoing tx_ready  : Bit
+    incoming tx_data   : Word[8]
+    incoming tx_strobe : Bit
+    incoming rx_ready  : Bit
+
+    //> USB activity indicators (LED-visible).
+    outgoing rxing : Bit
+    outgoing txing : Bit
+
+    //> Pad-facing side: unidirectional wires to/from the UsbPads ext
+    //> mod (see src/top.vir for the wiring).
+    outgoing dp_tx         : Bit
+    outgoing dn_tx         : Bit
+    outgoing output_enable : Bit
+    incoming dp_rx         : Bit
+    incoming dn_rx         : Bit
+
+    //> The core reset is REGISTERED one clk behind por_done: the
+    //> por_done flop must sit next to the usb_dp_pu pad (its dominant
+    //> load), and a pad-adjacent flop sourcing the core-wide reset
+    //> forced the placer to route the reset OUT of the IO region and
+    //> back into the fabric (the 4.9 ns first hop of the vir-flow
+    //> critical path).  A dedicated flop with no IO load is placed in
+    //> the core region instead.  +1 clk of reset assertion at a
+    //> ~175 ms POR is free; the core still leaves reset before it can
+    //> drive the bus (output_enable is gated by the in-reset core).
+    reg por_rst : Bit on clock {
+        initial it <= false
+        it <= por_done
+    }
+    wire core_rst : Bit {
+        it := !por_rst
+    }
+
+    mod core of UsbUart {
+        it.clk  := clock
+        it.rst  := core_rst
+        it.dp_rx := dp_rx
+        it.dn_rx := dn_rx
+        it.tx_data   := tx_data
+        it.tx_strobe := tx_strobe
+        it.rx_ready  := rx_ready
+    }
+
+    dp_tx          := core.dp_tx
+    dn_tx          := core.dn_tx
+    output_enable  := core.output_enable
+    rx_data        := core.rx_data
+    rx_valid       := core.rx_valid
+    tx_ready       := core.tx_ready
+    rxing          := core.rxing
+    txing          := core.txing
+}

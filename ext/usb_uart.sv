@@ -1586,14 +1586,15 @@ endmodule
 // usb_uart — core top: descriptor ROM, token router, response arbiter,
 // bulk snapshot loader, rx push, FIFOs + byte-stream loopback interface.
 // ===========================================================================
-module usb_uart(
+module \usb::UsbUart (
     input  wire        clk,
-    input  wire        rst,           // sync, active high (POR in Top)
+    input  wire        rst,           // sync, active high (registered por_done,
+                                      // see src/usb.vir UsbController)
     input  wire        dp_rx,         // pad readback (SB_IO D_IN_0)
     input  wire        dn_rx,
     output wire        dp_tx,         // to pads (SB_IO D_OUT_0)
     output wire        dn_tx,
-    output wire        oe,            // pad drive enable (SB_IO OUTPUT_ENABLE)
+    output wire        output_enable, // pad drive enable (SB_IO OUTPUT_ENABLE)
     // byte-stream FIFO interface (plan §2; loopback wired in Top)
     output wire [7:0]  rx_data,
     output wire        rx_valid,      // 1-clk strobe per byte (= FIFO pop)
@@ -2334,7 +2335,7 @@ module usb_uart(
         .tx_start(tx_start), .tx_pid(tx_pid_w), .tx_len(tx_len_w),
         .tx_byte(tx_byte), .tx_addr(), .tx_addr_next(tx_addr_next_w),
         .tx_busy(tx_busy), .tx_done(tx_done),
-        .dp(dp_tx), .dn(dn_tx), .oe(oe));
+        .dp(dp_tx), .dn(dn_tx), .oe(output_enable));
 
     // SET_CONFIGURATION completed -> reset bulk data toggles (§9.1.1.5)
     reg configured_d;

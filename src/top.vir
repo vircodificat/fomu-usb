@@ -1,5 +1,6 @@
 import ice40
 import echo
+import usb
 
 export mod Top for ice40::Fomu {
     incoming clock : Clock
@@ -8,25 +9,53 @@ export mod Top for ice40::Fomu {
     // D+ pull-up enable: MUST be wired through — the platform default is
     // low (= disconnected), so a wrapper that leaves it unwired produces
     // an image no host can ever see (the P0 found when the first upload
-    // build tied it to 1'b0).
+    // build tied it to 1'b0).  Driven by the POR: attach only after the
+    // ~175 ms power-on count (ext/usb_por.sv, parameterized so the sim
+    // TB can shorten it).
     outgoing usb_dp_pu : Bit
-    // heartbeat LEDs (active low on PVT), driven by the ext core
+    // heartbeat LEDs (active low on PVT), driven by the core's
+    // activity signals
     outgoing led_red   : Bit
     outgoing led_green : Bit
     outgoing led_blue  : Bit
 
-    mod actual_top of FomuTop {
+    // Power-on reset.  Instantiated at the top (not inside the
+    // controller) so the ext body's POR_CYCLES parameter stays
+    // overridable by the testbench.
+    mod por of usb::UsbPor {
         it.clock := clock
-        usb_dp := it.usb_dp
-        usb_dn := it.usb_dn
-        usb_dp_pu := it.usb_dp_pu
     }
+    usb_dp_pu := por.por_done
+
+    // The USB controller: everything between the byte stream and the
+    // pads, in Virdant (src/usb.vir).  Its pad-facing side is
+    // unidirectional wires (dp_rx/dn_rx in; dp_tx/dn_tx/output_enable
+    // out) -- the only bidirectional nets in the design live inside
+    // the UsbPads ext mod below.
+    mod actual_top of usb::UsbController {
+        it.clock := clock
+        it.por_done := por.por_done
+    }
+
+    // The pads: the one part that drops down into Verilog, because it
+    // is the only part that needs `inout` (two iCE40 SB_IO tristate
+    // cells; see ext/usb_pads.sv).  From Virdant's view these are
+    // ordinary outgoing wires the wrapper assigns to the Top ports.
+    mod pads of usb::UsbPads {
+        it.dp_tx := actual_top.dp_tx
+        it.dn_tx := actual_top.dn_tx
+        it.output_enable := actual_top.output_enable
+    }
+    usb_dp := pads.usb_dp
+    usb_dn := pads.usb_dn
+    actual_top.dp_rx := pads.dp_rx
+    actual_top.dn_rx := pads.dn_rx
 
     // The LEDs (active low on PVT) map the USB controller's activity
     // signals onto the pads: red lights while the USB is receiving
     // data (rxing), green while it is sending (txing); blue is unused
-    // (tied off).  The ext core's rxing/txing are stretched ~175 ms
-    // past the last byte, so sustained traffic reads as solid light.
+    // (tied off).  The core's rxing/txing are stretched ~175 ms past
+    // the last byte, so sustained traffic reads as solid light.
     led_red   := !actual_top.rxing
     led_green := !actual_top.txing
     led_blue  := true
@@ -61,36 +90,4 @@ export mod Top for ice40::Fomu {
         it <= uart_tx_line
     }
     echo.rxd := uart_rx_reg
-}
-
-// Fomu UART-over-USB PoC — top declaration.
-//
-// The platform export above wires the ext core (\top::FomuTop) to the
-// Fomu pins and instantiates the Virdant echo server (src/echo.vir),
-// which renders the USB byte stream onto internal raw UART wires
-// (115200 8N1) and echoes bytes read from them back to the host.
-ext mod FomuTop {
-    //> 48 MHz board clock (pin F4).
-    incoming clock : Clock
-    //> USB D+ pad (pin A1) — driven via SB_IO inside the ext module.
-    outgoing usb_dp : Bit
-    //> USB D− pad (pin A2) — driven via SB_IO inside the ext module.
-    outgoing usb_dn : Bit
-    //> USB D+ pull-up enable (pin A4); low = disconnected from host.
-    outgoing usb_dp_pu : Bit
-    //> USB activity from the controller (active high, stretched ~175
-    //> ms past the last byte): rxing = the USB is receiving data,
-    //> txing = it is sending data.  The platform wrapper maps these
-    //> onto the active-low LED pads.
-    outgoing rxing : Bit
-    outgoing txing : Bit
-    //> Byte-stream interface of the USB core (plan §2).  The Virdant
-    //> echo server consumes this stream; rx_valid is a 1-clk strobe
-    //> per byte, rx_ready is the consumer's flow control.
-    outgoing rx_data : Word[8]
-    outgoing rx_valid : Bit
-    outgoing tx_ready : Bit
-    incoming tx_data : Word[8]
-    incoming tx_strobe : Bit
-    incoming rx_ready : Bit
 }

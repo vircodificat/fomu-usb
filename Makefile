@@ -19,10 +19,15 @@ WIKI_CSS := wiki/style.css
 
 SHELL := /bin/bash
 
-# Vendored plain-Verilog USB core + PoC top (the entire PoC DUT).
+# Vendored plain-Verilog USB core + the ext bodies of the Virdant/Verilog
+# split (src/usb.vir): the SB_IO pad pair (the only `inout` in the
+# design), the parameterized POR, and the USB core itself.
 USB_SRVS := ext/usb_uart.sv
-TOP_SV   := ext/fomu_top.sv
+PADS_SV  := ext/usb_pads.sv
+POR_SV   := ext/usb_por.sv
 ECHO_SV  := ext/echo_fifo.sv
+EXT_SRVS := $(USB_SRVS) $(PADS_SV) $(POR_SV) $(ECHO_SV)
+USB_BUILD := build/usb.sv build/echo.sv build/uart.sv
 
 # Testbench sources.  tb/usb_host_bfm.v is an include file (tasks/macros
 # meant to be `include`d inside a TB module) and is never compiled on its own.
@@ -88,7 +93,7 @@ test-usb-phy: tools
 
 test-usb-serial: tools
 	$(IVERILOG) -g2012 -gspecify -o build/tb_usb_serial.vvp \
-	    $(USB_SRVS) $(TOP_SV) $(ECHO_SV) build/echo.sv build/uart.sv \
+	    $(EXT_SRVS) $(USB_BUILD) \
 	    tb/sb_io_sim.v tb/usb_host_bfm.v \
 	    tb/tb_usb_serial.v
 	$(VVP) build/tb_usb_serial.vvp
@@ -100,7 +105,7 @@ test-usb-serial: tools
 synth: build tools
 	mkdir -p build
 	set -o pipefail; \
-	$(YOSYS) -p "read_verilog $(USB_SRVS) $(TOP_SV) $(ECHO_SV) build/echo.sv build/uart.sv build/top.sv; synth_ice40 -top Top -json build/top.json" \
+	$(YOSYS) -p "read_verilog $(EXT_SRVS) $(USB_BUILD) build/top.sv; synth_ice40 -top Top -json build/top.json" \
 	    | tee build/yosys.log
 	set -o pipefail; \
 	$(NEXTPNR) --up5k --package uwg30 --json build/top.json \
