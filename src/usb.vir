@@ -163,9 +163,29 @@ mod RxRam {
 //> stream (bit_i/bit_valid/sop/eop/pkt_err) and emits 1-clock record
 //> pulses -- tk_* (token: OUT/IN/SOF), dt_* (data: payload +
 //> read port), hs_* (handshake) -- for the router in the core top.
+//>
+//> The tk_*, hs_* and dt_* record regs (plus the head window) are
+//> factored out verbatim into usb::RxTokenRec, usb::RxHandshakeRec
+//> and usb::RxDataRec (instantiated below, fed from this module's
+//> private shared state); the outgoing ports here are pure
+//> pass-throughs, so the port list is unchanged.
 //> A packet record is emitted only if the packet was good; CRC
 //> failures deliver the record with *_crc_ok low instead (the
 //> protocol layer retries), while stuff errors, bad PIDs and
+//> over-length payloads make the packet silent (bad).
+//> Bit stream -> packet records: consumes usb::RxPhy's decoded bit
+//> stream (bit_i/bit_valid/sop/eop/pkt_err) and emits 1-clock record
+//> pulses -- tk_* (token: OUT/IN/SOF), dt_* (data: payload +
+//> read port), hs_* (handshake) -- for the router in the core top.
+//>
+//> The FLAT record ports are a contract: tb/tb_usb_phy.v instantiates
+//> this mod directly, and wiki/usb-rx-packet.md documents the port
+//> list.  The packet engine (and the three record captures it feeds)
+//> lives in usb::RxPacketCore, instantiated below; every outgoing
+//> port here is a pure pass-through of core's, so the port list is
+//> unchanged.  A packet record is emitted only if the packet was
+//> good; CRC failures deliver the record with *_crc_ok low instead
+//> (the protocol layer retries), while stuff errors, bad PIDs and
 //> over-length payloads make the packet silent (bad).
 mod RxPacket {
     //> 48 MHz clock: 4 clock cycles per USB FS bit.
@@ -186,150 +206,126 @@ mod RxPacket {
     //> Sticky per-packet error from usb::RxPhy (stuff violation or
     //> illegal line state); kills the packet.
     incoming pkt_err : Bit
+    //> Payload RAM read address (the rx-push byte index in the core;
+    //> present this clock, the byte is on dt_rd_data the next).
+    incoming dt_rd_addr : Word[6]
 
-    // ---- output strobes + captured fields --------------------------------
-    //> FLAT equations: the caps are MUTUALLY EXCLUSIVE by construction
-    //> (tok: nb==23 in the PID section; hs: nb==7 in the PID section;
-    //> dat: data section), so
-    //> the caps close each strobe as one 2-input AND of registers, and
-    //> reading them AT the eop edge is safe (same edge clears them;
-    //> nonblocking semantics see the pre-edge values).
+    // ---- packet engine + record captures -------------------------------
+    mod core of RxPacketCore {
+        it.clock := clock
+        it.reset := reset
+        it.bus_reset := bus_reset
+        it.bit_i := bit_i
+        it.bit_valid := bit_valid
+        it.sop := sop
+        it.eop := eop
+        it.pkt_err := pkt_err
+        it.dt_rd_addr := dt_rd_addr
+    }
 
-    // ---- token record ------------------------------------------------
+    // ---- flat pass-throughs --------------------------------------------
+    //> Token record (usb::RxPacketCore's tokrec).
     //> 1-clock pulse: a token record is in tk_* (latched this edge).
     //> Token strobe.
-    outgoing reg tk_valid : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            else => eop && tok_cap
-        }
+    outgoing tk_valid : Bit {
+        it := core.tk_valid
     }
     //> Token PID (OUT 1 / IN 9 / SOF 5 / SETUP D).
-    //> Token PID field: pid_r[3:0] at EOP.
-    outgoing reg tk_pid : Word[4] on clock {
-        initial it <= 0w4
-        it <= when {
-            case reset || bus_reset => 0w4
-            case eop && tok_cap => pid_r[4..0]
-            else => it
-        }
+    outgoing tk_pid : Word[4] {
+        it := core.tk_pid
     }
     //> Device address (tk_sh[6:0]; SOF packets leave it stale).
-    //> Token address field: tk_sh[6:0] (non-SOF tokens only).
-    outgoing reg tk_addr : Word[7] on clock {
-        initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case eop && tok_cap && !sof_cap => tk_sh[7..0]
-            else => it
-        }
+    outgoing tk_addr : Word[7] {
+        it := core.tk_addr
     }
     //> Endpoint (tk_sh[10:7]; SOF packets leave it stale).
-    //> Token endpoint field: tk_sh[10:7] (non-SOF tokens only).
-    outgoing reg tk_endp : Word[4] on clock {
-        initial it <= 0w4
-        it <= when {
-            case reset || bus_reset => 0w4
-            case eop && tok_cap && !sof_cap => tk_sh[11..7]
-            else => it
-        }
+    outgoing tk_endp : Word[4] {
+        it := core.tk_endp
     }
     //> SOF frame number (tk_sh[10:0]; non-SOF tokens leave it stale).
-    //> SOF frame field: the whole tk_sh (SOF tokens only).
-    outgoing reg tk_frame : Word[11] on clock {
-        initial it <= 0w11
-        it <= when {
-            case reset || bus_reset => 0w11
-            case eop && tok_cap && sof_cap => tk_sh
-            else => it
-        }
+    outgoing tk_frame : Word[11] {
+        it := core.tk_frame
     }
     //> CRC5 residual check (5'h0C after a good token stream).
-    //> Token CRC5 verdict: the registered residual compare.
-    outgoing reg tk_crc_ok : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case eop && tok_cap => crc5_res_r
-            else => it
-        }
+    outgoing tk_crc_ok : Bit {
+        it := core.tk_crc_ok
     }
-
-    // ---- data record -------------------------------------------------
-    //> 1-clock pulse: a data record is in dt_* (latched this edge).
-    //> Data strobe.
-    outgoing reg dt_valid : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            else => eop && dat_cap
-        }
+    //> Data record (usb::RxPacketCore's datarec).
+    outgoing dt_valid : Bit {
+        it := core.dt_valid
     }
     //> Data PID (DATA0 3 / DATA1 B).
-    //> Data PID field.
-    outgoing reg dt_pid : Word[4] on clock {
-        initial it <= 0w4
-        it <= when {
-            case reset || bus_reset => 0w4
-            case eop && dat_cap => pid_r[4..0]
-            else => it
-        }
+    outgoing dt_pid : Word[4] {
+        it := core.dt_pid
     }
     //> Payload byte count (bc - 2: the 2 crc16 wire bytes are excluded).
-    //> Data length field: bc - 2 (the crc16 wire bytes drop out).
-    outgoing reg dt_len : Word[7] on clock {
-        initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case eop && dat_cap => mux(bc >= 2w7, bc - 2w7, 0w7)
-            else => it
-        }
+    outgoing dt_len : Word[7] {
+        it := core.dt_len
     }
     //> Flopped payload head window, packet bytes 0..7 (consumers that
     //> need several bytes AT ONCE -- the EP0 request latch,
     //> SET_LINE_CODING -- cannot use the one-at-a-time RAM port).
     outgoing dt_head : Word[64] {
-        it := word(head7, head6, head5, head4, head3, head2, head1, head0)
+        it := core.dt_head
     }
     //> Payload RAM registered read (usb::RxRam.rd): present dt_rd_addr,
     //> the byte is here the NEXT clock.
     outgoing dt_rd_data : Word[8] {
-        it := ram.rd
+        it := core.dt_rd_data
     }
-    //> Payload RAM read address (the rx-push byte index in the core).
-    incoming dt_rd_addr : Word[6]
     //> CRC16 residual check (16'h800D after a good payload stream).
-    //> Data CRC16 verdict: the registered residual compare.
-    outgoing reg dt_crc_ok : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case eop && dat_cap => crc16_res_r
-            else => it
-        }
+    outgoing dt_crc_ok : Bit {
+        it := core.dt_crc_ok
     }
-
-    // ---- handshake record --------------------------------------------
-    //> 1-clock pulse: a handshake record is in hs_pid (latched this edge).
-    //> Handshake strobe.
-    outgoing reg hs_valid : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            else => eop && hs_cap
-        }
+    //> Handshake record (usb::RxPacketCore's hsrec).
+    outgoing hs_valid : Bit {
+        it := core.hs_valid
     }
     //> Handshake PID (ACK 2 / NAK A / STALL E).
-    //> Handshake PID field (nothing follows the PID byte).
-    outgoing reg hs_pid : Word[4] on clock {
-        initial it <= 0w4
-        it <= when {
-            case reset || bus_reset => 0w4
-            case eop && hs_cap => pid_r[4..0]
-            else => it
-        }
+    outgoing hs_pid : Word[4] {
+        it := core.hs_pid
     }
+}
+
+//> usb_packet_core -- the packet engine behind usb::RxPacket: the
+//> sync/PID/bit counting, the payload RAM and its write strobe, the
+//> CRC LFSRs and the end-of-packet capture decisions
+//> (tok_cap/sof_cap/hs_cap/dat_cap).  The record mods
+//> (usb::RxTokenRec / usb::RxDataRec / usb::RxHandshakeRec) are
+//> instantiated here, fed from this module's (otherwise private)
+//> shared state, and their flat outputs pass through to the facade.
+//>
+//> FSM + counting: IDLE -> (sop) -> SYNC (skip the 8 sync bits) ->
+//> BODY (PID section, then token or data section) -> (eop) -> IDLE.
+//> nb counts PID-section bits (sync 0..7 ignored, PID byte 0..7,
+//> token data 8..18, crc5 wire bits 19..23, parked at 24 in the data
+//> section); n3 is the data-section bit-in-byte index (0..7,
+//> wrapping), with bc counting complete bytes (payload + the 2
+//> trailing crc16 wire bytes, subtracted at EOP by usb::RxDataRec).
+//> Bad packets are silent: every cap is qualified by !bad, so no
+//> strobe ever fires.
+mod RxPacketCore {
+    //> 48 MHz clock: 4 clock cycles per USB FS bit.
+    incoming clock : Clock
+    //> Synchronous reset, active high (core reset from UsbController).
+    incoming reset : Bit
+    //> Bus reset strobe from usb::RxPhy (SE0 held >= 2.5 us): flushes
+    //> everything, including partial packet state.
+    incoming bus_reset : Bit
+    //> Decoded (NRZI-decoded, bit-unstuffed) data bit.
+    incoming bit_i : Bit
+    //> 1-clock strobe: bit_i is a real packet bit this cycle.
+    incoming bit_valid : Bit
+    //> 1-clock pulse: start of packet (J->K from idle).
+    incoming sop : Bit
+    //> 1-clock pulse: end of packet (SE0 held ~1.75 bit times).
+    incoming eop : Bit
+    //> Sticky per-packet error from usb::RxPhy (stuff violation or
+    //> illegal line state); kills the packet.
+    incoming pkt_err : Bit
+    //> Payload RAM read address (the rx-push byte index in the core;
+    //> present this clock, the byte is on dt_rd_data the next).
+    incoming dt_rd_addr : Word[6]
 
     // ---- capture helpers, wires ----------------------------------------
 
@@ -677,74 +673,401 @@ mod RxPacket {
         it.ra  := dt_rd_addr
     }
 
-    //> Flopped payload head shadow, packet bytes 0..7 (bc < 8) -- eight
-    //> SEPARATE byte-regs: each byte's enable is its own shallow decode
-    //> (dt_wr && bc == k -- k < 8, so the equality subsumes the
-    //> head-window test) and its D is dt_byte_new directly; the bc
-    //> compare runs in PARALLEL with the dt_wr cone instead of serially
-    //> behind it.  A bad packet's payload is still written; dt_valid
-    //> just never fires for it.
-    reg head0 : Word[8] on clock {
-        initial it <= 0w8
+    // ---- record captures -------------------------------------------
+    //> The three record mods.  They read this module's shared
+    //> state (pid_r / tk_sh / bc / the caps / the CRC verdicts)
+    //> and latch their records at EOP.
+    mod tokrec of RxTokenRec {
+        it.clock := clock
+        it.reset := reset
+        it.bus_reset := bus_reset
+        it.eop := eop
+        it.cap := tok_cap
+        it.sof_cap := sof_cap
+        it.pid_r := pid_r
+        it.sh := tk_sh
+        it.crc5_res := crc5_res_r
+    }
+    //> 1-clock pulse: a token record is in tk_* (latched this edge).
+    //> Token strobe.
+    outgoing tk_valid : Bit {
+        it := tokrec.tk_valid
+    }
+    //> Token PID (OUT 1 / IN 9 / SOF 5 / SETUP D).
+    outgoing tk_pid : Word[4] {
+        it := tokrec.tk_pid
+    }
+    //> Device address (tk_sh[6:0]; SOF packets leave it stale).
+    outgoing tk_addr : Word[7] {
+        it := tokrec.tk_addr
+    }
+    //> Endpoint (tk_sh[10:7]; SOF packets leave it stale).
+    outgoing tk_endp : Word[4] {
+        it := tokrec.tk_endp
+    }
+    //> SOF frame number (tk_sh[10:0]; non-SOF tokens leave it stale).
+    outgoing tk_frame : Word[11] {
+        it := tokrec.tk_frame
+    }
+    //> CRC5 residual check (5'h0C after a good token stream).
+    outgoing tk_crc_ok : Bit {
+        it := tokrec.tk_crc_ok
+    }
+
+    // ---- data record -------------------------------------------------
+    //> The data record regs and the head window live in
+    //> usb::RxDataRec; this instance feeds them the shared packet
+    //> state (the frozen PID, the data-section byte count, the
+    //> byte-complete write strobe, the completing byte and the CRC16
+    //> verdict).
+    mod datarec of RxDataRec {
+        it.clock := clock
+        it.reset := reset
+        it.bus_reset := bus_reset
+        it.eop := eop
+        it.cap := dat_cap
+        it.pid_r := pid_r
+        it.bc := bc
+        it.dat_wr := dt_wr
+        it.byte_new := dt_byte_new
+        it.crc16_res := crc16_res_r
+    }
+    //> 1-clock pulse: a data record is in dt_* (latched this edge).
+    //> Data strobe.
+    outgoing dt_valid : Bit {
+        it := datarec.dt_valid
+    }
+    //> Data PID (DATA0 3 / DATA1 B).
+    outgoing dt_pid : Word[4] {
+        it := datarec.dt_pid
+    }
+    //> Payload byte count (bc - 2: the 2 crc16 wire bytes are excluded).
+    outgoing dt_len : Word[7] {
+        it := datarec.dt_len
+    }
+    //> Flopped payload head window, packet bytes 0..7 (consumers that
+    //> need several bytes AT ONCE -- the EP0 request latch,
+    //> SET_LINE_CODING -- cannot use the one-at-a-time RAM port).
+    outgoing dt_head : Word[64] {
+        it := word(datarec.head7, datarec.head6, datarec.head5,
+            datarec.head4, datarec.head3, datarec.head2,
+            datarec.head1, datarec.head0)
+    }
+    //> Payload RAM registered read (usb::RxRam.rd): present dt_rd_addr,
+    //> the byte is here the NEXT clock.
+    outgoing dt_rd_data : Word[8] {
+        it := ram.rd
+    }
+    //> CRC16 residual check (16'h800D after a good payload stream).
+    outgoing dt_crc_ok : Bit {
+        it := datarec.dt_crc_ok
+    }
+
+    // ---- handshake record --------------------------------------------
+    //> The handshake record regs live in usb::RxHandshakeRec; this
+    //> instance feeds them the frozen PID and the handshake cap.
+    mod hsrec of RxHandshakeRec {
+        it.clock := clock
+        it.reset := reset
+        it.bus_reset := bus_reset
+        it.eop := eop
+        it.cap := hs_cap
+        it.pid_r := pid_r
+    }
+    //> 1-clock pulse: a handshake record is in hs_pid (latched this edge).
+    //> Handshake strobe.
+    outgoing hs_valid : Bit {
+        it := hsrec.hs_valid
+    }
+    //> Handshake PID (ACK 2 / NAK A / STALL E).
+    outgoing hs_pid : Word[4] {
+        it := hsrec.hs_pid
+    }
+
+}
+
+//> usb_token_record -- the token record regs, factored out of
+//> usb::RxPacketCore (the drivers are byte-identical to the pre-split
+//> ones, so the outputs are bit-identical).  At a token packet's EOP
+//> (cap), latches the PID, the CRC5 verdict and the 11 token bits;
+//> sof_cap selects which reading captures (the whole shift register
+//> as the SOF frame number, else addr/endp) and the other fields go
+//> stale, exactly as before.  The record HOLDS until the next token.
+mod RxTokenRec {
+    //> 48 MHz clock: 4 clock cycles per USB FS bit.
+    incoming clock : Clock
+    //> Synchronous reset, active high (core reset from UsbController).
+    incoming reset : Bit
+    //> Bus reset strobe from usb::RxPhy (SE0 held >= 2.5 us): flushes
+    //> the record.
+    incoming bus_reset : Bit
+    //> 1-clock pulse: end of packet (SE0 held ~1.75 bit times).
+    incoming eop : Bit
+    //> Capture decision from usb::RxPacketCore (the token cap).
+    incoming cap : Bit
+    //> The SOF variant of the cap (the token bits are a frame number).
+    incoming sof_cap : Bit
+    //> The frozen PID byte.
+    incoming pid_r : Word[8]
+    //> The 11 captured token bits (LSB first).
+    incoming sh : Word[11]
+    //> Registered CRC5 residual verdict.
+    incoming crc5_res : Bit
+
+    //> 1-clock pulse: a token record is in tk_* (latched this edge).
+    //> Token strobe.
+    outgoing reg tk_valid : Bit on clock {
+        initial it <= false
         it <= when {
-            case reset || bus_reset => 0w8
-            case dt_wr && (bc == 0w7) => dt_byte_new
+            case reset || bus_reset => false
+            else => eop && cap
+        }
+    }
+    //> Token PID (OUT 1 / IN 9 / SOF 5 / SETUP D).
+    //> Token PID field: pid_r[3:0] at EOP.
+    outgoing reg tk_pid : Word[4] on clock {
+        initial it <= 0w4
+        it <= when {
+            case reset || bus_reset => 0w4
+            case eop && cap => pid_r[4..0]
             else => it
         }
     }
-    reg head1 : Word[8] on clock {
-        initial it <= 0w8
+    //> Device address (sh[6:0]; SOF packets leave it stale).
+    //> Token address field: sh[6:0] (non-SOF tokens only).
+    outgoing reg tk_addr : Word[7] on clock {
+        initial it <= 0w7
         it <= when {
-            case reset || bus_reset => 0w8
-            case dt_wr && (bc == 1w7) => dt_byte_new
+            case reset || bus_reset => 0w7
+            case eop && cap && !sof_cap => sh[7..0]
             else => it
         }
     }
-    reg head2 : Word[8] on clock {
-        initial it <= 0w8
+    //> Endpoint (sh[10:7]; SOF packets leave it stale).
+    //> Token endpoint field: sh[10:7] (non-SOF tokens only).
+    outgoing reg tk_endp : Word[4] on clock {
+        initial it <= 0w4
         it <= when {
-            case reset || bus_reset => 0w8
-            case dt_wr && (bc == 2w7) => dt_byte_new
+            case reset || bus_reset => 0w4
+            case eop && cap && !sof_cap => sh[11..7]
             else => it
         }
     }
-    reg head3 : Word[8] on clock {
-        initial it <= 0w8
+    //> SOF frame number (sh[10:0]; non-SOF tokens leave it stale).
+    //> SOF frame field: the whole sh (SOF tokens only).
+    outgoing reg tk_frame : Word[11] on clock {
+        initial it <= 0w11
         it <= when {
-            case reset || bus_reset => 0w8
-            case dt_wr && (bc == 3w7) => dt_byte_new
+            case reset || bus_reset => 0w11
+            case eop && cap && sof_cap => sh
             else => it
         }
     }
-    reg head4 : Word[8] on clock {
-        initial it <= 0w8
+    //> CRC5 residual check (5'h0C after a good token stream).
+    //> Token CRC5 verdict: the registered residual compare.
+    outgoing reg tk_crc_ok : Bit on clock {
+        initial it <= false
         it <= when {
-            case reset || bus_reset => 0w8
-            case dt_wr && (bc == 4w7) => dt_byte_new
+            case reset || bus_reset => false
+            case eop && cap => crc5_res
             else => it
         }
     }
-    reg head5 : Word[8] on clock {
-        initial it <= 0w8
+}
+
+//> usb_handshake_record -- the handshake record regs, factored out of
+//> usb::RxPacketCore (the drivers are byte-identical to the pre-split
+//> ones, so the outputs are bit-identical).  At a handshake's EOP
+//> (cap), latches the PID; nothing follows the PID byte on the wire.
+//> The record HOLDS until the next handshake.
+mod RxHandshakeRec {
+    //> 48 MHz clock: 4 clock cycles per USB FS bit.
+    incoming clock : Clock
+    //> Synchronous reset, active high (core reset from UsbController).
+    incoming reset : Bit
+    //> Bus reset strobe from usb::RxPhy (SE0 held >= 2.5 us): flushes
+    //> the record.
+    incoming bus_reset : Bit
+    //> 1-clock pulse: end of packet (SE0 held ~1.75 bit times).
+    incoming eop : Bit
+    //> Capture decision from usb::RxPacketCore (the handshake cap).
+    incoming cap : Bit
+    //> The frozen PID byte.
+    incoming pid_r : Word[8]
+
+    //> 1-clock pulse: a handshake record is in hs_pid (latched this
+    //> edge).  Handshake strobe.
+    outgoing reg hs_valid : Bit on clock {
+        initial it <= false
         it <= when {
-            case reset || bus_reset => 0w8
-            case dt_wr && (bc == 5w7) => dt_byte_new
+            case reset || bus_reset => false
+            else => eop && cap
+        }
+    }
+    //> Handshake PID (ACK 2 / NAK A / STALL E).
+    //> Handshake PID field (nothing follows the PID byte).
+    outgoing reg hs_pid : Word[4] on clock {
+        initial it <= 0w4
+        it <= when {
+            case reset || bus_reset => 0w4
+            case eop && cap => pid_r[4..0]
             else => it
         }
     }
-    reg head6 : Word[8] on clock {
-        initial it <= 0w8
+}
+
+//> usb_data_record -- the data record regs + the flopped payload head
+//> window, factored out of usb::RxPacket (the drivers are
+//> byte-identical to the pre-split ones, so the outputs are
+//> bit-identical).  At a data packet's EOP (cap), latches the PID,
+//> the payload length (bc - 2: the 2 crc16 wire bytes drop out) and
+//> the CRC16 verdict; the record HOLDS until the next data packet.
+//> Also owns the flopped payload head window (bytes 0..7 -- eight
+//> SEPARATE byte-regs: each byte's enable is its own shallow decode
+//> (dat_wr && bc == k -- k < 8, so the equality subsumes the
+//> head-window test) and its D is byte_new directly; the bc compare
+//> runs in PARALLEL with the dat_wr cone instead of serially behind
+//> it).  A bad packet's payload is still written; the record just
+//> never fires for it.
+mod RxDataRec {
+    //> 48 MHz clock: 4 clock cycles per USB FS bit.
+    incoming clock : Clock
+    //> Synchronous reset, active high (core reset from UsbController).
+    incoming reset : Bit
+    //> Bus reset strobe from usb::RxPhy (SE0 held >= 2.5 us): flushes
+    //> the record and the head window.
+    incoming bus_reset : Bit
+    //> 1-clock pulse: end of packet (SE0 held ~1.75 bit times).
+    incoming eop : Bit
+    //> Capture decision from usb::RxPacketCore (the data cap).
+    incoming cap : Bit
+    //> The frozen PID byte.
+    incoming pid_r : Word[8]
+    //> Data-section byte count (payload bytes + the 2 trailing crc16
+    //> wire bytes; the length subtracts them back out at EOP).
+    incoming bc : Word[7]
+    //> Byte-complete write strobe (usb::RxPacketCore's dt_wr).
+    incoming dat_wr : Bit
+    //> The data-section byte completing on this bit clock.
+    incoming byte_new : Word[8]
+    //> Registered CRC16 residual verdict.
+    incoming crc16_res : Bit
+
+    //> 1-clock pulse: a data record is in dt_* (latched this edge).
+    //> Data strobe.
+    outgoing reg dt_valid : Bit on clock {
+        initial it <= false
         it <= when {
-            case reset || bus_reset => 0w8
-            case dt_wr && (bc == 6w7) => dt_byte_new
+            case reset || bus_reset => false
+            else => eop && cap
+        }
+    }
+    //> Data PID (DATA0 3 / DATA1 B).
+    //> Data PID field.
+    outgoing reg dt_pid : Word[4] on clock {
+        initial it <= 0w4
+        it <= when {
+            case reset || bus_reset => 0w4
+            case eop && cap => pid_r[4..0]
             else => it
         }
     }
-    reg head7 : Word[8] on clock {
+    //> Payload byte count (bc - 2: the 2 crc16 wire bytes are excluded).
+    //> Data length field: bc - 2 (the crc16 wire bytes drop out).
+    outgoing reg dt_len : Word[7] on clock {
+        initial it <= 0w7
+        it <= when {
+            case reset || bus_reset => 0w7
+            case eop && cap => mux(bc >= 2w7, bc - 2w7, 0w7)
+            else => it
+        }
+    }
+    //> CRC16 residual check (16'h800D after a good payload stream).
+    //> Data CRC16 verdict: the registered residual compare.
+    outgoing reg dt_crc_ok : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case eop && cap => crc16_res
+            else => it
+        }
+    }
+
+    // ---- flopped payload head window ------------------------------------
+    //> Packet bytes 0..7 (bc < 8): each byte's enable is its own
+    //> shallow decode (dat_wr && bc == k -- k < 8, so the equality
+    //> subsumes the head-window test) and its D is byte_new directly;
+    //> the bc compare runs in PARALLEL with the dat_wr cone instead of
+    //> serially behind it.  A bad packet's payload is still written;
+    //> the record just never fires for it.
+    outgoing reg head0 : Word[8] on clock {
         initial it <= 0w8
         it <= when {
             case reset || bus_reset => 0w8
-            case dt_wr && (bc == 7w7) => dt_byte_new
+            case dat_wr && (bc == 0w7) => byte_new
+            else => it
+        }
+    }
+    //> Packet byte 1.
+    outgoing reg head1 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case reset || bus_reset => 0w8
+            case dat_wr && (bc == 1w7) => byte_new
+            else => it
+        }
+    }
+    //> Packet byte 2.
+    outgoing reg head2 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case reset || bus_reset => 0w8
+            case dat_wr && (bc == 2w7) => byte_new
+            else => it
+        }
+    }
+    //> Packet byte 3.
+    outgoing reg head3 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case reset || bus_reset => 0w8
+            case dat_wr && (bc == 3w7) => byte_new
+            else => it
+        }
+    }
+    //> Packet byte 4.
+    outgoing reg head4 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case reset || bus_reset => 0w8
+            case dat_wr && (bc == 4w7) => byte_new
+            else => it
+        }
+    }
+    //> Packet byte 5.
+    outgoing reg head5 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case reset || bus_reset => 0w8
+            case dat_wr && (bc == 5w7) => byte_new
+            else => it
+        }
+    }
+    //> Packet byte 6.
+    outgoing reg head6 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case reset || bus_reset => 0w8
+            case dat_wr && (bc == 6w7) => byte_new
+            else => it
+        }
+    }
+    //> Packet byte 7.
+    outgoing reg head7 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case reset || bus_reset => 0w8
+            case dat_wr && (bc == 7w7) => byte_new
             else => it
         }
     }
@@ -1779,22 +2102,29 @@ mod UsbTokenRouter {
     //> Packet assembler token-record fields (they hold between
     //> packets).
     incoming tk_addr : Word[7]
+    //> Token PID (OUT 1 / IN 9 / SOF 5 / SETUP D).
     incoming tk_pid : Word[4]
+    //> Token endpoint number.
     incoming tk_endp : Word[4]
     //> Packet assembler data-record strobe (a data packet's EOP).
     incoming dt_valid : Bit
     //> Packet assembler handshake-record strobe + PID.
     incoming hs_valid : Bit
+    //> Handshake PID (ACK 2 / NAK A / STALL E).
     incoming hs_pid : Word[4]
     //> EP0 router hints: a data packet is expected (ep0_busy), the
     //> transfer is STALLed (ep0_stalling), a response is in flight
     //> (ep0_wait_ack).
     incoming ep0_busy : Bit
+    //> The transfer is STALLed (qualifies the data-stage STALL
+    //> routing via last_out_ep0).
     incoming ep0_stalling : Bit
+    //> An EP0 response is in flight (the handshake goes to EP0).
     incoming ep0_wait_ack : Bit
     //> Serial router hints: an OUT data packet is expected
     //> (ser_busy), a response is in flight (ser_ack_wait).
     incoming ser_busy : Bit
+    //> A serial response is in flight (the handshake goes to serial).
     incoming ser_ack_wait : Bit
 
     // ---- token-valid gate ----------------------------------------------
@@ -1829,6 +2159,7 @@ mod UsbTokenRouter {
             else => tok_v_r && (tk_pid == 13w4) && (tk_endp == 0w4)
         }
     }
+    //> 1-clock strobe: a valid IN token reached EP0 (endp 0).
     outgoing reg ep0_tk_in_r : Bit on clock {
         initial it <= false
         it <= when {
@@ -1836,6 +2167,7 @@ mod UsbTokenRouter {
             else => tok_v_r && (tk_pid == 9w4) && (tk_endp == 0w4)
         }
     }
+    //> 1-clock strobe: a valid OUT token reached EP0 (endp 0).
     outgoing reg ep0_tk_out_r : Bit on clock {
         initial it <= false
         it <= when {
@@ -1843,6 +2175,8 @@ mod UsbTokenRouter {
             else => tok_v_r && (tk_pid == 1w4) && (tk_endp == 0w4)
         }
     }
+    //> 1-clock strobe: a valid IN token reached the serial endpoint
+    //> (endp 1).
     outgoing reg ser_tk_in_r : Bit on clock {
         initial it <= false
         it <= when {
@@ -1850,6 +2184,8 @@ mod UsbTokenRouter {
             else => tok_v_r && (tk_pid == 9w4) && (tk_endp == 1w4)
         }
     }
+    //> 1-clock strobe: a valid OUT token reached the serial endpoint
+    //> (endp 1).
     outgoing reg ser_tk_out_r : Bit on clock {
         initial it <= false
         it <= when {
@@ -1857,6 +2193,8 @@ mod UsbTokenRouter {
             else => tok_v_r && (tk_pid == 1w4) && (tk_endp == 1w4)
         }
     }
+    //> 1-clock strobe: a valid IN token reached the notif endpoint
+    //> (endp 2; the arbiter NAKs it).
     outgoing reg ep2_tk_in_r : Bit on clock {
         initial it <= false
         it <= when {
@@ -1864,6 +2202,8 @@ mod UsbTokenRouter {
             else => tok_v_r && (tk_pid == 9w4) && (tk_endp == 2w4)
         }
     }
+    //> 1-clock strobe: a valid OUT token reached the notif endpoint
+    //> (endp 2; the arbiter NAKs it).
     outgoing reg ep2_tk_out_r : Bit on clock {
         initial it <= false
         it <= when {
@@ -1904,6 +2244,9 @@ mod UsbTokenRouter {
     wire ep0_dt_gate : Bit {
         it := dt_valid && ep0_data_take
     }
+    //> 1-clock strobe: a data packet was routed to EP0 (registered
+    //> one clock after dt_valid; the fields hold, so the delayed read
+    //> is bit-identical).
     outgoing reg ep0_dt_valid_r : Bit on clock {
         initial it <= false
         it <= when {
@@ -1911,6 +2254,9 @@ mod UsbTokenRouter {
             else => ep0_dt_gate
         }
     }
+    //> Arrival-cycle strobe: a data packet was routed to the serial
+    //> endpoint (its accept decision registers one clock later, so
+    //> this stays unregistered).
     outgoing ser_dt_valid : Bit {
         it := dt_valid && ser_busy && !ep0_data_take
     }
@@ -1920,6 +2266,8 @@ mod UsbTokenRouter {
     outgoing ep0_hs_ack : Bit {
         it := hs_valid && (hs_pid == 2w4) && ep0_wait_ack
     }
+    //> 1-clock pulse: an ACK handshake was routed to the serial
+    //> endpoint.
     outgoing ser_hs_ack : Bit {
         it := hs_valid && (hs_pid == 2w4) && !ep0_wait_ack && ser_ack_wait
     }
@@ -1942,15 +2290,20 @@ mod UsbArbiter {
     incoming reset : Bit
     //> EP0's 1-clock response request + held response params.
     incoming ep0_req : Bit
+    //> EP0's held response PID (valid with ep0_req and after).
     incoming ep0_pid : Word[4]
+    //> EP0's held response length in bytes.
     incoming ep0_len : Word[7]
     //> Serial's 1-clock response request + held response params.
     incoming ser_req : Bit
+    //> Serial's held response PID (valid with ser_req and after).
     incoming ser_pid : Word[4]
+    //> Serial's held response length in bytes.
     incoming ser_len : Word[7]
     //> Router-gated EP2 token strobes: every token to the notif EP
     //> gets a NAK.
     incoming ep2_tk_in : Bit
+    //> 1-clock strobe: a valid OUT token reached the notif endpoint.
     incoming ep2_tk_out : Bit
     //> The tx PHY's done strobe (the in-flight response finished).
     incoming tx_done : Bit
@@ -1995,6 +2348,7 @@ mod UsbArbiter {
             else         => 10w4
         }
     }
+    //> The launched response's length in bytes (0 for the EP2 NAK).
     outgoing tx_len_w : Word[7] {
         it := when {
             case ep0_req => ep0_len
@@ -2027,6 +2381,9 @@ mod UsbSnapshotLoader {
     //> Serial's response request + fresh-arm strobe: the arm is a NEW
     //> bulk-IN packet (vs a retransmit of the pending snapshot).
     incoming ser_req : Bit
+    //> 1-clock strobe: the arm is a NEW bulk-IN packet (vs a
+    //> retransmit of the pending snapshot); reloads the snapshot RAM
+    //> from the tx FIFO.
     incoming ser_fresh : Bit
     //> The armed packet's length (arbiter.tx_len_w at the arm).
     incoming tx_len : Word[7]
@@ -2218,6 +2575,7 @@ mod UsbByteStream {
     outgoing tx_empty : Bit {
         it := txfifo.empty
     }
+    //> Bytes currently in the tx FIFO (for serial's arm sizing).
     outgoing tx_count : Word[7] {
         it := txfifo.count
     }
@@ -2349,6 +2707,9 @@ mod UsbByteStream {
     wire rx_sum : Word[8] {
         it := word(0w1, rxfifo.count) + word(0w1, dt_len)
     }
+    //> True when the accepted packet's payload (dt_len) fits the rx
+    //> FIFO's free slots (combinational; serial registers the accept
+    //> decision off this).
     outgoing rx_room_ok : Bit {
         it := rx_sum <= 64w8
     }
