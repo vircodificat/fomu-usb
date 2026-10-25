@@ -1,22 +1,227 @@
+//! The USB physical layer ("PHY") mods: everything between the raw
+//! pad samples and the decoded / encoded bit streams.
+//!
+//! Receive side: usb::RxPhy synchronizes the raw D+/D- pads, decodes
+//! the line states (SE0/SE1/J/K), recovers the bit clock (4x
+//! oversampling: 48 MHz core clock = 4 clock cycles per FS bit), and
+//! emits the decoded bit stream plus the SOP/EOP/error/bus_reset
+//! strobes.  The NRZI decode and bit destuffing it builds on live in
+//! their own mods (usb::NrziDecoder, usb::BitDestuffer).
+//!
+//! Transmit side: usb::TxPhy is the mirror image -- packet records
+//! (pid / len / byte stream) in, NRZI-encoded bit-stuffed pad drive
+//! out, with EOP/SE0 sequencing and the payload CRC16 from
+//! crc::Crc16.
+//!
+//! The bidirectional pad cells themselves stay vendored in
+//! ext/usb_pads.sv (UsbPads) -- see src/usb.vir.
+
 import crc
 
-//> The USB physical layer ("PHY") mods: everything between the raw
-//> pad samples and the decoded / encoded bit streams.
+//> RxPhy is the physical receiver ("PHY") for the USB.
+//> It is responsible for converting the raw D+ and D- USB signals (`dp` and `dn`).
+//> It takes these and applies the NRZI (non-return to zeror inverting) transform
+//> and bit un-stuffing.
 //>
-//> Receive side: usb::RxPhy synchronizes the raw D+/D- pads, decodes
-//> the line states (SE0/SE1/J/K), recovers the bit clock (4x
-//> oversampling: 48 MHz core clock = 4 clock cycles per FS bit), and
-//> emits the decoded bit stream plus the SOP/EOP/error/bus_reset
-//> strobes.  The NRZI decode and bit destuffing it builds on live in
-//> their own mods (usb::NrziDecoder, usb::BitDestuffer).
+//> Since USB is asynchronous, RxPhy also synchronizes the incoming packets.
+//> On a 48 MHz clock, each USB signal is 4 cycles long;
+//> RxPhy samples on the 2nd cycle to get the most accurate reading.
 //>
-//> Transmit side: usb::TxPhy is the mirror image -- packet records
-//> (pid / len / byte stream) in, NRZI-encoded bit-stuffed pad drive
-//> out, with EOP/SE0 sequencing and the payload CRC16 from
-//> crc::Crc16.
+//> RxPhy watches for Start-of-Packet (SOP) and End-of-Packet (EOF).
 //>
-//> The bidirectional pad cells themselves stay vendored in
-//> ext/usb_pads.sv (UsbPads) -- see src/usb.vir.
+//> The output of RxPhy are:
+//> - the decoded bit
+//> - whether we are at the SOP or EOP.
+//> - whether the host requested the device reset
+//> - whether there was an error
+mod RxPhy {
+    //> 48 MHz clock: 4 clock cycles per USB FS bit.
+    incoming clock : Clock
+    //> Synchronous reset (core reset from UsbController).
+    //> Deliberately NOT asserted on bus reset: the bus-reset detector lives here.
+    incoming reset : Bit
+
+    //> Raw D+ pad sample. Asynchronous.
+    incoming dp  : Bit
+    //> Raw D- pad sample. Asynchronous.
+    incoming dn  : Bit
+
+    //> Decoded (NRZI-decoded) data bit, captured at every mid-bit
+    //> sample (including the dropped stuff bit -- the destuffer
+    //> suppresses `bit_valid`, not this).  See NrziDecoder.
+    outgoing bit_o : Bit {
+        it := nrzi_decoder.bit_sampled
+    }
+    //> 1-clock strobe: bit_o is good this cycle (suppressed for the
+    //> dropped stuff bit).  See BitDestuffer.
+    outgoing bit_valid : Bit {
+        it := unstuffer.bit_valid
+    }
+    //> 1-clock pulse: J->K seen from idle (start of packet).
+    outgoing reg sop : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset      => false
+            case sop_edge => true
+            else          => false
+        }
+    }
+    //> 1-clock pulse: SE0 held ~1.75 bit times (end of packet).
+    outgoing reg eop : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset     => false
+            case eop_now   => true
+            else           => false
+        }
+    }
+    //> Inside a packet (from sop until eop): armed at the sop edge,
+    //> dropped with the eop pulse or on an SE1 (illegal bus state).
+    outgoing reg active : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset      => false
+            case sop_edge   => true
+            case abort      => false
+            case eop_now    => false
+            else            => it
+        }
+    }
+    //> Sticky per-packet error: SE1 seen (illegal bus state), or 6
+    //> ones then a 1 (stuffing violation); cleared at the next sop
+    //> (or by reset).
+    outgoing reg error : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset                => false
+            case sop_edge             => false
+            case abort                => true
+            case unstuffer.violation  => true
+            else                      => it
+        }
+    }
+    //> 1-clock pulse: SE0 held >= 2.5 us (host-issued bus reset;
+    //> see se0_count).
+    outgoing reg bus_reset : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset              => false
+            case se0_count == 119w7 => true
+            else                    => false
+        }
+    }
+
+    //> `dp` but synchronized to `clock`
+    mod sync_dp of Sync {
+        it.inp   := dp
+        it.clock := clock
+    }
+    //> `dn` but synchronized to `clock`
+    mod sync_dn of Sync {
+        it.inp   := dn
+        it.clock := clock
+    }
+
+    //> Previous-cycle synchronized D+ sample
+    reg dp_p : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset => false
+            else     => sync_dp.out
+        }
+    }
+    //> Previous-cycle synchronized D- sample
+    reg dn_p : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset => false
+            else     => sync_dn.out
+        }
+    }
+
+    //> NRZI decode of the synchronized pads
+    mod nrzi_decoder of NrziDecoder {
+        it.clock   := clock
+        it.reset   := reset
+        it.sample  := sample
+        it.dp_sync := sync_dp.out
+        it.dn_sync := sync_dn.out
+    }
+    //> Bit destuffing of the decoded stream
+    mod unstuffer of BitDestuffer {
+        it.clock    := clock
+        it.reset    := reset
+        it.active   := active
+        it.sample   := sample
+        it.bit_live := nrzi_decoder.bit_live
+    }
+    wire trans : Bit {
+        it := (sync_dp.out != dp_p) || (sync_dn.out != dn_p)
+    }
+    // bus states: SE0 (both low), SE1 (illegal), K (the sync edge polarity)
+    wire se0 : Bit {
+        it := !sync_dp.out && !sync_dn.out
+    }
+    wire se1 : Bit {
+        it := sync_dp.out && sync_dn.out
+    }
+    wire k : Bit {
+        it := !sync_dp.out && sync_dn.out
+    }
+    // next-state helper cones (mutually exclusive where priority
+    // matters; reset always wins as the first case of every reg)
+    wire sop_edge : Bit {
+        it := !active && k
+    }
+    wire abort : Bit {
+        it := active && se1
+    }
+    wire eop_now : Bit {
+        it := active && se0 && (se0_count == 6w7)
+    }
+    // inside a packet at a J/K level (not SE0/SE1)
+    wire jk : Bit {
+        it := active && !se1 && !se0
+    }
+    // the mid-bit sample point: phase 1 captures the synchronized D+ sample
+    // (sync_dp.out) 2-3 clks after the line switch -- inside the bit's
+    // visibility window for EVERY
+    // achievable quantized window width (3, 4 or 5 clks).  The re-align
+    // at every transition (phase reset, below) makes the counter read 0 one
+    // clock after the transition, so one sample lands per bit window for
+    // run windows of any length (4n-1/4n/4n+1 clks all yield n captures).
+    wire sample : Bit {
+        it := jk && (phase == 1w2)
+    }
+
+    //> Bit-phase counter (0..3 clks into the current bit).  Clock
+    //> recovery: re-aligned to 0 on every line transition; phase 1 is
+    //> the mid-bit sample (see the `sample` wire).
+    reg phase : Word[2] on clock {
+        initial it <= 0w2
+        it <= when {
+            case reset     => 0w2
+            case sop_edge  => 0w2
+            case jk        => mux(trans, 0w2, it + 1w2)
+            else           => it
+        }
+    }
+
+    //> Standalone SE0 timer: the EOP threshold is checked off
+    //> `eop_now` (~1.75 bit times = 7 clks); bus_reset fires when the
+    //> count reaches 119, i.e. after 120 SE0 clks = 2.5 us.  The
+    //> 7-bit counter wraps, so sustained reset SE0 re-pulses every
+    //> 128 clks (the ep0 FSM treats each pulse identically).
+    reg se0_count : Word[7] on clock {
+        initial it <= 0w7
+        it <= when {
+            case reset => 0w7
+            case se0   => it + 1w7
+            else       => 0w7
+        }
+    }
+
+}
 
 //> NRZI decoder: recovers the data bit from the synchronized D+/D-
 //> levels.  NRZI encodes a 1 as "line level unchanged since the last
@@ -32,15 +237,13 @@ mod NrziDecoder {
     //> Synchronous reset (core reset from UsbController).  Parks the
     //> level history at the idle line state (J: D+ high, D- low).
     incoming reset : Bit
-    //> 1-clock strobe at the mid-bit sample point (generated by the
-    //> parent's clock recovery: `jk && (ph == 1w2)`).  The decoder
-    //> loads its level history and captures `bit_sampled` on this
-    //> edge.
+    //> 1-clock strobe at the mid-bit sample point.
+    //> The decoder loads its level history
+    //> and captures `bit_sampled` on this edge.
     incoming sample : Bit
-    //> Synchronized D+ sample (the parent owns the 2-flop `Sync`s;
-    //> already aligned to clock).
+    //> Synchronized D+ sample
     incoming dp_sync : Bit
-    //> Synchronized D- sample.
+    //> Synchronized D- sample
     incoming dn_sync : Bit
 
     // The NRZI decode of the line levels: current synchronized
@@ -114,7 +317,7 @@ mod BitDestuffer {
     outgoing reg bit_valid : Bit on clock {
         initial it <= false
         it <= when {
-            case reset                    => false
+            case reset                  => false
             case sample && !drop_state  => true
             else                        => false
         }
@@ -147,11 +350,11 @@ mod BitDestuffer {
     when {
         case reset {
             stuff_count  <= 0w3
-            drop_state <= false
+            drop_state   <= false
         }
         case !active {
             stuff_count  <= 0w3
-            drop_state <= false
+            drop_state   <= false
         }
         case sample {
             stuff_count <= mux(drop_state, 0w3, mux(bit_live, stuff_count + 1w3, 0w3))
@@ -167,209 +370,6 @@ mod BitDestuffer {
     }
 }
 
-//> RxPhy is the physical receiver ("PHY") for the USB.
-//> It is responsible for converting the raw D+ and D- USB signals (`dp` and `dn`).
-//> It takes these and applies the NRZI (non-return to zeror inverting) transform
-//> and bit un-stuffing.
-//>
-//> Since USB is asynchronous, RxPhy also synchronizes the incoming packets.
-//> On a 48 MHz clock, each USB signal is 4 cycles long;
-//> RxPhy samples on the 2nd cycle to get the most accurate reading.
-//>
-//> RxPhy watches for Start-of-Packet (SOP) and End-of-Packet (EOF).
-//>
-//> The output of RxPhy are:
-//> - the decoded bit
-//> - whether we are at the SOP or EOP.
-//> - whether the host requested the device reset
-//> - whether there was an error
-mod RxPhy {
-    //> 48 MHz clock: 4 clock cycles per USB FS bit.
-    incoming clock : Clock
-    //> Synchronous reset (core reset from UsbController).
-    //> Deliberately NOT asserted on bus reset: the bus-reset detector lives here.
-    incoming reset : Bit
-
-    //> Raw D+ pad sample. Asynchronous.
-    incoming dp  : Bit
-    //> Raw D- pad sample. Asynchronous.
-    incoming dn  : Bit
-
-    //> Decoded (NRZI-decoded) data bit, captured at every mid-bit
-    //> sample (including the dropped stuff bit -- the destuffer
-    //> suppresses `bit_valid`, not this).  See NrziDecoder.
-    outgoing bit_o : Bit {
-        it := nrzi_decoder.bit_sampled
-    }
-    //> 1-clock strobe: bit_o is good this cycle (suppressed for the
-    //> dropped stuff bit).  See BitDestuffer.
-    outgoing bit_valid : Bit {
-        it := unstuff.bit_valid
-    }
-    //> 1-clock pulse: J->K seen from idle (start of packet).
-    outgoing reg sop : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset      => false
-            case sop_edge => true
-            else          => false
-        }
-    }
-    //> 1-clock pulse: SE0 held ~1.75 bit times (end of packet).
-    outgoing reg eop : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset     => false
-            case eop_now => true
-            else         => false
-        }
-    }
-    //> Inside a packet (from sop until eop): armed at the sop edge,
-    //> dropped with the eop pulse or on an SE1 (illegal bus state).
-    outgoing reg active : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset      => false
-            case sop_edge => true
-            case abort    => false
-            case eop_now  => false
-            else          => it
-        }
-    }
-    //> Sticky per-packet error: SE1 seen (illegal bus state), or 6
-    //> ones then a 1 (stuffing violation); cleared at the next sop
-    //> (or by reset).
-    outgoing reg error : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset              => false
-            case sop_edge           => false
-            case abort              => true
-            case unstuff.violation => true
-            else                    => it
-        }
-    }
-    //> 1-clock pulse: SE0 held >= 2.5 us (host-issued bus reset;
-    //> see se0_count).
-    outgoing reg bus_reset : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset              => false
-            case se0_count == 119w7 => true
-            else                  => false
-        }
-    }
-
-    //> `dp` but synchronized to `clock`
-    mod sync_dp of Sync {
-        it.inp   := dp
-        it.clock := clock
-    }
-    //> `dn` but synchronized to `clock`
-    mod sync_dn of Sync {
-        it.inp   := dn
-        it.clock := clock
-    }
-    //> NRZI decode of the synchronized pads (see NrziDecoder).
-    mod nrzi_decoder of NrziDecoder {
-        it.clock   := clock
-        it.reset   := reset
-        it.sample  := sample
-        it.dp_sync := sync_dp.out
-        it.dn_sync := sync_dn.out
-    }
-    //> Bit destuffing of the decoded stream (see BitDestuffer).
-    mod unstuff of BitDestuffer {
-        it.clock    := clock
-        it.reset    := reset
-        it.active   := active
-        it.sample   := sample
-        it.bit_live := nrzi_decoder.bit_live
-    }
-    //> Previous-cycle synchronized D+ sample
-    reg dp_p : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset => false
-            else     => sync_dp.out
-        }
-    }
-    //> Previous-cycle synchronized D- sample
-    reg dn_p : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset => false
-            else     => sync_dn.out
-        }
-    }
-
-    wire trans : Bit {
-        it := (sync_dp.out != dp_p) || (sync_dn.out != dn_p)
-    }
-    // bus states: SE0 (both low), SE1 (illegal), K (the sync edge polarity)
-    wire se0 : Bit {
-        it := !sync_dp.out && !sync_dn.out
-    }
-    wire se1 : Bit {
-        it := sync_dp.out && sync_dn.out
-    }
-    wire k : Bit {
-        it := !sync_dp.out && sync_dn.out
-    }
-    // next-state helper cones (mutually exclusive where priority
-    // matters; reset always wins as the first case of every reg)
-    wire sop_edge : Bit {
-        it := !active && k
-    }
-    wire abort : Bit {
-        it := active && se1
-    }
-    wire eop_now : Bit {
-        it := active && se0 && (se0_count == 6w7)
-    }
-    // inside a packet at a J/K level (not SE0/SE1)
-    wire jk : Bit {
-        it := active && !se1 && !se0
-    }
-    // the mid-bit sample point: phase 1 captures the synchronized D+ sample
-    // (sync_dp.out) 2-3 clks after the line switch -- inside the bit's
-    // visibility window for EVERY
-    // achievable quantized window width (3, 4 or 5 clks).  The re-align
-    // at every transition (ph reset, below) makes the counter read 0 one
-    // clock after the transition, so one sample lands per bit window for
-    // run windows of any length (4n-1/4n/4n+1 clks all yield n captures).
-    wire sample : Bit {
-        it := jk && (ph == 1w2)
-    }
-
-    //> Bit-phase counter (0..3 clks into the current bit).  Clock
-    //> recovery: re-aligned to 0 on every line transition; phase 1 is
-    //> the mid-bit sample (see the `sample` wire).
-    reg ph : Word[2] on clock {
-        initial it <= 0w2
-        it <= when {
-            case reset       => 0w2
-            case sop_edge  => 0w2
-            case jk        => mux(trans, 0w2, it + 1w2)
-            else           => it
-        }
-    }
-
-    //> Standalone SE0 timer: the EOP threshold is checked off
-    //> `eop_now` (~1.75 bit times = 7 clks); bus_reset fires when the
-    //> count reaches 119, i.e. after 120 SE0 clks = 2.5 us.  The
-    //> 7-bit counter wraps, so sustained reset SE0 re-pulses every
-    //> 128 clks (the ep0 FSM treats each pulse identically).
-    reg se0_count : Word[7] on clock {
-        initial it <= 0w7
-        it <= when {
-            case reset => 0w7
-            case se0 => it + 1w7
-            else     => 0w7
-        }
-    }
-
-}
 
 //> usb_tx_phy -- packet records back to pads (USB 2.0 §7.1.x), the
 //> mirror of the RxPhy in ext/usb_uart.sv.  Drives a complete FS
