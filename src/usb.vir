@@ -219,7 +219,10 @@ mod RxRam {
 //> (Valid[TokenRec] / Valid[DataRec] / Valid[HsRec]) are unpacked to
 //> the flat tk_*/dt_*/hs_* fields here, with the @Invalid defaults
 //> reproducing the pre-split reset values (fields 0, crc verdicts
-//> false), so the port list is unchanged.  A packet record is emitted
+//> false), so the port list is unchanged.  The records themselves
+//> are ALSO passed through (tok_rec/data_rec/hs_rec) for the
+//> in-design consumers, which unpack them with match.  A packet
+//> record is emitted
 //> only if the packet was good; CRC failures deliver the record with
 //> *_crc_ok low instead (the protocol layer retries), while stuff
 //> errors, bad PIDs and over-length payloads make the packet silent
@@ -258,6 +261,23 @@ mod RxPacket {
         it.eop := eop
         it.pkt_err := pkt_err
         it.dt_rd_addr := dt_rd_addr
+    }
+
+    // ---- record pass-throughs -------------------------------------------
+    //> The held records, for the in-design consumers (they unpack
+    //> them with match).  The flat ports below remain the
+    //> plain-Verilog TB contract (tb/tb_usb_phy.v).
+    //> The held token record (until the next token).
+    outgoing tok_rec : Valid[TokenRec] {
+        it := core.tok_rec
+    }
+    //> The held data record (until the next data packet).
+    outgoing data_rec : Valid[DataRec] {
+        it := core.data_rec
+    }
+    //> The held handshake record (until the next handshake).
+    outgoing hs_rec : Valid[HsRec] {
+        it := core.hs_rec
     }
 
     // ---- flat pass-throughs --------------------------------------------
@@ -1153,19 +1173,39 @@ mod Ep0 {
     //> Router-gated data packet strobe: EP0 expects this packet (the
     //> SETUP request packet, or the status-stage ZLP).
     incoming dt_valid : Bit
-    //> Data packet PID (DATA0 3 / DATA1 B).
-    incoming dt_pid : Word[4]
-    //> Data packet payload byte count.
-    incoming dt_len : Word[7]
+    //> The packet assembler's held data record (fields hold between
+    //> packets; EP0 reads them at the registered accept, one clock
+    //> after the strobe).
+    incoming dat : Valid[DataRec]
     //> Payload head window, packet bytes 0..7 (usb::RxPacket's flopped
     //> head shadow -- EP0 only ever reads the 8-byte request header:
     //> the SETUP packet, or the status-stage ZLP which has no payload;
     //> never the payload RAM bytes 8..63).
     incoming dt_head : Word[64]
-    //> Data packet CRC16 verdict.
-    incoming dt_crc_ok : Bit
     //> Router-gated handshake strobe: EP0's response was ACKed.
     incoming hs_ack : Bit
+
+    //> The held data record, unpacked (the @Invalid default
+    //> reproduces the flat-port reset values).
+    wire dt : DataRec {
+        it := match dat {
+            case @Valid(d) => d
+            case @Invalid() => ${
+                pid = 0w4,
+                len = 0w7,
+                crc_ok = false,
+            }
+        }
+    }
+    wire dt_pid : Word[4] {
+        it := dt->pid
+    }
+    wire dt_len : Word[7] {
+        it := dt->len
+    }
+    wire dt_crc_ok : Bit {
+        it := dt->crc_ok
+    }
 
     // ---- tx response request (1-clock pulse; params held) ------------
     //> 1-clock response request for the core's arbiter.
@@ -1737,14 +1777,31 @@ mod Serial {
     //> delayed a clock, unlike EP0's -- the accept decision below is
     //> itself registered).
     incoming dt_valid : Bit
-    //> Data packet PID.
-    incoming dt_pid : Word[4]
-    //> Data packet payload byte count.
-    incoming dt_len : Word[7]
-    //> Data packet CRC16 verdict.
-    incoming dt_crc_ok : Bit
+    //> The packet assembler's held data record (fields hold between
+    //> packets; the accept decision registers one clock after the
+    //> strobe).
+    incoming dat : Valid[DataRec]
     //> Router-gated handshake strobe: our in-flight packet was ACKed.
     incoming hs_ack : Bit
+
+    //> The held data record, unpacked (the @Invalid default
+    //> reproduces the flat-port reset values).
+    wire dt : DataRec {
+        it := match dat {
+            case @Valid(d) => d
+            case @Invalid() => ${
+                pid = 0w4,
+                len = 0w7,
+                crc_ok = false,
+            }
+        }
+    }
+    wire dt_pid : Word[4] {
+        it := dt->pid
+    }
+    wire dt_crc_ok : Bit {
+        it := dt->crc_ok
+    }
     //> Tx FIFO status: nothing queued for the host.
     incoming txfifo_empty : Bit
     //> Tx FIFO fill (for arm sizing: min(count, 64) bytes).
@@ -1847,11 +1904,10 @@ mod Serial {
     }
 
     unused tx_room
-    // Unused inputs: tx_room (arm sizing reads txfifo_count directly)
-    // and dt_len (the core's rx push counts the packet's bytes
-    // itself; the whole packet is accepted or rejected on rx_room
-    // alone).
-    unused dt_len
+    // Unused input: tx_room (arm sizing reads txfifo_count directly).
+    // The data record's len field is likewise unread here: the rx
+    // push (usb::UsbByteStream) counts the packet's bytes itself, and
+    // the whole packet is accepted or rejected on rx_room alone.
 
     // ---- combinational helpers -------------------------------------------
     //> The data pid the armed OUT expects (toggle-dependent).
@@ -2114,21 +2170,15 @@ mod UsbTokenRouter {
     incoming dev_addr : Word[7]
     //> Packet assembler token-record strobe (a token's EOP).
     incoming tk_valid : Bit
-    //> Packet assembler token-record CRC5 verdict.
-    incoming tk_crc_ok : Bit
-    //> Packet assembler token-record fields (they hold between
-    //> packets).
-    incoming tk_addr : Word[7]
-    //> Token PID (OUT 1 / IN 9 / SOF 5 / SETUP D).
-    incoming tk_pid : Word[4]
-    //> Token endpoint number.
-    incoming tk_endp : Word[4]
+    //> The packet assembler's held token record (fields hold between
+    //> packets; the strobe is the arrival event).
+    incoming tok : Valid[TokenRec]
     //> Packet assembler data-record strobe (a data packet's EOP).
     incoming dt_valid : Bit
-    //> Packet assembler handshake-record strobe + PID.
+    //> Packet assembler handshake-record strobe (a handshake's EOP).
     incoming hs_valid : Bit
-    //> Handshake PID (ACK 2 / NAK A / STALL E).
-    incoming hs_pid : Word[4]
+    //> The packet assembler's held handshake record.
+    incoming hs : Valid[HsRec]
     //> EP0 router hints: a data packet is expected (ep0_busy), the
     //> transfer is STALLed (ep0_stalling), a response is in flight
     //> (ep0_wait_ack).
@@ -2143,6 +2193,41 @@ mod UsbTokenRouter {
     incoming ser_busy : Bit
     //> A serial response is in flight (the handshake goes to serial).
     incoming ser_ack_wait : Bit
+
+    // ---- record field extraction ----------------------------------------
+    //> The @Invalid defaults reproduce the flat-port reset values
+    //> (fields 0, crc verdicts false); between packets the held
+    //> @Valid record serves the fields.
+    wire tk : TokenRec {
+        it := match tok {
+            case @Valid(t) => t
+            case @Invalid() => ${
+                pid = 0w4,
+                crc_ok = false,
+                addr = 0w7,
+                endp = 0w4,
+                frame = 0w11,
+            }
+        }
+    }
+    wire tk_crc_ok : Bit {
+        it := tk->crc_ok
+    }
+    wire tk_addr : Word[7] {
+        it := tk->addr
+    }
+    wire tk_pid : Word[4] {
+        it := tk->pid
+    }
+    wire tk_endp : Word[4] {
+        it := tk->endp
+    }
+    wire hs_pid : Word[4] {
+        it := match hs {
+            case @Valid(h) => h->pid
+            case @Invalid() => 0w4
+        }
+    }
 
     // ---- token-valid gate ----------------------------------------------
     //> The device answers only tokens whose CRC5 checks out AND whose
@@ -2497,11 +2582,28 @@ mod UsbByteStream {
     //> Serial accepted the OUT packet (its ACK response): the payload
     //> streams into the rx FIFO.
     incoming ser_accept : Bit
-    //> The accepted packet's payload byte count (rxpkt.dt_len).
-    incoming dt_len : Word[7]
+    //> The packet assembler's held data record (the rx push reads
+    //> its len field: the accepted packet's payload byte count).
+    incoming dat : Valid[DataRec]
     //> The packet payload RAM's registered read byte (paired with the
     //> push strobe one clock later).
     incoming dt_rd_data : Word[8]
+
+    //> The held data record, unpacked (the @Invalid default is the
+    //> flat dt_len port's reset value 0).
+    wire dt : DataRec {
+        it := match dat {
+            case @Valid(d) => d
+            case @Invalid() => ${
+                pid = 0w4,
+                len = 0w7,
+                crc_ok = false,
+            }
+        }
+    }
+    wire dt_len : Word[7] {
+        it := dt->len
+    }
     //> The snapshot loader's pop strobe: the tx FIFO pops exactly the
     //> arm-time min(count,64), one byte per clock (so it can never
     //> meet empty mid-load).
@@ -2839,13 +2941,26 @@ mod UsbUart {
         it.dt_rd_addr := bytestream.push_i[6..0]
         // SOF frames decode but are ignored (the device does no SOF
         // bookkeeping).
+        // SOF frames decode but are ignored (the device does no SOF
+        // bookkeeping); the flat frame field is left unconnected --
+        // the in-design consumers read the record fields off tok_rec
+        // instead.  The remaining flat field outputs are likewise
+        // TB-only now (the in-design consumers take the records).
         unused it.tk_frame
+        unused it.tk_pid
+        unused it.tk_addr
+        unused it.tk_endp
+        unused it.tk_crc_ok
+        unused it.dt_pid
+        unused it.dt_len
+        unused it.dt_crc_ok
+        unused it.hs_pid
     }
 
     // ---- EP0 + serial protocol modules ---------------------------------
     //> EP0 (control transfers + CDC requests) and Serial (EP1 bulk
-    //> data): see their own banners.  The dt_* data fields are shared
-    //> straight off the packet assembler (they hold between packets);
+    //> data): see their own banners.  The data record is shared
+    //> straight off the packet assembler (it holds between packets);
     //> only the per-module data strobes are gated by the router.
     mod ep0 of Ep0 {
         it.clock       := clock
@@ -2855,10 +2970,8 @@ mod UsbUart {
         it.tk_in     := router.ep0_tk_in_r
         it.tk_out    := router.ep0_tk_out_r
         it.dt_valid  := router.ep0_dt_valid_r
-        it.dt_pid    := rxpkt.dt_pid
-        it.dt_len    := rxpkt.dt_len
+        it.dat       := rxpkt.data_rec
         it.dt_head   := rxpkt.dt_head
-        it.dt_crc_ok := rxpkt.dt_crc_ok
         it.hs_ack    := router.ep0_hs_ack
     }
 
@@ -2870,9 +2983,7 @@ mod UsbUart {
         it.tk_in     := router.ser_tk_in_r
         it.tk_out    := router.ser_tk_out_r
         it.dt_valid  := router.ser_dt_valid
-        it.dt_pid    := rxpkt.dt_pid
-        it.dt_len    := rxpkt.dt_len
-        it.dt_crc_ok := rxpkt.dt_crc_ok
+        it.dat       := rxpkt.data_rec
         it.hs_ack    := router.ser_hs_ack
         it.txfifo_empty := bytestream.tx_empty
         it.txfifo_count := bytestream.tx_count
@@ -2890,13 +3001,10 @@ mod UsbUart {
         it.bus_reset := rxphy.bus_reset
         it.dev_addr  := ep0.dev_addr
         it.tk_valid  := rxpkt.tk_valid
-        it.tk_crc_ok := rxpkt.tk_crc_ok
-        it.tk_addr   := rxpkt.tk_addr
-        it.tk_pid    := rxpkt.tk_pid
-        it.tk_endp   := rxpkt.tk_endp
+        it.tok       := rxpkt.tok_rec
         it.dt_valid  := rxpkt.dt_valid
         it.hs_valid  := rxpkt.hs_valid
-        it.hs_pid    := rxpkt.hs_pid
+        it.hs        := rxpkt.hs_rec
         it.ep0_busy    := ep0.ep0_busy
         it.ep0_stalling := ep0.ep0_stalling
         it.ep0_wait_ack := ep0.ep0_wait_ack
@@ -2946,7 +3054,7 @@ mod UsbUart {
         it.reset      := reset
         it.bus_reset  := rxphy.bus_reset
         it.ser_accept := ser_accept
-        it.dt_len     := rxpkt.dt_len
+        it.dat        := rxpkt.data_rec
         it.dt_rd_data := rxpkt.dt_rd_data
         it.tx_pop     := loader.load_run
         it.rx.ready   := rx.ready
