@@ -164,6 +164,18 @@ downstream anyway.
 
 This is textbook NRZI: no transition encodes `1`, transition encodes `0`.
 
+This logic lives in its own mod, `usb::NrziDecoder` (instantiated as
+`nrzi_decoder` inside `RxPhy`). It owns `lev_d`/`lev_n` and the captured
+bit, and exposes two outputs with a distinction worth internalizing:
+`bit_live` is the *combinational* decode of the line levels as they are
+right now -- only meaningful at sample instants, and consumed at the
+sample edge by same-edge decision logic (the destuffer, `error`).
+`bit_sampled` is the *registered* capture of that decode on the sample
+edge -- the stable, per-bit-time answer that downstream layers read
+(exposed through `RxPhy`'s `bit_o` port). The parent keeps ownership of
+the pad synchronizers and the clock recovery that generates the
+`sample` strobe.
+
 ## Bit unstuffing
 
 Transmitters insert a `0` after six consecutive `1`s. The receiver must
@@ -184,6 +196,13 @@ it, so it stops at 6 and never wraps. Note the asymmetry: the run counter only
 advances at mid-bit samples (and only in-packet), and the drop sample itself
 zeroes it — the stuffed bit is a forced transition (a decoded `0`), so it
 naturally resets the run.
+
+This logic also lives in its own mod, `usb::BitDestuffer` (instantiated as
+`unstuff` inside `RxPhy`). It owns `stuff_count`/`drop_state` and the
+`bit_valid` gate, takes the decoder's live decode (`bit_live`) as input,
+and raises a combinational `violation` output at the offending sample;
+the parent's `error` register latches that term (alongside the SE1/abort
+term) until the next SOP or reset.
 
 ## EOP and bus reset: the SE0 timer
 

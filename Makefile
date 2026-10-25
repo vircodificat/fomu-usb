@@ -28,7 +28,13 @@ USB_SRVS := ext/usb_uart.sv
 PADS_SV  := ext/usb_pads.sv
 ECHO_SV  := ext/echo_fifo.sv
 EXT_SRVS := $(USB_SRVS) $(PADS_SV) $(ECHO_SV)
-USB_BUILD := build/builtin.sv build/usb.sv build/echo.sv build/uart.sv
+# crc.sv / phy.sv come from src/crc.vir / src/phy.vir (see also the import
+# lines at the top of src/usb.vir).
+# Core = everything a TB that doesn't drive the echo path can elaborate
+# without ext/echo_fifo.sv (EchoServer's EchoFifo ext body); USB_BUILD
+# adds echo/uart on top for the serial TB and synth.
+USB_BUILD_CORE := build/builtin.sv build/crc.sv build/usb.sv build/phy.sv
+USB_BUILD := $(USB_BUILD_CORE) build/echo.sv build/uart.sv
 
 # Testbench sources.  tb/usb_host_bfm.v is an include file (tasks/macros
 # meant to be `include`d inside a TB module) and is never compiled on its own.
@@ -90,13 +96,18 @@ build:
 ## test — the PoC's primary acceptance: all iverilog testbenches pass.
 test: build test-crc test-usb-phy test-usb-serial
 
+# The crc and usb-phy TBs need only the modules they drive directly +
+# the ones instantiated inside usb.sv -- NOT echo/uart (echo::EchoFifo's
+# ext body ext/echo_fifo.sv isn't on these compile lines, so
+# build/echo.sv would fail on 'Unknown module type: echo::EchoFifo').
 test-crc: tools
-	$(IVERILOG) -g2012 -gspecify -o build/tb_crc.vvp $(USB_SRVS) $(SB_RAM_SIM) build/builtin.sv build/usb.sv tb/tb_crc.v
+	$(IVERILOG) -g2012 -gspecify -o build/tb_crc.vvp $(USB_SRVS) $(SB_RAM_SIM) \
+	    $(USB_BUILD_CORE) tb/tb_crc.v
 	$(VVP) build/tb_crc.vvp
 
 test-usb-phy: tools
 	$(IVERILOG) -g2012 -gspecify -o build/tb_usb_phy.vvp \
-	    $(USB_SRVS) $(SB_RAM_SIM) build/builtin.sv build/usb.sv tb/usb_host_bfm.v tb/tb_usb_phy.v
+	    $(USB_SRVS) $(SB_RAM_SIM) $(USB_BUILD_CORE) tb/usb_host_bfm.v tb/tb_usb_phy.v
 	$(VVP) build/tb_usb_phy.vvp
 
 test-usb-serial: tools

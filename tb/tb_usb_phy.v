@@ -2,7 +2,7 @@
 // Part of ~/projects/fomu-usb (see FOMU_UART_OVER_USB_PLANv2.md §7).
 // Hand-written Verilog-2005 for iverilog.
 //
-// Wires the BFM's pad driver straight into \usb::RxPhy + \usb::RxPacket,
+// Wires the BFM's pad driver straight into \phy::RxPhy + \usb::RxPacket,
 // and loops the core's usb_tx_phy output back onto the same nets (via a
 // tri-state driver, like the SB_IO would): BFM-sent packets must decode
 // with correct PID/addr/EP/bytes/CRC, and core-sent packets must be
@@ -26,12 +26,12 @@ module tb_usb_phy;
     // core RX chain
     // ------------------------------------------------------------------
     wire rx_bit, rx_bitv, rx_sop, rx_eop, rx_act, rx_perr, rx_breset;
-    \usb::RxPhy rxphy(
-        .clk(clk), .rst(rst),
+    \phy::RxPhy rxphy(
+        .clock(clk), .reset(rst),
         .dp(usb_dp), .dn(usb_dn),
         .bit_o(rx_bit), .bit_valid(rx_bitv),
         .sop(rx_sop), .eop(rx_eop), .active(rx_act),
-        .pkt_err(rx_perr), .bus_reset(rx_breset));
+        .error(rx_perr), .bus_reset(rx_breset));
 
     wire tk_valid, tk_crc_ok, dt_valid, dt_crc_ok, hs_valid;
     wire [3:0] tk_pid, dt_pid, hs_pid;
@@ -46,7 +46,7 @@ module tb_usb_phy;
     wire [7:0]  dt_rd_data;
     reg  [5:0]  dt_rd_addr = 6'd0;
     \usb::RxPacket rxpkt(
-        .clk(clk), .rst(rst), .bus_reset(rx_breset),
+        .clock(clk), .reset(rst), .bus_reset(rx_breset),
         .bit_i(rx_bit), .bit_valid(rx_bitv),
         .sop(rx_sop), .eop(rx_eop), .pkt_err(rx_perr),
         .tk_valid(tk_valid), .tk_pid(tk_pid), .tk_addr(tk_addr),
@@ -66,8 +66,8 @@ module tb_usb_phy;
     wire [6:0] tx_addr;
     wire [7:0] tx_byte = tx_bytes[tx_addr];
     wire tx_busy, tx_done, dut_dp, dut_dn, dut_oe;
-    \usb::TxPhy txphy(
-        .clk(clk), .rst(rst),
+    \phy::TxPhy txphy(
+        .clock(clk), .reset(rst),
         .tx_start(tx_start), .tx_pid(tx_pid), .tx_len(tx_len),
         .tx_byte(tx_byte), .tx_addr(tx_addr),
         .tx_busy(tx_busy), .tx_done(tx_done),

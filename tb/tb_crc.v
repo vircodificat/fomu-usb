@@ -1,6 +1,6 @@
-// Fomu UART-over-USB PoC — known-answer TB for usb::Crc5 / usb::Crc16
-// (the serial CRC LFSRs, migrated to src/usb.vir; generated Verilog in
-// build/usb.sv).
+// Fomu UART-over-USB PoC — known-answer TB for crc::Crc5 / crc::Crc16
+// (the serial CRC LFSRs, in src/crc.vir; generated Verilog in
+// build/crc.sv).
 // Part of ~/projects/fomu-usb (see FOMU_UART_OVER_USB_PLANv2.md §7).
 // Hand-written Verilog-2005.  Vectors cross-checked against valentyusb
 // (BSD-3-Clause, ~/repos/valentyusb):
@@ -24,8 +24,8 @@ module tb_crc;
     wire [4:0]  crc5;
     wire [15:0] crc16;
 
-    \usb::Crc5 u_crc5 (.clk(clk), .rst(rst), .adv(adv), .din(din), .crc(crc5));
-    \usb::Crc16 u_crc16 (.clk(clk), .rst(rst), .adv(adv), .din(din), .crc(crc16));
+    \crc::Crc5 u_crc5 (.clock(clk), .reset(rst), .advance(adv), .din(din), .crc(crc5));
+    \crc::Crc16 u_crc16 (.clock(clk), .reset(rst), .adv(adv), .din(din), .crc(crc16));
 
     integer errors = 0;
     reg [7:0] tmp [0:63];

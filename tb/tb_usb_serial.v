@@ -44,8 +44,8 @@ module tb_usb_serial;
     // post-split topology of export mod Top in src/top.vir.
     // ------------------------------------------------------------------
     wire por_done;
-    \usb::UsbPor por(
-        .clock(clk), .por_done(por_done));
+    \usb::PowerOnReset por(
+        .clock(clk), .done(por_done));
 
     wire usb_dp_pu = por_done;    // wired at the top in src/top.vir
     wire rxing, txing;
