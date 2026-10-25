@@ -6,7 +6,7 @@
 // cross-referenced against valentyusb (BSD-3-Clause, ~/repos/valentyusb)
 // as a reading reference only; all code here is original.
 //
-// Single clock domain: 48 MHz (4 clk cycles per USB FS bit), no PLL, no
+// Single clock domain: 48 MHz (4 clock cycles per USB FS bit), no PLL, no
 // CDC.  FS only, one configuration, EP0 control + EP1 IN/OUT bulk; no
 // suspend/resume, no SOF bookkeeping (SOF tokens are captured and
 // ignored).  The CDC notification endpoint EP2 IN exists in the
@@ -52,10 +52,10 @@
 // never accept; 64 B is also exactly what a real device's endpoint
 // buffer holds.
 // rd_data is the combinational head (RAM=0) or the head delayed one
-// clk (RAM=1: block-RAM storage with a free-running registered read
+// clock (RAM=1: block-RAM storage with a free-running registered read
 // port -- the 64-deep rx side uses it, taking 512 flops and their
 // per-byte write-decode cones out of the fabric).  With RAM=1 the
-// popped byte is on rd_data one clk after rd_en.
+// popped byte is on rd_data one clock after rd_en.
 // CONTRACT: wr_en must be pre-gated with !full by the caller, and
 // rd_en with !empty.  The FIFO has no internal protection: a push
 // while full or a pop while empty corrupts cnt and the pointers.  By
@@ -74,8 +74,8 @@ module usb_fifo16x8 #(
     parameter AW    = 4,
     parameter RAM   = 0
 )(
-    input  wire        clk,
-    input  wire        rst,
+    input  wire        clock,
+    input  wire        reset,
     input  wire        wr_en,
     input  wire [7:0]  wr_data,
     input  wire        rd_en,
@@ -98,7 +98,7 @@ module usb_fifo16x8 #(
         if (RAM != 0) begin : g_ram
             (* ram_style = "block" *) reg [7:0] mem [0:DEPTH-1];
             reg [7:0] rd_q;
-            always @(posedge clk) begin
+            always @(posedge clock) begin
                 if (do_wr)
                     mem[wptr] <= wr_data;
                 rd_q <= mem[rptr];     // free-running registered read
@@ -106,7 +106,7 @@ module usb_fifo16x8 #(
             assign rd_data = rd_q;
         end else begin : g_ff
             (* no_ram *) reg [7:0] mem [0:DEPTH-1];
-            always @(posedge clk) begin
+            always @(posedge clock) begin
                 if (do_wr)
                     mem[wptr] <= wr_data;
             end
@@ -114,8 +114,8 @@ module usb_fifo16x8 #(
         end
     endgenerate
 
-    always @(posedge clk) begin
-        if (rst) begin
+    always @(posedge clock) begin
+        if (reset) begin
             wptr <= {AW{1'b0}};
             rptr <= {AW{1'b0}};
             cnt  <= 7'd0;
@@ -145,8 +145,8 @@ endmodule
 // enables) is the usb_fifo16x8 header's; the wrappers add nothing.
 // ===========================================================================
 module \usb::TxFifo (
-    input  wire       clk,
-    input  wire       rst,
+    input  wire       clock,
+    input  wire       reset,
     input  wire       wr_en,
     input  wire [7:0] wr_data,
     input  wire       rd_en,
@@ -156,15 +156,15 @@ module \usb::TxFifo (
     output wire       empty
 );
     usb_fifo16x8 u (   // defaults: DEPTH=16, AW=4, RAM=0 (flops, comb head)
-        .clk(clk), .rst(rst),
+        .clock(clock), .reset(reset),
         .wr_en(wr_en), .wr_data(wr_data),
         .rd_en(rd_en), .rd_data(rd_data),
         .count(count), .full(full), .empty(empty));
 endmodule
 
 module \usb::RxFifo (
-    input  wire       clk,
-    input  wire       rst,
+    input  wire       clock,
+    input  wire       reset,
     input  wire       wr_en,
     input  wire [7:0] wr_data,
     input  wire       rd_en,
@@ -174,7 +174,7 @@ module \usb::RxFifo (
     output wire       empty
 );
     usb_fifo16x8 #(.DEPTH(64), .AW(6), .RAM(1)) u (   // BRAM, registered head
-        .clk(clk), .rst(rst),
+        .clock(clock), .reset(reset),
         .wr_en(wr_en), .wr_data(wr_data),
         .rd_en(rd_en), .rd_data(rd_data),
         .count(count), .full(full), .empty(empty));
@@ -183,7 +183,7 @@ endmodule
 // ===========================================================================
 // \usb::DescRom -- the descriptor ROM, ext body of usb::DescRom
 // (src/usb.vir).  256x8 initialized block RAM, registered sync read
-// (ra presented this clk -> rd next clk).  Contiguous pages, addressed
+// (ra presented this clock -> rd next clock).  Contiguous pages, addressed
 // by usb::UsbUart's rom_page map (src/usb.vir): sel0 device@0 (18 B),
 // sel1 config@18 (75 B), sel2 str0@93 (4 B), sel3 str1@97 (10 B),
 // sel4 str2@107 (32 B -- bLength 0x20; the string data is followed by
@@ -195,7 +195,7 @@ endmodule
 // ice40::SbRam40_4k cell would need an INIT_FILE hex image instead.
 // ===========================================================================
 module \usb::DescRom (
-    input  wire       clk,
+    input  wire       clock,
     input  wire [7:0] ra,
     output reg  [7:0] rd
 );
@@ -458,5 +458,5 @@ module \usb::DescRom (
             desc_rom[8'd254] = 8'h00;
             desc_rom[8'd255] = 8'h00;
     end
-    always @(posedge clk) rd <= desc_rom[ra];
+    always @(posedge clock) rd <= desc_rom[ra];
 endmodule

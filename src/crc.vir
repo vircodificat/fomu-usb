@@ -1,0 +1,81 @@
+//> Serial CRC LFSRs (USB 2.0 §8.3.5).
+//> Both advance one serial WIRE bit per clock while `adv` is high (wire order = LSB first).
+//> The checker convention feeds the received wire CRC bits through the
+//> LFSR too and compares the final state against the residual (token
+//> CRC5: 5'h0C, data CRC16: 16'h800D) -- see the residual compares in
+//> RxPacket.  Known-answer vectors live in tb/tb_crc.v, cross-checked
+//> against valentyusb.  In this design Crc5 is receive-side only (the
+//> device never transmits tokens); Crc16 also generates the TX data
+//> CRC in TxPhy.
+//>
+//> CRC5, poly x^5+x^2+1, seed 0x1F -- the token CRC over
+//> addr[6:0] + endp[3:0].  Used receive-side only: RxPacket advances
+//> it over the token bits and checks the residual.
+mod Crc5 {
+    //> 48 MHz clock.
+    incoming clock : Clock
+    //> Synchronous reset: re-seed the LFSR to 0x1F (RxPacket asserts
+    //> it at sop / bus reset / core reset).
+    incoming reset : Bit
+    //> Advance one serial wire bit on this clock edge.
+    incoming advance : Bit
+    //> Serial input bit, wire order (LSB first).
+    incoming din : Bit
+    //> Current LFSR state.
+    //> In this checker-only role the caller compares it against the residual 5'h0C,
+    //> which is what remains after a good token stream incl. its received CRC bits.
+    //> Next state = {crc[3:0], inv} with the x^2 tap XORed into bit 2.
+    //> seeds to 0x1F.
+    outgoing reg crc : Word[5] on clock {
+        initial it <= 31w5
+        it <= when {
+            case reset => 31w5
+            case advance => word(it[4..0], inv) ^ word(0w2, inv, 0w2)
+            else     => it
+        }
+    }
+
+    //> Feedback bit: din XOR the x^5 tap (crc[4]).
+    wire inv : Bit {
+        it := din ^ crc[4]
+    }
+
+}
+
+//> CRC16, poly x^16+x^15+x^2+1, seed 0xFFFF -- the data-payload CRC:
+//> checker in RxPacket, generator for TX data packets in TxPhy.
+mod Crc16 {
+    //> 48 MHz clock.
+    incoming clock : Clock
+    //> Synchronous reset: re-seed the LFSR to 0xFFFF.
+    incoming reset : Bit
+    //> Advance one serial wire bit on this clock edge.
+    incoming adv : Bit
+    //> Serial input bit, wire order (LSB first).
+    incoming din : Bit
+    //> Current LFSR state.  As a generator (TxPhy): the transmitted
+    //> wire stream is ~crc shifted out MSB-first, i.e. crc_wire[i] =
+    //> ~crc[15-i] with i = 0 the first bit on the wire (the ext
+    //> header's "complement + bit-reverse, low byte first"
+    //> convention; TxPhy realizes it by loading crc_shift with
+    //> crc ^ 0xFFFF and shifting MSB-first).  As a checker
+    //> (RxPacket): after a good payload incl. its received CRC bits
+    //> the state is the residual 16'h800D.
+    //> The 16-bit shift register.  Next state = {crc[14:0], inv} with
+    //> the x^15 tap XORed into bit 15 and the x^2 tap into bit 2;
+    //> seeds to 0xFFFF.
+    outgoing reg crc : Word[16] on clock {
+        initial it <= 65535w16
+        it <= when {
+            case reset => 65535w16
+            case adv => word(it[15..0], inv) ^ word(inv, 0w12, inv, 0w2)
+            else     => it
+        }
+    }
+
+    //> Feedback bit: din XOR the x^16 tap (crc[15]).
+    wire inv : Bit {
+        it := din ^ crc[15]
+    }
+
+}
