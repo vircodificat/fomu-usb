@@ -93,6 +93,54 @@ mod PowerOnReset {
     }
 }
 
+//> A decoded token packet record: usb::RxTokenRec latches it at the
+//> token's EOP and holds it until the next token.  The fields are
+//> FLAT, not a union: on a SOF capture the addr/endp slots go stale
+//> and the frame slot is captured, and vice versa on non-SOF tokens
+//> -- exactly the per-field reg semantics this record replaced.
+//>
+//> `pid` -- the 4-bit PID value (OUT 1 / IN 9 / SOF 5 / SETUP D).
+//> `crc_ok` -- the registered CRC5 residual verdict (5'h0C after a
+//>   good token stream): a CRC failure delivers the record with this
+//>   low, so the protocol layer retries.
+//> `addr` -- the device address (sh[7..0]; non-SOF tokens only:
+//>   stale on SOF).
+//> `endp` -- the endpoint number (sh[11..7]; non-SOF tokens only:
+//>   stale on SOF).
+//> `frame` -- the SOF frame number (the whole sh; SOF tokens only:
+//>   stale on non-SOF tokens).
+struct type TokenRec {
+    pid : Word[4]
+    crc_ok : Bit
+    addr : Word[7]
+    endp : Word[4]
+    frame : Word[11]
+}
+
+//> A decoded data packet record: usb::RxDataRec latches it at the
+//> data packet's EOP and holds it until the next data packet.
+//>
+//> `pid` -- the 4-bit data PID value (DATA0 3 / DATA1 B).
+//> `len` -- the payload byte count: the data-section byte count
+//>   minus the 2 crc16 wire bytes (0 for a bare 2-byte packet).
+//> `crc_ok` -- the registered CRC16 residual verdict (16'h800D after
+//>   a good payload stream): a CRC failure delivers the record with
+//>   this low, so the protocol layer retries.
+struct type DataRec {
+    pid : Word[4]
+    len : Word[7]
+    crc_ok : Bit
+}
+
+//> A decoded handshake record: usb::RxHandshakeRec latches it at the
+//> handshake's EOP and holds it until the next handshake.  Nothing
+//> follows the PID byte on the wire.
+//>
+//> `pid` -- the 4-bit handshake PID value (ACK 2 / NAK A / STALL E).
+struct type HsRec {
+    pid : Word[4]
+}
+
 //> usb_rx_packet -- assembles the serial bit stream into packet
 //> records (PID, tokens, data payloads, handshakes).  The
 //> registered-helper structure (the cap precompute + qualify dance)
@@ -164,29 +212,18 @@ mod RxRam {
 //> pulses -- tk_* (token: OUT/IN/SOF), dt_* (data: payload +
 //> read port), hs_* (handshake) -- for the router in the core top.
 //>
-//> The tk_*, hs_* and dt_* record regs (plus the head window) are
-//> factored out verbatim into usb::RxTokenRec, usb::RxHandshakeRec
-//> and usb::RxDataRec (instantiated below, fed from this module's
-//> private shared state); the outgoing ports here are pure
-//> pass-throughs, so the port list is unchanged.
-//> A packet record is emitted only if the packet was good; CRC
-//> failures deliver the record with *_crc_ok low instead (the
-//> protocol layer retries), while stuff errors, bad PIDs and
-//> over-length payloads make the packet silent (bad).
-//> Bit stream -> packet records: consumes usb::RxPhy's decoded bit
-//> stream (bit_i/bit_valid/sop/eop/pkt_err) and emits 1-clock record
-//> pulses -- tk_* (token: OUT/IN/SOF), dt_* (data: payload +
-//> read port), hs_* (handshake) -- for the router in the core top.
-//>
 //> The FLAT record ports are a contract: tb/tb_usb_phy.v instantiates
 //> this mod directly, and wiki/usb-rx-packet.md documents the port
 //> list.  The packet engine (and the three record captures it feeds)
-//> lives in usb::RxPacketCore, instantiated below; every outgoing
-//> port here is a pure pass-through of core's, so the port list is
-//> unchanged.  A packet record is emitted only if the packet was
-//> good; CRC failures deliver the record with *_crc_ok low instead
-//> (the protocol layer retries), while stuff errors, bad PIDs and
-//> over-length payloads make the packet silent (bad).
+//> lives in usb::RxPacketCore, instantiated below; the held records
+//> (Valid[TokenRec] / Valid[DataRec] / Valid[HsRec]) are unpacked to
+//> the flat tk_*/dt_*/hs_* fields here, with the @Invalid defaults
+//> reproducing the pre-split reset values (fields 0, crc verdicts
+//> false), so the port list is unchanged.  A packet record is emitted
+//> only if the packet was good; CRC failures deliver the record with
+//> *_crc_ok low instead (the protocol layer retries), while stuff
+//> errors, bad PIDs and over-length payloads make the packet silent
+//> (bad).
 mod RxPacket {
     //> 48 MHz clock: 4 clock cycles per USB FS bit.
     incoming clock : Clock
@@ -224,43 +261,76 @@ mod RxPacket {
     }
 
     // ---- flat pass-throughs --------------------------------------------
-    //> Token record (usb::RxPacketCore's tokrec).
-    //> 1-clock pulse: a token record is in tk_* (latched this edge).
-    //> Token strobe.
+    //> The held records (usb::RxPacketCore's captures), unpacked to
+    //> the FLAT record ports.  While a record is @Invalid, its flat
+    //> fields serve the pre-split reset values (fields 0, crc
+    //> verdicts false).
+    wire tok_p : TokenRec {
+        it := match core.tok_rec {
+            case @Valid(t) => t
+            case @Invalid() => ${
+                pid = 0w4,
+                crc_ok = false,
+                addr = 0w7,
+                endp = 0w4,
+                frame = 0w11,
+            }
+        }
+    }
+    wire data_p : DataRec {
+        it := match core.data_rec {
+            case @Valid(d) => d
+            case @Invalid() => ${
+                pid = 0w4,
+                len = 0w7,
+                crc_ok = false,
+            }
+        }
+    }
+    wire hs_p : HsRec {
+        it := match core.hs_rec {
+            case @Valid(h) => h
+            case @Invalid() => ${
+                pid = 0w4,
+            }
+        }
+    }
+
+    //> 1-clock pulse: a token record was latched this edge.
     outgoing tk_valid : Bit {
-        it := core.tk_valid
+        it := core.tk_strobe
     }
     //> Token PID (OUT 1 / IN 9 / SOF 5 / SETUP D).
     outgoing tk_pid : Word[4] {
-        it := core.tk_pid
+        it := tok_p->pid
     }
     //> Device address (tk_sh[6:0]; SOF packets leave it stale).
     outgoing tk_addr : Word[7] {
-        it := core.tk_addr
+        it := tok_p->addr
     }
     //> Endpoint (tk_sh[10:7]; SOF packets leave it stale).
     outgoing tk_endp : Word[4] {
-        it := core.tk_endp
+        it := tok_p->endp
     }
     //> SOF frame number (tk_sh[10:0]; non-SOF tokens leave it stale).
     outgoing tk_frame : Word[11] {
-        it := core.tk_frame
+        it := tok_p->frame
     }
     //> CRC5 residual check (5'h0C after a good token stream).
     outgoing tk_crc_ok : Bit {
-        it := core.tk_crc_ok
+        it := tok_p->crc_ok
     }
-    //> Data record (usb::RxPacketCore's datarec).
+    //> 1-clock pulse: a data record was latched this edge.
     outgoing dt_valid : Bit {
-        it := core.dt_valid
+        it := core.dt_strobe
     }
     //> Data PID (DATA0 3 / DATA1 B).
     outgoing dt_pid : Word[4] {
-        it := core.dt_pid
+        it := data_p->pid
     }
     //> Payload byte count (bc - 2: the 2 crc16 wire bytes are excluded).
     outgoing dt_len : Word[7] {
-        it := core.dt_len
+        it := data_p->len
     }
     //> Flopped payload head window, packet bytes 0..7 (consumers that
     //> need several bytes AT ONCE -- the EP0 request latch,
@@ -275,15 +345,15 @@ mod RxPacket {
     }
     //> CRC16 residual check (16'h800D after a good payload stream).
     outgoing dt_crc_ok : Bit {
-        it := core.dt_crc_ok
+        it := data_p->crc_ok
     }
-    //> Handshake record (usb::RxPacketCore's hsrec).
+    //> 1-clock pulse: a handshake record was latched this edge.
     outgoing hs_valid : Bit {
-        it := core.hs_valid
+        it := core.hs_strobe
     }
     //> Handshake PID (ACK 2 / NAK A / STALL E).
     outgoing hs_pid : Word[4] {
-        it := core.hs_pid
+        it := hs_p->pid
     }
 }
 
@@ -688,38 +758,20 @@ mod RxPacketCore {
         it.sh := tk_sh
         it.crc5_res := crc5_res_r
     }
-    //> 1-clock pulse: a token record is in tk_* (latched this edge).
-    //> Token strobe.
-    outgoing tk_valid : Bit {
-        it := tokrec.tk_valid
+    //> The held token record (until the next token) + its arrival
+    //> strobe.
+    outgoing tok_rec : Valid[TokenRec] {
+        it := tokrec.rec
     }
-    //> Token PID (OUT 1 / IN 9 / SOF 5 / SETUP D).
-    outgoing tk_pid : Word[4] {
-        it := tokrec.tk_pid
-    }
-    //> Device address (tk_sh[6:0]; SOF packets leave it stale).
-    outgoing tk_addr : Word[7] {
-        it := tokrec.tk_addr
-    }
-    //> Endpoint (tk_sh[10:7]; SOF packets leave it stale).
-    outgoing tk_endp : Word[4] {
-        it := tokrec.tk_endp
-    }
-    //> SOF frame number (tk_sh[10:0]; non-SOF tokens leave it stale).
-    outgoing tk_frame : Word[11] {
-        it := tokrec.tk_frame
-    }
-    //> CRC5 residual check (5'h0C after a good token stream).
-    outgoing tk_crc_ok : Bit {
-        it := tokrec.tk_crc_ok
+    outgoing tk_strobe : Bit {
+        it := tokrec.strobe
     }
 
     // ---- data record -------------------------------------------------
-    //> The data record regs and the head window live in
-    //> usb::RxDataRec; this instance feeds them the shared packet
-    //> state (the frozen PID, the data-section byte count, the
-    //> byte-complete write strobe, the completing byte and the CRC16
-    //> verdict).
+    //> The data record + head window live in usb::RxDataRec; this
+    //> instance feeds them the shared packet state (the frozen PID,
+    //> the data-section byte count, the byte-complete write strobe,
+    //> the completing byte and the CRC16 verdict).
     mod datarec of RxDataRec {
         it.clock := clock
         it.reset := reset
@@ -732,18 +784,13 @@ mod RxPacketCore {
         it.byte_new := dt_byte_new
         it.crc16_res := crc16_res_r
     }
-    //> 1-clock pulse: a data record is in dt_* (latched this edge).
-    //> Data strobe.
-    outgoing dt_valid : Bit {
-        it := datarec.dt_valid
+    //> The held data record (until the next data packet) + its
+    //> arrival strobe.
+    outgoing data_rec : Valid[DataRec] {
+        it := datarec.rec
     }
-    //> Data PID (DATA0 3 / DATA1 B).
-    outgoing dt_pid : Word[4] {
-        it := datarec.dt_pid
-    }
-    //> Payload byte count (bc - 2: the 2 crc16 wire bytes are excluded).
-    outgoing dt_len : Word[7] {
-        it := datarec.dt_len
+    outgoing dt_strobe : Bit {
+        it := datarec.strobe
     }
     //> Flopped payload head window, packet bytes 0..7 (consumers that
     //> need several bytes AT ONCE -- the EP0 request latch,
@@ -758,14 +805,10 @@ mod RxPacketCore {
     outgoing dt_rd_data : Word[8] {
         it := ram.rd
     }
-    //> CRC16 residual check (16'h800D after a good payload stream).
-    outgoing dt_crc_ok : Bit {
-        it := datarec.dt_crc_ok
-    }
 
     // ---- handshake record --------------------------------------------
-    //> The handshake record regs live in usb::RxHandshakeRec; this
-    //> instance feeds them the frozen PID and the handshake cap.
+    //> The handshake record lives in usb::RxHandshakeRec; this
+    //> instance feeds it the frozen PID and the handshake cap.
     mod hsrec of RxHandshakeRec {
         it.clock := clock
         it.reset := reset
@@ -774,25 +817,24 @@ mod RxPacketCore {
         it.cap := hs_cap
         it.pid_r := pid_r
     }
-    //> 1-clock pulse: a handshake record is in hs_pid (latched this edge).
-    //> Handshake strobe.
-    outgoing hs_valid : Bit {
-        it := hsrec.hs_valid
+    //> The held handshake record (until the next handshake) + its
+    //> arrival strobe.
+    outgoing hs_rec : Valid[HsRec] {
+        it := hsrec.rec
     }
-    //> Handshake PID (ACK 2 / NAK A / STALL E).
-    outgoing hs_pid : Word[4] {
-        it := hsrec.hs_pid
+    outgoing hs_strobe : Bit {
+        it := hsrec.strobe
     }
 
 }
 
-//> usb_token_record -- the token record regs, factored out of
-//> usb::RxPacketCore (the drivers are byte-identical to the pre-split
-//> ones, so the outputs are bit-identical).  At a token packet's EOP
-//> (cap), latches the PID, the CRC5 verdict and the 11 token bits;
-//> sof_cap selects which reading captures (the whole shift register
-//> as the SOF frame number, else addr/endp) and the other fields go
-//> stale, exactly as before.  The record HOLDS until the next token.
+//> usb_token_record -- the token record, factored out of
+//> usb::RxPacketCore.  At a token packet's EOP (cap), latches the
+//> PID, the CRC5 verdict and the 11 token bits as a Valid[TokenRec]
+//> (per-field stale semantics: @Sof captures only the frame slot, a
+//> non-SOF token only addr/endp -- see the TokenRec doc).  The
+//> record HOLDS until the next token; `strobe` is the 1-clock
+//> arrival pulse.
 mod RxTokenRec {
     //> 48 MHz clock: 4 clock cycles per USB FS bit.
     incoming clock : Clock
@@ -814,72 +856,64 @@ mod RxTokenRec {
     //> Registered CRC5 residual verdict.
     incoming crc5_res : Bit
 
-    //> 1-clock pulse: a token record is in tk_* (latched this edge).
-    //> Token strobe.
-    outgoing reg tk_valid : Bit on clock {
+    //> The latched record: @Valid from the token's EOP until the next
+    //> token latches over it (reset / bus_reset -> @Invalid).
+    //> Per-field stale semantics preserved: @Sof captures only the
+    //> frame slot (the mux keeps the previous addr/endp), a non-SOF
+    //> token captures only addr/endp + pid + crc_ok (the mux keeps
+    //> the previous frame).  The held struct value feeds back into
+    //> its own D-cone exactly as the flat regs' else => it did.
+    //>
+    //> The held field extracts end in wires (not inline matches in
+    //> the struct literal) to keep every line 4-space-multiple
+    //> indented.
+    wire held_addr : Word[7] {
+        it := match rec {
+            case @Valid(t) => t->addr
+            case @Invalid() => 0w7
+        }
+    }
+    wire held_endp : Word[4] {
+        it := match rec {
+            case @Valid(t) => t->endp
+            case @Invalid() => 0w4
+        }
+    }
+    wire held_frame : Word[11] {
+        it := match rec {
+            case @Valid(t) => t->frame
+            case @Invalid() => 0w11
+        }
+    }
+    outgoing reg rec : Valid[TokenRec] on clock {
+        initial it <= @Invalid()
+        it <= when {
+            case reset || bus_reset => @Invalid()
+            case eop && cap => @Valid(${
+                pid = pid_r[4..0],
+                crc_ok = crc5_res,
+                addr = mux(sof_cap, held_addr, sh[7..0]),
+                endp = mux(sof_cap, held_endp, sh[11..7]),
+                frame = mux(sof_cap, sh, held_frame),
+            })
+            else => it
+        }
+    }
+    //> 1-clock pulse: a token record was latched this edge.
+    outgoing reg strobe : Bit on clock {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
             else => eop && cap
         }
     }
-    //> Token PID (OUT 1 / IN 9 / SOF 5 / SETUP D).
-    //> Token PID field: pid_r[3:0] at EOP.
-    outgoing reg tk_pid : Word[4] on clock {
-        initial it <= 0w4
-        it <= when {
-            case reset || bus_reset => 0w4
-            case eop && cap => pid_r[4..0]
-            else => it
-        }
-    }
-    //> Device address (sh[6:0]; SOF packets leave it stale).
-    //> Token address field: sh[6:0] (non-SOF tokens only).
-    outgoing reg tk_addr : Word[7] on clock {
-        initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case eop && cap && !sof_cap => sh[7..0]
-            else => it
-        }
-    }
-    //> Endpoint (sh[10:7]; SOF packets leave it stale).
-    //> Token endpoint field: sh[10:7] (non-SOF tokens only).
-    outgoing reg tk_endp : Word[4] on clock {
-        initial it <= 0w4
-        it <= when {
-            case reset || bus_reset => 0w4
-            case eop && cap && !sof_cap => sh[11..7]
-            else => it
-        }
-    }
-    //> SOF frame number (sh[10:0]; non-SOF tokens leave it stale).
-    //> SOF frame field: the whole sh (SOF tokens only).
-    outgoing reg tk_frame : Word[11] on clock {
-        initial it <= 0w11
-        it <= when {
-            case reset || bus_reset => 0w11
-            case eop && cap && sof_cap => sh
-            else => it
-        }
-    }
-    //> CRC5 residual check (5'h0C after a good token stream).
-    //> Token CRC5 verdict: the registered residual compare.
-    outgoing reg tk_crc_ok : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case eop && cap => crc5_res
-            else => it
-        }
-    }
 }
 
-//> usb_handshake_record -- the handshake record regs, factored out of
-//> usb::RxPacketCore (the drivers are byte-identical to the pre-split
-//> ones, so the outputs are bit-identical).  At a handshake's EOP
-//> (cap), latches the PID; nothing follows the PID byte on the wire.
-//> The record HOLDS until the next handshake.
+//> usb_handshake_record -- the handshake record, factored out of
+//> usb::RxPacketCore.  At a handshake's EOP (cap), latches the PID
+//> as a Valid[HsRec]; nothing follows the PID byte on the wire.  The
+//> record HOLDS until the next handshake; `strobe` is the 1-clock
+//> arrival pulse.
 mod RxHandshakeRec {
     //> 48 MHz clock: 4 clock cycles per USB FS bit.
     incoming clock : Clock
@@ -895,34 +929,33 @@ mod RxHandshakeRec {
     //> The frozen PID byte.
     incoming pid_r : Word[8]
 
-    //> 1-clock pulse: a handshake record is in hs_pid (latched this
-    //> edge).  Handshake strobe.
-    outgoing reg hs_valid : Bit on clock {
+    //> The latched record: @Valid from the handshake's EOP until the
+    //> next handshake latches over it (reset / bus_reset ->
+    //> @Invalid).
+    outgoing reg rec : Valid[HsRec] on clock {
+        initial it <= @Invalid()
+        it <= when {
+            case reset || bus_reset => @Invalid()
+            case eop && cap => @Valid(${ pid = pid_r[4..0] })
+            else => it
+        }
+    }
+    //> 1-clock pulse: a handshake record was latched this edge.
+    outgoing reg strobe : Bit on clock {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
             else => eop && cap
         }
     }
-    //> Handshake PID (ACK 2 / NAK A / STALL E).
-    //> Handshake PID field (nothing follows the PID byte).
-    outgoing reg hs_pid : Word[4] on clock {
-        initial it <= 0w4
-        it <= when {
-            case reset || bus_reset => 0w4
-            case eop && cap => pid_r[4..0]
-            else => it
-        }
-    }
 }
 
-//> usb_data_record -- the data record regs + the flopped payload head
-//> window, factored out of usb::RxPacket (the drivers are
-//> byte-identical to the pre-split ones, so the outputs are
-//> bit-identical).  At a data packet's EOP (cap), latches the PID,
-//> the payload length (bc - 2: the 2 crc16 wire bytes drop out) and
-//> the CRC16 verdict; the record HOLDS until the next data packet.
-//> Also owns the flopped payload head window (bytes 0..7 -- eight
+//> usb_data_record -- the data record + the flopped payload head
+//> window, factored out of usb::RxPacketCore.  At a data packet's
+//> EOP (cap), latches the PID, the payload length (bc - 2: the 2
+//> crc16 wire bytes drop out) and the CRC16 verdict as a
+//> Valid[DataRec]; the record HOLDS until the next data packet, and
+//> `strobe` is the 1-clock arrival pulse.  Also owns the flopped payload head window (bytes 0..7 -- eight
 //> SEPARATE byte-regs: each byte's enable is its own shallow decode
 //> (dat_wr && bc == k -- k < 8, so the equality subsumes the
 //> head-window test) and its D is byte_new directly; the bc compare
@@ -953,43 +986,27 @@ mod RxDataRec {
     //> Registered CRC16 residual verdict.
     incoming crc16_res : Bit
 
-    //> 1-clock pulse: a data record is in dt_* (latched this edge).
-    //> Data strobe.
-    outgoing reg dt_valid : Bit on clock {
+    //> The latched record: @Valid from the data packet's EOP until
+    //> the next data packet latches over it (reset / bus_reset ->
+    //> @Invalid).
+    outgoing reg rec : Valid[DataRec] on clock {
+        initial it <= @Invalid()
+        it <= when {
+            case reset || bus_reset => @Invalid()
+            case eop && cap => @Valid(${
+                pid = pid_r[4..0],
+                len = mux(bc >= 2w7, bc - 2w7, 0w7),
+                crc_ok = crc16_res,
+            })
+            else => it
+        }
+    }
+    //> 1-clock pulse: a data record was latched this edge.
+    outgoing reg strobe : Bit on clock {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
             else => eop && cap
-        }
-    }
-    //> Data PID (DATA0 3 / DATA1 B).
-    //> Data PID field.
-    outgoing reg dt_pid : Word[4] on clock {
-        initial it <= 0w4
-        it <= when {
-            case reset || bus_reset => 0w4
-            case eop && cap => pid_r[4..0]
-            else => it
-        }
-    }
-    //> Payload byte count (bc - 2: the 2 crc16 wire bytes are excluded).
-    //> Data length field: bc - 2 (the crc16 wire bytes drop out).
-    outgoing reg dt_len : Word[7] on clock {
-        initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case eop && cap => mux(bc >= 2w7, bc - 2w7, 0w7)
-            else => it
-        }
-    }
-    //> CRC16 residual check (16'h800D after a good payload stream).
-    //> Data CRC16 verdict: the registered residual compare.
-    outgoing reg dt_crc_ok : Bit on clock {
-        initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case eop && cap => crc16_res
-            else => it
         }
     }
 
