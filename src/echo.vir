@@ -49,7 +49,7 @@ ext mod EchoFifo {
     //>   a simultaneous push and pop is a no-op).  `room` is high while
     //>   count < 12; the 4 slots still free at that threshold absorb
     //>   the bytes in flight in the USB core's pop pipeline (rx_pop_d
-    //>   -> rx_valid_r -> rx_valid_rr in src/usb.vir) after the
+    //>   -> rx_valid_r -> rx_valid (outgoing reg) in src/usb.vir) after the
     //>   throttle takes effect.
     incoming clock      : Clock
     incoming push_data  : Word[8]
@@ -65,19 +65,30 @@ mod EchoServer {
     //> see src/uart.vir).
     incoming clock : Clock
     //> Byte from the host, paired with `usb_rx_valid`: a 1-clk strobe
-    //> per byte popped from the core's rx FIFO (rx_valid_rr in
+    //> per byte popped from the core's rx FIFO (rx_valid in
     //> src/usb.vir).  Pushing `usb_rx_data` into the EchoFifo on that
     //> same edge IS the pop.
     incoming usb_rx_data  : Word[8]
     incoming usb_rx_valid : Bit
-    //> The USB core's tx FIFO has room for another byte (tx_ready_r in
+    //> The USB core's tx FIFO has room for another byte (tx_ready in
     //> src/usb.vir: !txfifo.full, registered and therefore one clk
     //> stale).  Gates the hold slot's push below.
     incoming usb_tx_ready : Bit
     //> Byte toward the host; `tx_strobe` is the 1-clk push strobe.  The
     //> core registers the write and re-checks !txfifo.full at the write
     //> edge (txfifo_wr_d in src/usb.vir).
-    outgoing tx_data      : Word[8]
+    // One-slot holding register between the receiver and the USB core.
+    // `tx_drained` guarantees the slot is empty before the sender
+    // starts the next byte, so an incoming byte can never overwrite an
+    // untransmitted one (the two events below can therefore never
+    // coincide).
+    outgoing reg tx_data : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case receiver.data_valid => receiver.data
+            else                     => it
+        }
+    }
     outgoing tx_strobe    : Bit
     //> Flow control back to the USB core (= fifo.room): low = stop
     //> popping bytes out of the rx FIFO (the core will NAK bulk-OUT
@@ -130,19 +141,6 @@ mod EchoServer {
         it.uart_rx := rxd
     }
 
-    // One-slot holding register between the receiver and the USB core.
-    // `tx_drained` guarantees the slot is empty before the sender
-    // starts the next byte, so an incoming byte can never overwrite an
-    // untransmitted one (the two events below can therefore never
-    // coincide).
-    reg hold_data : Word[8] on clock {
-        initial it <= 0w8
-        it <= when {
-            case receiver.data_valid => receiver.data
-            else                     => it
-        }
-    }
-
     reg hold_valid : Bit on clock {
         initial it <= false
         it <= when {
@@ -156,7 +154,6 @@ mod EchoServer {
         it := hold_valid && usb_tx_ready
     }
 
-    tx_data   := hold_data
     tx_strobe := do_push
 
     // The sender may start the next byte only once the previously

@@ -12,21 +12,19 @@ export mod Top for ice40::Fomu {
     // after the ~175 ms power-on count (usb::UsbPor in src/usb.vir; its
     // count is inlined -- no parameter -- so the sim TB eats the full
     // delay).
-    outgoing usb_dp_pu : Bit
+    outgoing usb_dp_pu : Bit {
+        it := por.done
+    }
     // heartbeat LEDs (active low on PVT), driven by the core's
     // activity signals
     outgoing led_red   : Bit
     outgoing led_green : Bit
     outgoing led_blue  : Bit
 
-    // Power-on reset (a plain Virdant mod since the POR_CYCLES
-    // parameter was inlined).  Kept at the top (not inside the
-    // controller) so the topology mirrors the sim TB, which
-    // instantiates the pieces directly.
-    mod por of usb::UsbPor {
+    // Power-on reset
+    mod por of usb::PowerOnReset {
         it.clock := clock
     }
-    usb_dp_pu := por.por_done
 
     // The USB controller: everything between the byte stream and the
     // pads, in Virdant (src/usb.vir).  Its pad-facing side is
@@ -35,7 +33,7 @@ export mod Top for ice40::Fomu {
     // the UsbPads ext mod below.
     mod actual_top of usb::UsbController {
         it.clock := clock
-        it.por_done := por.por_done
+        it.por_done := true
     }
 
     // The pads: the one part that drops down into Verilog, because it

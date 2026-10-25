@@ -143,8 +143,18 @@ mod UartSender {
 mod UartReceiver {
     incoming clock      : Clock
     incoming uart_rx    : Bit
-    outgoing data       : Word[8] {
-        it := shift
+    // At the end of each 417-cycle Data phase (each bit's center)
+    // uart_rx is shifted in at the MSB side: word() places its first
+    // argument in the MSBs, so the first bit on the wire (the LSB,
+    // UART sends LSB first) keeps shifting right and after eight
+    // captures the byte sits with its LSB in data[0].  The byte then
+    // holds through the Stop phase, which is when data_valid pulses.
+    outgoing reg data : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case state == #Data && bit_time_done => word(uart_rx, it[8..1])
+            else                                 => it
+        }
     }
     // 1-clk pulse during the final cycle of the Stop phase (roughly the
     // stop bit's center); `data` has been stable since the last
@@ -238,17 +248,4 @@ mod UartReceiver {
         }
     }
 
-    // At the end of each 417-cycle Data phase (each bit's center)
-    // uart_rx is shifted in at the MSB side: word() places its first
-    // argument in the MSBs, so the first bit on the wire (the LSB,
-    // UART sends LSB first) keeps shifting right and after eight
-    // captures the byte sits with its LSB in shift[0].  The byte then
-    // holds through the Stop phase, which is when data_valid pulses.
-    reg shift : Word[8] on clock {
-        initial it <= 0w8
-        it <= when {
-            case state == #Data && bit_time_done => word(uart_rx, it[8..1])
-            else                                 => it
-        }
-    }
 }
