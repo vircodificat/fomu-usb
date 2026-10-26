@@ -1988,22 +1988,14 @@ mod UsbUart {
     //> doccomment in UsbController for why the extra register stage
     //> is load-bearing.
     incoming reset : Bit
-    //> D+ pad sample in (from the bus transceiver inside UsbPads).
-    incoming dp_rx : Bit
-    //> D- pad sample in (from the bus transceiver inside UsbPads).
-    incoming dn_rx : Bit
-    //> D+ drive level out (to UsbPads, gated by output_enable).
-    outgoing dp_tx : Bit {
-        it := txphy.dp
-    }
-    //> D- drive level out (to UsbPads, gated by output_enable).
-    outgoing dn_tx : Bit {
-        it := txphy.dn
-    }
-    //> Pad drive enable: high while the tx PHY is driving the bus
-    //> (SB_IO OUTPUT_ENABLE via UsbPads; low during receive/SIDLE).
-    outgoing output_enable : Bit {
-        it := txphy.output_enable
+    //> Pad-facing UsbTxRx socket.  The client is this module: it
+    //> drives the D+/D- levels and the tristate control (cosi
+    //> channels dp_tx/dn_tx/output_enable), and reads the pad
+    //> samples back (soci channels dp_rx/dn_rx).
+    client socket usb of UsbTxRx {
+        it.dp_tx := txphy.dp
+        it.dn_tx := txphy.dn
+        it.output_enable := txphy.output_enable
     }
     //> Bulk-OUT byte stream toward the consumer: popped rx-FIFO
     //> bytes, with the consumer's ready as end-to-end flow control.
@@ -2032,8 +2024,8 @@ mod UsbUart {
     mod rxphy of phy::RxPhy {
         it.clock := clock
         it.reset := reset
-        it.dp  := dp_rx
-        it.dn  := dn_rx
+        it.dp  := usb.dp_rx
+        it.dn  := usb.dn_rx
         unused it.active
     }
 
@@ -2286,17 +2278,8 @@ mod UsbController {
     outgoing txing : Bit
 
     // Pad-facing side: the UsbTxRx socket to the UsbPads ext mod
-    // (bulk-connected in src/top.vir).  The client is this
-    // controller: it drives the D+/D- levels and the tristate
-    // control; the pad samples come back on the soci channels.
-    //> D+ drive level out to UsbPads (gated by output_enable).
-    //> D- drive level out to UsbPads.
-    //> Tristate control out to UsbPads: drive the bus while high;
-    //> low = listen (the pads release the bus, which idles in the J
-    //> state held by the host and the D+ 1.5k pull-up).
-    //> D+ pad sample in from UsbPads (SB_IO D_IN_0, registered
-    //> inside the pad cell).
-    //> D- pad sample in from UsbPads.
+    // (bulk-connected in src/top.vir).  Forwarded unchanged from
+    // the UsbUart core via usb :=: it.usb.
     client socket usb of UsbTxRx
 
     //> the core reset persists until a cycle after the power-on reset is complete
@@ -2308,13 +2291,8 @@ mod UsbController {
     mod core of UsbUart {
         it.clock    := clock
         it.reset    := core_reset
-        // The pad-facing UsbTxRx socket: forwarded channel-by-channel
-        // from UsbUart's flat pad ports.
-        usb.dp_tx         := it.dp_tx
-        usb.dn_tx         := it.dn_tx
-        usb.output_enable := it.output_enable
-        it.dp_rx          := usb.dp_rx
-        it.dn_rx          := usb.dn_rx
+        // The pad-facing UsbTxRx socket: bulk-forwarded from UsbUart.
+        usb :=: it.usb
         // The rx/tx pipes: bulk-forwarded from the core.
         rx :=: it.rx
         tx :=: it.tx
