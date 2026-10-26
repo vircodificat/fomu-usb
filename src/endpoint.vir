@@ -1,0 +1,877 @@
+import usb
+
+//> The USB endpoint protocol mods, split out of src/usb.vir: Ep0 (the
+//> EP0 control endpoint: SETUP -> parse/setup/arm -> data stage ->
+//> status handshake, plus the CDC requests) and Serial (the EP1 bulk
+//> endpoint: data toggles + ACK/NAK/arm decisions).  Both consume the
+//> router-gated token/data strobes from usb::UsbTokenRouter and answer
+//> with 1-clock tx response requests for usb::UsbArbiter; the packet
+//> records they consume (usb::DataRec) still live in src/usb.vir.
+//> The EP2 notif endpoint has no protocol mod of its own: it always
+//> NAKs, handled directly by usb::UsbArbiter.
+
+//> usb_ep0 -- control transfer state machine (USB 2.0 §8.5.5) + CDC
+//> requests.  Every reg's next-state below is a priority chain,
+//> including the registered-accept pipeline (req_acc_r / sto_acc_r,
+//> +1 clock after the router strobes) and the EP_PARSE -> EP_SETUP ->
+//> EP_ARM request-decode pipeline -- all load-bearing for the
+//> 48 MHz timing (see wiki/usb-ep0.md).
+//>
+//> Supported: GET_DESCRIPTOR (device/config/string), SET_ADDRESS
+//> (latched at status-stage completion), SET_CONFIGURATION,
+//> GET_STATUS (device), SET_CONTROL_LINE_STATE.  Everything else ->
+//> STALL until the next SETUP.  Data toggles: SETUP is always DATA0
+//> and re-initializes the toggle; the device data stage starts at
+//> DATA1; the status-stage data packet is a zero-length DATA1 packet:
+//> the device sends it in response to an IN token (control write /
+//> no data stage) and ACKs the host's DATA1 ZLP after an OUT token
+//> (control read).  Descriptor bytes are pulled by usb::TxPhy from
+//> the core ROM via (resp_sel, resp_base + tx_addr).
+enum type Ep0State {
+    Idle    = 0w4
+    RcvReq  = 1w4
+    Send    = 2w4
+    WaitAck = 3w4
+    StatusI = 5w4
+    StatusO = 6w4
+    Stall   = 7w4
+    Parse   = 8w4
+    Setup   = 9w4
+    Arm     = 10w4
+}
+
+//> EP0: the control endpoint.  Runs one control transfer at a time:
+//> SETUP (tk_setup + the 8-byte request packet) -> parse / setup /
+//> arm pipeline -> data stage (descriptor bytes served by
+//> usb::DescRom through resp_sel / resp_base) -> status handshake.
+//> Supported requests: GET_DESCRIPTOR (device / config / string
+//> 0-2), GET_STATUS(device), SET_ADDRESS, SET_CONFIGURATION(0/1),
+//> SET_CONTROL_LINE_STATE; anything else is STALLed until the next
+//> SETUP.  Consumes the router-gated token / data / handshake
+//> strobes and answers with 1-clock tx response requests (resp_req +
+//> held params) for the core's response arbiter, plus the device
+//> status (dev_addr, configured) and the router hints (ep0_busy /
+//> ep0_stalling / ep0_wait_ack).
+mod Ep0 {
+    //> 48 MHz clock: 4 clock cycles per USB FS bit.
+    incoming clock : Clock
+    //> Synchronous reset, active high (core reset from UsbController).
+    incoming reset : Bit
+    //> Bus reset strobe (via the core, from usb::RxPhy): flushes any
+    //> transfer in progress.
+    incoming bus_reset : Bit
+    //> Router-gated token strobes (address + endpoint matched): SETUP
+    //> starts a control transfer and aborts any transfer in progress
+    //> (USB 2.0 §8.5.2.2).
+    incoming tk_setup : Bit
+    //> IN token to EP0: the host wants the data stage / status ZLP.
+    incoming tk_in : Bit
+    //> OUT token to EP0.  EP0 never reacts to the token directly (the
+    //> status-stage data packet arrives via dt_valid); the port exists
+    //> for interface completeness with the router.
+    incoming tk_out : Bit
+    //> Router-gated data packet strobe: EP0 expects this packet (the
+    //> SETUP request packet, or the status-stage ZLP).
+    incoming dt_valid : Bit
+    //> The packet assembler's held data record (fields hold between
+    //> packets; EP0 reads them at the registered accept, one clock
+    //> after the strobe).
+    incoming dat : Valid[usb::DataRec]
+    //> Payload head window, packet bytes 0..7 (usb::RxPacket's flopped
+    //> head shadow -- EP0 only ever reads the 8-byte request header:
+    //> the SETUP packet, or the status-stage ZLP which has no payload;
+    //> never the payload RAM bytes 8..63).
+    incoming dt_head : Word[64]
+    //> Router-gated handshake strobe: EP0's response was ACKed.
+    incoming hs_ack : Bit
+
+    //> The held data record, unpacked (the @Invalid default
+    //> reproduces the flat-port reset values).
+    wire dt : usb::DataRec {
+        it := match dat {
+            case @Valid(d) => d
+            case @Invalid() => ${
+                pid = 0w4,
+                len = 0w7,
+                crc_ok = false,
+            }
+        }
+    }
+    wire dt_pid : Word[4] {
+        it := dt->pid
+    }
+    wire dt_len : Word[7] {
+        it := dt->len
+    }
+    wire dt_crc_ok : Bit {
+        it := dt->crc_ok
+    }
+
+    // ---- tx response request (1-clock pulse; params held) ------------
+    //> 1-clock response request for the core's arbiter.
+    //> resp_req is default low, pulsed by each arm; the params hold
+    //> between pulses (the tx PHY latches pid / len at the pulse,
+    //> sel / base are consumed while the packet streams).
+    outgoing reg resp_req : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case tk_setup => false
+            case (st == #RcvReq) && req_acc_r => true
+            case (st == #Send) && tk_in => true
+            case (st == #StatusI) && tk_in => true
+            case (st == #StatusO) && sto_acc_r => true
+            case (st == #Stall) && (dt_valid || tk_in) => true
+            else => false
+        }
+    }
+    //> Response PID: ACK 2, DATA0 3, DATA1 B, STALL E.
+    outgoing reg resp_pid : Word[4] on clock {
+        initial it <= 0w4
+        it <= when {
+            case (st == #RcvReq) && req_acc_r => 2w4
+            case (st == #Send) && tk_in => mux(tog, 11w4, 3w4)
+            case (st == #StatusI) && tk_in => 11w4
+            case (st == #StatusO) && sto_acc_r => 2w4
+            case (st == #Stall) && (dt_valid || tk_in) => 14w4
+            else => it
+        }
+    }
+    //> Response payload byte count (0 for ACK / STALL / ZLP).
+    outgoing reg resp_len : Word[7] on clock {
+        initial it <= 0w7
+        it <= when {
+            case (st == #RcvReq) && req_acc_r => 0w7
+            case (st == #Send) && tk_in => mux(remain > 64w7, 64w7, remain)
+            case (st == #StatusI) && tk_in => 0w7
+            case (st == #StatusO) && sto_acc_r => 0w7
+            case (st == #Stall) && (dt_valid || tk_in) => 0w7
+            else => it
+        }
+    }
+    //> Descriptor select (the core ROM's bank: 0 device, 1 config,
+    //> 2/3/4 strings, 6 status).
+    outgoing reg resp_sel : Word[3] on clock {
+        initial it <= 0w3
+        it <= when {
+            case (st == #RcvReq) && req_acc_r => 0w3
+            case (st == #Send) && tk_in => sel
+            case (st == #StatusI) && tk_in => 0w3
+            else => it
+        }
+    }
+    //> Descriptor byte offset the response starts at.
+    outgoing reg resp_base : Word[10] on clock {
+        initial it <= 0w10
+        it <= when {
+            case (st == #RcvReq) && req_acc_r => 0w10
+            case (st == #Send) && tk_in => base
+            case (st == #StatusI) && tk_in => 0w10
+            else => it
+        }
+    }
+
+    // ---- device status ------------------------------------------------
+    //> USB device address (applied at the owning SET_ADDRESS's status
+    //> completion; 0 until enumerated).
+    //> Device address / configuration, applied at the OWNING
+    //> transfer's status completion (pend_addr / pend_cfg tags).
+    outgoing reg dev_addr : Word[7] on clock {
+        initial it <= 0w7
+        it <= when {
+            case reset || bus_reset => 0w7
+            case (st == #WaitAck) && hs_ack && send_zlp_r && pend_addr
+                => addr_pending
+            case (st == #StatusO) && sto_acc_r && pend_addr => addr_pending
+            else => it
+        }
+    }
+    //> Configuration state (SET_CONFIGURATION(1) status completion).
+    outgoing reg configured : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case (st == #WaitAck) && hs_ack && send_zlp_r && pend_cfg
+                => cfg_pending
+            case (st == #StatusO) && sto_acc_r && pend_cfg => cfg_pending
+            else => it
+        }
+    }
+
+    // ---- router hints -------------------------------------------------
+    //> EP0 expects a data packet (SETUP request or status-stage ZLP):
+    //> route dt_valid here.
+    outgoing ep0_busy : Bit {
+        it := (st == #RcvReq) || (st == #StatusO)
+    }
+    //> EP0 is STALLing.  The router still routes data packets here
+    //> while the last token was OUT-to-EP0 (this transfer's own data
+    //> stage); IN tokens to EP0 also get STALL responses.  The state
+    //> persists until the next SETUP or reset.
+    outgoing ep0_stalling : Bit {
+        it := st == #Stall
+    }
+    //> EP0's response is in flight: route the ACK here.
+    outgoing ep0_wait_ack : Bit {
+        it := st == #WaitAck
+    }
+
+    unused tk_out
+
+    // ---- combinational decode helpers ---------------------------------
+    //> wLength from the REGISTERED request bytes (the parse runs one
+    //> clock after the SETUP data, so the registered view is current).
+    wire w_length : Word[16] {
+        it := word(rq7, rq6)
+    }
+    //> GET_DESCRIPTOR select from the registered request bytes: 0
+    //> device, 1 config, 2/3/4 string 0/1/2 (rq2 = index), 7 invalid
+    //> (-> STALL).  A named wire because the FSM must not read the
+    //> previous request's `sel` when sizing `remain` -- the parse runs
+    //> off the REGISTERED request bytes.
+    wire new_sel : Word[3] {
+        it := match rq3 {
+            case 0x01w8 => 0w3
+            case 0x02w8 => 1w3
+            case 0x03w8 => match rq2 {
+                case 0x00w8 => 2w3
+                case 0x01w8 => 3w3
+                case 0x02w8 => 4w3
+                else        => 7w3
+            }
+            else => 7w3
+        }
+    }
+    //> Descriptor lengths by select -- must match the core's desc ROM:
+    //> sel 0=device 1=config 2=str0 3=str1 4=str2 6=status.
+    wire dlen : Word[7] {
+        it := match p_sel {
+            case 0w3 => 18w7
+            case 1w3 => 75w7
+            case 2w3 => 4w7
+            case 3w3 => 10w7
+            case 4w3 => 32w7
+            else     => 2w7
+        }
+    }
+
+    // ---- registered data-stage accepts --------------------------------
+    //> Registered data-stage accepts (independent shallow cones, one
+    //> register each): the FSM reacts to the router strobes one clock
+    //> after arrival -- every field it reads (dt_head / dt_pid /
+    //> dt_len / dt_crc_ok) holds between packets, so the delayed
+    //> reaction is bit-identical, and the +1 clock is free against the
+    //> ~30-50 clock turnaround budget.
+
+    //> SETUP request packet accepted (DATA0, 8 bytes, good CRC).
+    reg req_acc_r : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            else => (st == #RcvReq) && dt_valid
+                && (dt_pid == 3w4) && dt_crc_ok && (dt_len == 8w7)
+        }
+    }
+    //> Status-stage ZLP accepted (lenient on the data pid: hosts
+    //> sending DATA0 here are taken).
+    reg sto_acc_r : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            else => (st == #StatusO) && dt_valid
+                && (dt_len == 0w7) && dt_crc_ok
+        }
+    }
+
+    // ---- request bytes (latched at the registered accept) -------------
+    //> bmRequestType.
+    reg rq0 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case (st == #RcvReq) && req_acc_r => dt_head[8..0]
+            else => it
+        }
+    }
+    //> bRequest.
+    reg rq1 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case (st == #RcvReq) && req_acc_r => dt_head[16..8]
+            else => it
+        }
+    }
+    //> wValue low (SET_ADDRESS address / SET_CONFIGURATION value /
+    //> GET_DESCRIPTOR string index).
+    reg rq2 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case (st == #RcvReq) && req_acc_r => dt_head[24..16]
+            else => it
+        }
+    }
+    //> wValue high (descriptor type: 1 device, 2 config, 3 string).
+    reg rq3 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case (st == #RcvReq) && req_acc_r => dt_head[32..24]
+            else => it
+        }
+    }
+    //> wLength high.  (rq4/rq5 = wIndex are never needed and not kept.)
+    reg rq6 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case (st == #RcvReq) && req_acc_r => dt_head[56..48]
+            else => it
+        }
+    }
+    //> wLength low.
+    reg rq7 : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case (st == #RcvReq) && req_acc_r => dt_head[64..56]
+            else => it
+        }
+    }
+
+    // ---- decode-stage registers (EP_PARSE: one-hot flags + raw wLength)
+    //> The request case tree is too deep for one 48 MHz cycle, so the
+    //> decode is split across two: PARSE computes these flags, SETUP
+    //> routes them, ARM applies.  Deliberately unreset: every flag is
+    //> rewritten in PARSE before any reader (SETUP) looks at it.
+
+    //> Decoded descriptor select.
+    reg p_sel : Word[3] on clock {
+        initial it <= 0w3
+        it <= when {
+            case st == #Parse => new_sel
+            else => it
+        }
+    }
+    //> Raw wLength as parsed.
+    reg p_wlen : Word[16] on clock {
+        initial it <= 0w16
+        it <= when {
+            case st == #Parse => word(rq7, rq6)
+            else => it
+        }
+    }
+    //> GET_DESCRIPTOR with a valid select (computed but not read:
+    //> the Arm action tree treats GET_DESCRIPTOR as the fall-through
+    //> action).
+    reg p_is_desc : Bit on clock {
+        initial it <= false
+        it <= when {
+            case st == #Parse => (rq1 == 0x06w8) && (new_sel != 7w3)
+            else => it
+        }
+    }
+    //> GET_STATUS (device).
+    reg p_is_get_status : Bit on clock {
+        initial it <= false
+        it <= when {
+            case st == #Parse => (rq1 == 0w8) && (rq0 == 0x80w8)
+            else => it
+        }
+    }
+    //> SET_ADDRESS.
+    reg p_is_set_addr : Bit on clock {
+        initial it <= false
+        it <= when {
+            case st == #Parse => rq1 == 0x05w8
+            else => it
+        }
+    }
+    //> SET_CONFIGURATION (value 0 or 1).
+    reg p_is_set_cfg : Bit on clock {
+        initial it <= false
+        it <= when {
+            case st == #Parse => (rq1 == 0x09w8)
+                && ((rq2 == 0x01w8) || (rq2 == 0w8))
+            else => it
+        }
+    }
+    //> SET_CONTROL_LINE_STATE.
+    reg p_is_cls : Bit on clock {
+        initial it <= false
+        it <= when {
+            case st == #Parse => (rq1 == 0x22w8) && (rq0 == 0x21w8)
+            else => it
+        }
+    }
+    //> Decoded request is supported at all.
+    reg p_valid : Bit on clock {
+        initial it <= false
+        it <= when {
+            case st == #Parse => ((rq1 == 0x06w8) && (new_sel != 7w3))
+                || ((rq1 == 0w8) && (rq0 == 0x80w8))
+                || (rq1 == 0x05w8)
+                || ((rq1 == 0x09w8) && ((rq2 == 0x01w8) || (rq2 == 0w8)))
+                || ((rq1 == 0x22w8) && (rq0 == 0x21w8))
+            else => it
+        }
+    }
+
+    //> Side effects latched in PARSE, tagged per request so only the
+    //> OWNING transfer's status stage applies them (without the tags,
+    //> any control read's status stage would latch addr_pending = 0
+    //> and wipe dev_addr at completion).
+
+    //> SET_ADDRESS value, applied at this transfer's status completion.
+    reg addr_pending : Word[7] on clock {
+        initial it <= 0w7
+        it <= when {
+            case reset || bus_reset => 0w7
+            case st == #Parse => rq2[7..0]
+            else => it
+        }
+    }
+    //> SET_CONFIGURATION value.
+    reg cfg_pending : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case st == #Parse => rq2 == 0x01w8
+            else => it
+        }
+    }
+    //> This transfer IS a SET_ADDRESS.
+    reg pend_addr : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case st == #Parse => rq1 == 0x05w8
+            else => it
+        }
+    }
+    //> This transfer IS a SET_CONFIGURATION.
+    reg pend_cfg : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case st == #Parse => (rq1 == 0x09w8)
+                && ((rq2 == 0x01w8) || (rq2 == 0w8))
+            else => it
+        }
+    }
+
+    // ---- compute-stage registers (EP_SETUP: route flags -> one-hot) --
+    //> The routed one-hot action EP_ARM applies: 0 STALL, 1 STATUS_I
+    //> (no-data control write), 2 GET_STATUS, 3 RCV_DATA
+    //> (GET_DESCRIPTOR data stage).  The only place the request
+    //> routing tree runs, landing on ONE register -- not on datapath
+    //> clock enables.
+    reg p_action : Word[3] on clock {
+        initial it <= 0w3
+        it <= when {
+            case reset || bus_reset => 0w3
+            case st == #Setup => when {
+                case !p_valid => 0w3
+                case p_is_set_addr || p_is_set_cfg || p_is_cls => 1w3
+                case p_is_get_status => 2w3
+                else => 3w3
+            }
+            else => it
+        }
+    }
+    //> Request wLength == 0.
+    reg p_wlen0 : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case st == #Setup => w_length == 0w16
+            else => it
+        }
+    }
+    //> GET_DESCRIPTOR direction (IN -> status stage is OUT, and vice
+    //> versa) -- rq0[7].
+    reg p_desc_in : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case st == #Setup => rq0[7]
+            else => it
+        }
+    }
+    //> Descriptor data-stage length, min(wLength, dlen(p_sel)),
+    //> precomputed in SETUP so remain's Arm load is
+    //> register-to-register.  dlen <= 75 < 128, so the compare only
+    //> needs the low bits: wLength >= 128 means the descriptor
+    //> length wins outright.
+    reg p_dremain_r : Word[7] on clock {
+        initial it <= 0w7
+        it <= when {
+            case st == #Setup => when {
+                case any(p_wlen[15..7]) => dlen
+                case p_wlen[7..0] < dlen => p_wlen[7..0]
+                else => dlen
+            }
+            else => it
+        }
+    }
+
+    // ---- the FSM and datapath -----------------------------------------
+    //> Transfer state.  Next-state is one priority chain: reset,
+    //> then tk_setup (SETUP aborts any transfer in progress,
+    //> re-initializing the toggle), then the state cases.
+    reg st : Ep0State on clock {
+        initial it <= #Idle
+        it <= when {
+            case reset || bus_reset => #Idle
+            case tk_setup => #RcvReq
+            case it == #RcvReq => mux(req_acc_r, #Parse, it)
+            case it == #Parse  => #Setup
+            case it == #Setup  => #Arm
+            case it == #Arm => when {
+                // no-data control write: straight to the status IN
+                case p_action == 1w3 => #StatusI
+                // GET_STATUS: wLength 0 is a read whose status stage
+                // is OUT; else a (<= 2 byte) data stage
+                case p_action == 2w3 => mux(p_wlen0, #StatusO, #Send)
+                // GET_DESCRIPTOR: ditto, direction-dependent
+                case p_action == 3w3 => mux(p_wlen0,
+                    mux(p_desc_in, #StatusO, #StatusI), #Send)
+                else => #Stall
+            }
+            case it == #Send => mux(tk_in, #WaitAck, it)
+            case it == #WaitAck => when {
+                case hs_ack => mux(send_zlp_r, #Idle,
+                    mux(last_r, #StatusO, #Send))
+                // host retried the IN token (no ACK seen): re-arm the
+                // same packet (base/remain/tog unchanged)
+                case tk_in => mux(send_zlp_r, #StatusI, #Send)
+                else => it
+            }
+            case it == #StatusI => mux(tk_in, #WaitAck, it)
+            case it == #StatusO => mux(sto_acc_r, #Idle, it)
+            else => it
+        }
+    }
+
+    //> 1 => the next device data PID is DATA1.  Re-initialized to 0
+    //> by SETUP (the SETUP data stage is DATA0), set for the data
+    //> stage of a control read, toggled per accepted data packet.
+    reg tog : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case tk_setup => false
+            // data stage armed (GET_STATUS / GET_DESCRIPTOR): the
+            // first device data packet is DATA1
+            case (st == #Arm) && ((p_action == 2w3) || (p_action == 3w3)) => true
+            // data packet accepted: advance the toggle
+            case (st == #WaitAck) && hs_ack && !send_zlp_r => !it
+            else => it
+        }
+    }
+
+    //> Data stage bytes left to send.
+    reg remain : Word[7] on clock {
+        initial it <= 0w7
+        it <= when {
+            case reset || bus_reset => 0w7
+            // GET_STATUS: at most 2 bytes
+            case (st == #Arm) && (p_action == 2w3) && !p_wlen0
+                => mux(p_wlen[7..0] > 2w7, 2w7, p_wlen[7..0])
+            // GET_DESCRIPTOR: the precomputed min(wLength, dlen)
+            case (st == #Arm) && (p_action == 3w3) && !p_wlen0
+                => p_dremain_r
+            // data packet accepted: consume its bytes
+            case (st == #WaitAck) && hs_ack && !send_zlp_r => it - send_len
+            else => it
+        }
+    }
+
+    //> Bytes in the in-flight packet.
+    reg send_len : Word[7] on clock {
+        initial it <= 0w7
+        it <= when {
+            case reset || bus_reset => 0w7
+            case (st == #Send) && tk_in => mux(remain > 64w7, 64w7, remain)
+            case (st == #StatusI) && tk_in => 0w7
+            else => it
+        }
+    }
+
+    //> Current send offset into the descriptor (base + tx_addr is the
+    //> ROM byte usb::TxPhy pulls).
+    reg base : Word[10] on clock {
+        initial it <= 0w10
+        it <= when {
+            case reset || bus_reset => 0w10
+            case tk_setup => 0w10
+            case (st == #Arm) && ((p_action == 2w3) || (p_action == 3w3))
+                && !p_wlen0 => 0w10
+            // data packet accepted: advance by the accepted length
+            case (st == #WaitAck) && hs_ack && !send_zlp_r
+                => it + word(0w3, send_len)
+            else => it
+        }
+    }
+
+    //> Current descriptor select.
+    reg sel : Word[3] on clock {
+        initial it <= 0w3
+        it <= when {
+            case reset || bus_reset => 0w3
+            case (st == #Arm) && (p_action == 2w3) => 6w3
+            case (st == #Arm) && (p_action == 3w3) => p_sel
+            else => it
+        }
+    }
+
+    //> Arm-time precomputed packet flags: the EP_WAIT_ACK decisions
+    //> read these 1-bit registers instead of comparing
+    //> send_len/remain.  send_zlp_r: armed packet is the status ZLP
+    //> (len 0).  last_r: armed packet completes the data stage.
+    reg send_zlp_r : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case (st == #Send) && tk_in => remain == 0w7
+            case (st == #StatusI) && tk_in => true
+            else => it
+        }
+    }
+    reg last_r : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset => false
+            case (st == #Send) && tk_in => remain < 65w7
+            case (st == #StatusI) && tk_in => false
+            else => it
+        }
+    }
+
+}
+
+//> usb_serial -- EP1 bulk endpoint protocol.  Data toggles + ACK/NAK/
+//> arm decisions only -- data movement lives in the core top (FIFOs,
+//> snapshot RAM, tx PHY mux).  IN packets are snapshotted from the
+//> tx FIFO into the snapshot RAM at arm time (via resp_fresh), so an
+//> unacknowledged packet is retransmitted byte-identically (same
+//> data pid) until the host ACKs.  Data toggles reset on bus reset
+//> and SET_CONFIGURATION (USB 2.0 §9.1.1.5).
+//>
+//> The OUT data accept/reject is REGISTERED one clock after arrival
+//> (dt_acc/dt_rej): the room check (an add+compare crossing the rx
+//> FIFO count) and the response/toggle registers then land in
+//> separate cycles (+1 clock response latency is well inside the
+//> device turnaround budget).  An OUT packet that does not fit the
+//> rx FIFO whole is NAKed.
+mod Serial {
+    //> 48 MHz clock: 4 clock cycles per USB FS bit.
+    incoming clock : Clock
+    //> Synchronous reset, active high (core reset from UsbController).
+    incoming reset : Bit
+    //> Bus reset strobe (via the core): flushes the protocol state.
+    incoming bus_reset : Bit
+    //> Pulse: SET_CONFIGURATION completed (reset the bulk toggles).
+    incoming set_cfg : Bit
+    //> Router-gated token strobes (address + endpoint 1 matched):
+    //> IN (host wants a bulk-IN packet).
+    incoming tk_in : Bit
+    //> OUT (a data packet for EP1 follows).
+    incoming tk_out : Bit
+    //> Router-gated data packet strobe: an armed OUT to EP1 (NOT
+    //> delayed a clock, unlike EP0's -- the accept decision below is
+    //> itself registered).
+    incoming dt_valid : Bit
+    //> The packet assembler's held data record (fields hold between
+    //> packets; the accept decision registers one clock after the
+    //> strobe).
+    incoming dat : Valid[usb::DataRec]
+    //> Router-gated handshake strobe: our in-flight packet was ACKed.
+    incoming hs_ack : Bit
+
+    //> The held data record, unpacked (the @Invalid default
+    //> reproduces the flat-port reset values).
+    wire dt : usb::DataRec {
+        it := match dat {
+            case @Valid(d) => d
+            case @Invalid() => ${
+                pid = 0w4,
+                len = 0w7,
+                crc_ok = false,
+            }
+        }
+    }
+    wire dt_pid : Word[4] {
+        it := dt->pid
+    }
+    wire dt_crc_ok : Bit {
+        it := dt->crc_ok
+    }
+    //> Tx FIFO status: nothing queued for the host.
+    incoming txfifo_empty : Bit
+    //> Tx FIFO fill (for arm sizing: min(count, 64) bytes).
+    incoming txfifo_count : Word[7]
+    //> 1: the whole OUT packet fits the rx FIFO (core-side add+compare;
+    //> the decision here is registered one clock after arrival).
+    incoming rx_room : Bit
+    //> Free slots in the tx FIFO (unused here -- arm sizing reads
+    //> txfifo_count directly).
+    incoming tx_room : Word[7]
+
+    // ---- response registers -----------------------------------------------
+    //> 1-clock pulse: launch this module's response (the core's arbiter
+    //> latches resp_pid/resp_len/resp_fresh on it).
+    //> resp_req is default low, pulsed by each arm/accept/reject; the
+    //> params are held per-branch (the core's arbiter latches them on
+    //> the pulse).  The accept/reject branches take priority over the
+    //> token arm.
+    outgoing reg resp_req : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset || set_cfg => false
+            case dt_acc => true
+            case dt_rej => true
+            case tk_in  => true
+            else => false
+        }
+    }
+    //> Response PID: DATA0 3 / DATA1 B / ACK 2 / NAK A.
+    outgoing reg resp_pid : Word[4] on clock {
+        initial it <= 0w4
+        it <= when {
+            case dt_acc => 2w4
+            case dt_rej => 10w4
+            case tk_in => when {
+                // retransmit the unacknowledged packet, same pid
+                case ser_ack_wait   => mux(tog_tx, 11w4, 3w4)
+                // arm a new packet from the tx FIFO
+                case !txfifo_empty => mux(tog_tx, 11w4, 3w4)
+                // nothing to send
+                else => 10w4
+            }
+            else => it
+        }
+    }
+    //> Response byte count.
+    //> Held response length: the pending packet's pkt_len on a
+    //> retransmit, min(count,64) on a fresh arm, 0 for ACK/NAK.
+    outgoing reg resp_len : Word[7] on clock {
+        initial it <= 0w7
+        it <= when {
+            case dt_acc => 0w7
+            case dt_rej => 0w7
+            case tk_in => when {
+                case ser_ack_wait   => pkt_len
+                case !txfifo_empty => load_len
+                else => 0w7
+            }
+            else => it
+        }
+    }
+    //> 1-clock pulse alongside resp_req: a NEW packet was armed (vs a
+    //> retransmit of the pending snapshot) -- the core starts the
+    //> snapshot load on it.
+    //> The fresh-arm strobe: NOT reset (holds through reset/bus_reset/
+    //> set_cfg); harmless because the core only ever consumes it
+    //> alongside a resp_req pulse.
+    outgoing reg resp_fresh : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset || set_cfg => it
+            case arm_new => true
+            else => false
+        }
+    }
+    //> Router hint: an OUT data packet is expected (route dt_valid
+    //> here).  Cleared at the data packet's arrival edge; the
+    //> accept/reject decision is registered one clock later
+    //> (dt_acc/dt_rej).
+    outgoing reg ser_busy : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset || set_cfg => false
+            case it && dt_valid => false
+            case tk_out => true
+            else => it
+        }
+    }
+    //> Router hint: our data packet is in flight (route the ACK
+    //> here) -- the snapshot holds an unacknowledged IN packet
+    //> (retransmit on retry, same pid; forgotten at the ACK).
+    outgoing reg ser_ack_wait : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset || set_cfg => false
+            case hs_ack && it => false
+            case arm_new => true
+            else => it
+        }
+    }
+
+    unused tx_room
+    // Unused input: tx_room (arm sizing reads txfifo_count directly).
+    // The data record's len field is likewise unread here: the rx
+    // push (usb::UsbByteStream) counts the packet's bytes itself, and
+    // the whole packet is accepted or rejected on rx_room alone.
+
+    // ---- combinational helpers -------------------------------------------
+    //> The data pid the armed OUT expects (toggle-dependent).
+    wire exp_pid : Word[4] {
+        it := mux(tog_rx, 11w4, 3w4)
+    }
+    //> Arm-a-new-packet condition: IN token, no unacknowledged packet,
+    //> and something to send.
+    wire arm_new : Bit {
+        it := tk_in && !ser_ack_wait && !txfifo_empty
+    }
+    //> min(count, 64): the fresh-arm payload length.
+    wire load_len : Word[7] {
+        it := mux(txfifo_count > 64w7, 64w7, txfifo_count)
+    }
+
+    // ---- protocol registers ----------------------------------------------
+    //> TX data toggle: 0 => the next device data pid is DATA0.
+    //> Toggled by the ACK of our in-flight packet.
+    reg tog_tx : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset || set_cfg => false
+            case hs_ack && ser_ack_wait => !it
+            else => it
+        }
+    }
+    //> RX data toggle: 0 => the next host data pid is DATA0.
+    //> Toggled per accepted OUT packet.
+    reg tog_rx : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset || set_cfg => false
+            case dt_acc => !it
+            else => it
+        }
+    }
+    //> The snapshotted packet's byte count.
+    reg pkt_len : Word[7] on clock {
+        initial it <= 0w7
+        it <= when {
+            case reset || bus_reset || set_cfg => 0w7
+            case arm_new => load_len
+            else => it
+        }
+    }
+    //> Registered accept: good CRC, expected pid, room in the rx
+    //> FIFO (one clock after the data packet strobe).
+    reg dt_acc : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset || set_cfg => false
+            else => ser_busy && dt_valid && dt_crc_ok
+                && (dt_pid == exp_pid) && rx_room
+        }
+    }
+    //> Registered reject: anything else that arrives armed.
+    reg dt_rej : Bit on clock {
+        initial it <= false
+        it <= when {
+            case reset || bus_reset || set_cfg => false
+            else => ser_busy && dt_valid
+                && !(dt_crc_ok && (dt_pid == exp_pid) && rx_room)
+        }
+    }
+
+}

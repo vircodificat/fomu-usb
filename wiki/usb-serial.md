@@ -1,6 +1,6 @@
-# `usb::Serial` — EP1 bulk protocol
+# `endpoint::Serial` — EP1 bulk protocol
 
-`usb::Serial` (`src/usb.vir`) is the protocol brain for the CDC-ACM data
+`endpoint::Serial` (`src/endpoint.vir`) is the protocol brain for the CDC-ACM data
 endpoints: **EP1 OUT** (host → device data) and **EP1 IN**
 (device → host data), both **bulk** endpoints. It owns the *data toggles*,
 decides **ACK vs NAK** for every transaction, and tells the core top
@@ -40,7 +40,7 @@ Every endpoint maintains a toggle, one bit per direction. The rule:
   (USB 2.0 §9.1.1.5).
 
 In this module `tog_tx`/`tog_rx` are the toggles (the protocol registers in
-`usb::Serial`): `0` means the *next* data PID must be DATA0
+`endpoint::Serial`): `0` means the *next* data PID must be DATA0
 (`exp_pid` picks `DATA0`/`DATA1` from `tog_rx`).
 `0 → 1 → 0` is the "I received/sent a fresh packet" heartbeat of the whole
 link; if you ever lose sync, the host and device will disagree on the toggle
@@ -157,7 +157,7 @@ a NAK.
 | `ser_ack_wait` | out | 1 | our data packet is in flight (= `pkt_pending`) |
 
 State: `tog_tx`, `tog_rx`, `pkt_pending`, `pkt_len`, `armed_out`,
-`dt_acc`, `dt_rej` (the protocol registers in `usb::Serial`); the response
+`dt_acc`, `dt_rej` (the protocol registers in `endpoint::Serial`); the response
 registers `resp_req_r`/`resp_pid_r`/`resp_len_r`/`resp_fresh_r` hold the
 latched response the core's arbiter picks up.
 

@@ -113,7 +113,7 @@ The register-to-register critical path in the archived
 Read structurally: the source is the TX FIFO's read-pointer counter
 (`cnt` inside `usb_fifo16x8`, the ext body behind the `usb::TxFifo`
 wrapper in `ext/usb_uart.sv`); the middle levels are the arm-sizing
-decode in `usb::Serial` (`src/usb.vir`) — `load_len :=
+decode in `endpoint::Serial` (`src/endpoint.vir`) — `load_len :=
 min(txfifo_count, 64)` and `arm_new := tk_in && !pkt_pending &&
 !txfifo_empty` — and the sink is the **clock-enable** of the
 `pkt_pending` TX-arm register. "Did an IN token arrive, and how many
@@ -155,7 +155,7 @@ The deep cones above feed **FSM next-state logic**. A next-state
 decision is a feedback loop by definition: the result is needed *this
 cycle* to compute the state entered *next cycle*. You cannot pipeline
 inside a cycle. The registered-accept pattern in the EP0 request
-pipeline (`req_acc_r` / `sto_acc_r` in `usb::Ep0`, `src/usb.vir` — see
+pipeline (`req_acc_r` / `sto_acc_r` in `endpoint::Ep0`, `src/endpoint.vir` — see
 the "registered data-stage accepts" comment block) is the correct fix —
 it splits "did the packet decode?" from "what does the FSM do about
 it?" across two clock edges — but each such split needs the protocol to
@@ -188,7 +188,7 @@ protocol that has already spent nearly all of its spare cycles.
 ## The sharing hazard: cone independence
 
 Synthesis tools merge cones that share substructure — usually good for
-area, but it can undo your splits. This is why the `usb::Ep0` header
+area, but it can undo your splits. This is why the `endpoint::Ep0` header
 comment (`src/usb.vir`) calls its structure out explicitly: every
 register's next-state is a priority chain over *mutually exclusive*
 branches, so the tool can share the decode logic without the branches'
@@ -262,7 +262,7 @@ Now `cnt`'s enable cone is a single registered bit — depth 1. The cost
 is one cycle of latency: the counter reacts to `enable` one clock
 later. Whether that cycle is affordable is a *protocol* question, not a
 synthesis question — exactly the judgement this project makes in its
-EP0 pipeline (`usb::Ep0`, `src/usb.vir`): "the FSM reacts to the router
+EP0 pipeline (`endpoint::Ep0`, `src/endpoint.vir`): "the FSM reacts to the router
 strobes one clk after arrival ... the +1 clk is free against the
 ~30-50 clk turnaround budget."
 
@@ -324,8 +324,8 @@ restructure of a working, sim-green design; it is not the first move.
 | 4 clks per USB bit | `src/usb.vir` — `usb::RxPhy` header comment and the `ph` bit-phase counter (0..3) |
 | Build flow / synth target | `Makefile` (`synth`), [build-flow.md](build-flow.md) |
 | Latest timing report | `build/nextpnr.log` (verdict lines at "Max frequency"; paths at "Critical path report for clock") |
-| Registered-accept pipeline comment | `src/usb.vir`, `usb::Ep0` — "registered data-stage accepts" block and the `usb::Ep0` header |
-| The critical path's decode logic | `src/usb.vir`, `usb::Serial` — `arm_new` / `load_len` decode into `pkt_pending`'s clock-enable |
+| Registered-accept pipeline comment | `src/endpoint.vir`, `endpoint::Ep0` — "registered data-stage accepts" block and the `endpoint::Ep0` header |
+| The critical path's decode logic | `src/endpoint.vir`, `endpoint::Serial` — `arm_new` / `load_len` decode into `pkt_pending`'s clock-enable |
 
 ## See also
 

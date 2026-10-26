@@ -36,9 +36,9 @@ conventions — and is worth re-reading after this page.
 | `output_enable` | out | 1 | pad drive enable |
 
 `tx_pid`/`tx_len`/`tx_byte` come from the transmit arbiter in
-[`usb_uart`](usb-uart.md), which serializes responses from [`usb::Ep0`](usb-ep0.md)
+[`usb_uart`](usb-uart.md), which serializes responses from [`endpoint::Ep0`](usb-ep0.md)
 (descriptors and status — with `GET_STATUS` reading as zero bytes),
-[`usb::Serial`](usb-serial.md) (the bulk-IN snapshot RAM), and the
+[`endpoint::Serial`](usb-serial.md) (the bulk-IN snapshot RAM), and the
 always-NAK EP2. The drive
 levels leave the core top as `dp_tx`/`dn_tx`/`output_enable` and reach the
 wires through the SB_IO tristate pad cells in `ext/usb_pads.sv`

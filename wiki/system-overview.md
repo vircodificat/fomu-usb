@@ -54,8 +54,8 @@ module Top (build/top.sv, emitted from src/top.vir's platform export)
 │       ├── rxpkt: usb::RxPacket            bit stream → packet records
 │       │     ├── crc5: usb::Crc5           token CRC (x⁵+x²+1)
 │       │     └── crc16: usb::Crc16         data CRC (x¹⁶+x¹⁵+x²+1)
-│       ├── ep0: usb::Ep0                   EP0 control SM + CDC requests
-│       ├── serial: usb::Serial             EP1 bulk protocol, toggles, ACK/NAK
+│       ├── ep0: endpoint::Ep0                   EP0 control SM + CDC requests
+│       ├── serial: endpoint::Serial             EP1 bulk protocol, toggles, ACK/NAK
 │       ├── txphy: usb::TxPhy               packet records → pads
 │       │     └── crc16: usb::Crc16         TX data CRC generator
 │       ├── rxfifo: usb::RxFifo             ext body: usb_fifo16x8 64×8, BRAM
@@ -107,7 +107,7 @@ uart_rx_line
   → UartReceiver    (uart::UartReceiver: start-bit detect, mid-bit sampling)
   → hold slot       (reg hold_data, src/echo.vir)
   → tx FIFO         (usb::TxFifo, pushed while usb_tx_ready)
-  → usb::Serial     (DATA0/1 toggle, host ACK handshake)
+  → endpoint::Serial     (DATA0/1 toggle, host ACK handshake)
   → usb::TxPhy      (CRC16, stuffing, NRZI, sync, EOP)
   → usb::UsbUart    (response arbiter)
   → SB_IO pads      (usb::UsbPads, ext/usb_pads.sv)

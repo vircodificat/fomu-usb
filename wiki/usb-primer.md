@@ -164,7 +164,7 @@ bmRequestType | bRequest | wValue(2) | wIndex(2) | wLength(2)
 
 `wValue`/`wIndex` are LSb-first on the wire — a classic porting bug.
 
-The sequence this core serves (`usb::Ep0` in `src/usb.vir`,
+The sequence this core serves (`endpoint::Ep0` in `src/endpoint.vir`,
 [usb-ep0.md](usb-ep0.md)):
 
 1. `GET_DESCRIPTOR(Device)` — host reads the 18-byte device descriptor.
@@ -198,7 +198,7 @@ exposes as a serial port (`/dev/ttyACM*`, "COM port").
 
 - **Descriptors**: CDC header, call management, ACM, union descriptors
   on the control interface; two bulk endpoints on a data interface.
-- **EP0 class requests** this core implements in `usb::Ep0`: exactly
+- **EP0 class requests** this core implements in `endpoint::Ep0`: exactly
   one — `SET_CONTROL_LINE_STATE` (DTR/RTS, bmRequestType 0x21,
   bRequest 0x22) — accepted.  Anything unrecognized → **STALL**
   (error handshake), including `SET_LINE_CODING`/`GET_LINE_CODING`:
@@ -239,7 +239,7 @@ alternating per packet per direction. Sender flips its toggle only
 after an ACK; receiver accepts a packet only if the toggle matches
 expectation — a mismatched (duplicate) packet is a retry and is
 dropped. Toggles reset to "expect DATA0" on bus reset and
-SET_CONFIGURATION (`usb::Serial` in `src/usb.vir`; see
+SET_CONFIGURATION (`endpoint::Serial` in `src/endpoint.vir`; see
 [usb-serial.md](usb-serial.md)).
 
 **ACK/NAK flow control — the important design lesson.** USB has no
@@ -250,7 +250,7 @@ SET_CONFIGURATION (`usb::Serial` in `src/usb.vir`; see
    in `src/echo.vir`, `\echo::EchoFifo` in `ext/echo_fifo.sv`).
 2. `room` feeds back as `rx_ready` into the core (`src/top.vir`):
    the router stops popping bytes out of the rx FIFO.
-3. The rx FIFO stays non-empty ⇒ on the next OUT token, `usb::Serial`
+3. The rx FIFO stays non-empty ⇒ on the next OUT token, `endpoint::Serial`
    answers **NAK** (`src/usb.vir` OUT path).
 4. The host sees NAK, waits, retries the *same* OUT token + same
    toggle + same data — nothing is lost, everything is deferred.

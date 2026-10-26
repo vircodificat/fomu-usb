@@ -1,6 +1,6 @@
-# `usb::Ep0` — control transfers and enumeration
+# `endpoint::Ep0` — control transfers and enumeration
 
-`usb::Ep0` (`src/usb.vir`) is the control-transfer state machine for
+`endpoint::Ep0` (`src/endpoint.vir`) is the control-transfer state machine for
 **EP0**, the endpoint every USB device must implement. It is the module the
 host talks to first: it answers **GET_DESCRIPTOR** (device, configuration,
 strings) and **GET_STATUS**, applies **SET_ADDRESS** and
@@ -35,7 +35,7 @@ packet, optionally a data packet, optionally a handshake. A control
    token; for a control read the *host* sends a zero-length DATA1 after an
    OUT token and the device ACKs it.
 
-The 8 request bytes are a little fixed-layout structure. `usb::Ep0` latches
+The 8 request bytes are a little fixed-layout structure. `endpoint::Ep0` latches
 them into `rq0..rq3, rq6, rq7` (`wIndex`, bytes 4–5, is never needed and
 simply not kept):
 
@@ -46,8 +46,8 @@ simply not kept):
 | 2–3 | `rq2`/`rq3` | `wValue` low/high | request-specific (descriptor type/index, address…) |
 | 6–7 | `rq6`/`rq7` | `wLength` | bytes the data stage will carry |
 
-The toggles follow strict rules (see the `usb::Ep0` banner in
-`src/usb.vir`): SETUP is always DATA0 and **resets the toggle**; the *data*
+The toggles follow strict rules (see the `endpoint::Ep0` banner in
+`src/endpoint.vir`): SETUP is always DATA0 and **resets the toggle**; the *data*
 stage starts at DATA1 for both directions; the status packet is always a
 zero-length DATA1. See [Data toggles on EP0](#data-toggles-on-ep0) below.
 
@@ -69,7 +69,7 @@ device, conducted entirely over EP0. A typical pass against this core:
    64-byte DATA1 packet plus an 11-byte DATA0 packet (two IN transactions).
    The host reads the string descriptors the same way.
 5. **SET_CONFIGURATION(1)** — `configured` goes 1; the token router starts
-   forwarding EP1 traffic to `usb::Serial`, and a `cfg_strobe` pulse
+   forwarding EP1 traffic to `endpoint::Serial`, and a `cfg_strobe` pulse
    resets the bulk data toggles (USB 2.0 §9.1.1.5) — see
    [usb-serial.md](usb-serial.md).
 6. **CDC requests** — `SET_CONTROL_LINE_STATE` (the host asserts DTR when a
@@ -111,8 +111,8 @@ last_out_ep0))`) and each incoming ACK (`ep0_hs_ack = rxpkt.hs_valid &&
 
 ## The state machine
 
-`usb::Ep0` is a classic registered FSM (`st`, the 10-state `Ep0State` enum
-in `src/usb.vir`) plus a small pipeline of helper registers. The state
+`endpoint::Ep0` is a classic registered FSM (`st`, the 10-state `Ep0State` enum
+in `src/endpoint.vir`) plus a small pipeline of helper registers. The state
 encodings are deliberately non-sequential: `Parse = 8`, `Setup = 9`,
 `Arm = 10` are the three decode stages that follow `RcvReq = 1`, written in
 the order the request flows through them (`StatusI = 5`, `StatusO = 6` and
@@ -156,7 +156,7 @@ ZLP of a control read.
 Decoding "which request is this?" means comparing byte values at three
 levels (request type → descriptor type → string index). That compare tree
 is too deep for one 48 MHz clock, so it is *pipelined one compare per
-clock* (see the `usb::Ep0` banner in `src/usb.vir`):
+clock* (see the `endpoint::Ep0` banner in `src/endpoint.vir`):
 
 - **`EP_RCV_REQ`** — wait for the SETUP DATA0 (8 bytes, CRC good:
   `req_acc_r`), ACK it, latch the request bytes into `rq*`.
@@ -253,7 +253,7 @@ The tags are not decoration. Every request latches `addr_pending <=
 rq2[6:0]`, including GET_DESCRIPTOR — whose `wValue` low byte is 0. At a
 GET_DESCRIPTOR's status stage, `pend_addr` is 0, so the 0 parked value is
 *not* applied; without the tag, every control read would wipe `dev_addr`
-back to 0 mid-enumeration (the side-effects comment in `usb::Ep0` records
+back to 0 mid-enumeration (the side-effects comment in `endpoint::Ep0` records
 exactly this bug).
 
 The token router in `usb::UsbUart` compares every token's address field
@@ -262,7 +262,7 @@ EP0 answers only to its new name.
 
 ## Descriptor ROM reads
 
-`usb::Ep0` does not store descriptor bytes. When EP_SEND arms a data packet
+`endpoint::Ep0` does not store descriptor bytes. When EP_SEND arms a data packet
 it outputs `resp_sel` (which descriptor) and `resp_base` (byte offset
 within the transfer, 0 for the first packet); the descriptor *contents*
 are pulled byte-by-byte by the tx PHY from the descriptor ROM
@@ -282,7 +282,7 @@ One "descriptor" is dynamic and bypasses the ROM: `sel 6` (GET_STATUS)
 reads as zero bytes — the producer mux in `usb::UsbUart` is three-way:
 serial snapshot RAM (`tx_owner == 2`) / sel-6 zeroes / ROM (`tx_byte`).
 
-The `dlen` table inside `usb::Ep0` mirrors the ROM's page sizes so the FSM
+The `dlen` table inside `endpoint::Ep0` mirrors the ROM's page sizes so the FSM
 can size the data stage: `min(wLength, dlen(sel))`. It must be kept in
 sync with the ROM — a desync means over- or under-length transfers.
 Multi-packet data stages fall out naturally: the 75-byte config descriptor
@@ -333,7 +333,7 @@ data is ever lost. The endpoint is a billboard, not a worker.
 
 - A **control transfer** is SETUP (8-byte request in DATA0) → optional
   DATA stage → STATUS (a zero-length DATA1 in the opposite direction);
-  USB 2.0 §8.5.5 is the whole plot of `usb::Ep0`.
+  USB 2.0 §8.5.5 is the whole plot of `endpoint::Ep0`.
 - **Enumeration** is just a sequence of these transfers: read descriptors,
   SET_ADDRESS, SET_CONFIGURATION, then CDC requests — and this core walks
   the whole list with one 10-state FSM.

@@ -45,11 +45,12 @@ synthesis. This project does both, every `make`.
 Two kinds of RTL, compiled by two tools:
 
 - **`src/*.vir`** — the design is written in Virdant: `src/top.vir`
-  (the platform wrapper), `src/usb.vir` (the whole USB core:
-  `usb::UsbPor`, `usb::Crc5/Crc16`, `usb::RxPhy/RxPacket`, `usb::Ep0`,
-  `usb::Serial`, `usb::TxPhy`, wrapped by `usb::UsbController`),
-  `src/echo.vir` (`echo::EchoServer`), and `src/uart.vir`
-  (`uart::UartSender/UartReceiver`).
+  (the platform wrapper), `src/usb.vir` (the USB core: `usb::UsbPor`,
+  `usb::RxPhy/RxPacket`, `usb::TxPhy`, wrapped by
+  `usb::UsbController`), `src/crc.vir` (`usb::Crc5/Crc16`),
+  `src/endpoint.vir` (the endpoint protocol mods `endpoint::Ep0` /
+  `endpoint::Serial`), `src/echo.vir` (`echo::EchoServer`), and
+  `src/uart.vir` (`uart::UartSender/UartReceiver`).
 - **`ext/*.sv`** — hand-written Verilog *ext bodies* for the few mods
   Virdant cannot express, because they need `inout` nets, BRAM
   inference, or initializer ROMs: `ext/usb_pads.sv` (`usb::UsbPads`,

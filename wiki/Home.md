@@ -90,8 +90,8 @@ the transmit/application path, and finally the flow:
 | [usb-rx-phy.md](usb-rx-phy.md) | `usb::RxPhy` — pads → bit stream (NRZI, bit stuffing, sync/EOP/reset detect) |
 | [usb-rx-packet.md](usb-rx-packet.md) | `usb::RxPacket` — bit stream → packet records |
 | [usb-tx-phy.md](usb-tx-phy.md) | `usb::TxPhy` — packet records → pads |
-| [usb-ep0.md](usb-ep0.md) | `usb::Ep0` — control transfers, descriptors, enumeration |
-| [usb-serial.md](usb-serial.md) | `usb::Serial` — EP1 bulk protocol, toggles, ACK/NAK |
+| [usb-ep0.md](usb-ep0.md) | `endpoint::Ep0` — control transfers, descriptors, enumeration |
+| [usb-serial.md](usb-serial.md) | `endpoint::Serial` — EP1 bulk protocol, toggles, ACK/NAK |
 | [usb-fifo.md](usb-fifo.md) | `usb_fifo16x8` — the core's generic sync FIFO (16×8 flops / 64×8 BRAM) |
 | [usb-uart.md](usb-uart.md) | `usb::UsbUart` (`src/usb.vir`) — core top: token router, response arbiter, descriptor paging, FIFOs |
 

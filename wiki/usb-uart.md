@@ -27,8 +27,8 @@ domain (4 clks per USB FS bit), no PLL, no CDC.
 | `txphy` | `usb::TxPhy` | packet records → pads | [usb-tx-phy.md](usb-tx-phy.md) |
 | `rxfifo` | `\usb::RxFifo` (ext body of `usb_fifo16x8`) | 64-deep × 8-bit bulk-OUT FIFO, BRAM storage | [usb-fifo.md](usb-fifo.md) |
 | `txfifo` | `\usb::TxFifo` (ext body of `usb_fifo16x8`) | 16-deep × 8-bit bulk-IN FIFO, flop storage | [usb-fifo.md](usb-fifo.md) |
-| `ep0` | `usb::Ep0` | control endpoint state machine, CDC requests | [usb-ep0.md](usb-ep0.md) |
-| `serial` | `usb::Serial` | EP1 IN/OUT bulk protocol | [usb-serial.md](usb-serial.md) |
+| `ep0` | `endpoint::Ep0` | control endpoint state machine, CDC requests | [usb-ep0.md](usb-ep0.md) |
+| `serial` | `endpoint::Serial` | EP1 IN/OUT bulk protocol | [usb-serial.md](usb-serial.md) |
 | `snapram` | `usb::SnapRam` | 64×8 bulk-IN snapshot RAM (one `SB_RAM40_4K`) | — |
 | `descrom` | `\usb::DescRom` | 256×8 initialized descriptor ROM | — |
 
@@ -63,7 +63,7 @@ transfer offset at arm time (on `ep0_resp_req`):
 | 4 | 107 | 32 B declared | **String 2** (product: "Fomu UART PoC", bLength 0x20 — the UTF-16 string data is zero-padded up to the declared length) |
 | 6 | — | 2 B | **GET_STATUS** — two zero bytes; bypasses the ROM (the `tx_byte` producer mux returns zeros for sel 6) |
 
-There is no sel 5: `usb::Ep0` implements no line-coding request, and an
+There is no sel 5: `endpoint::Ep0` implements no line-coding request, and an
 invalid GET_DESCRIPTOR select STALLs instead of arming.
 
 The descriptors *must* match what the core implements: `cdc_acm` on Linux
@@ -77,7 +77,7 @@ Two register stages in `mod UsbUart`:
 1. **Address filter** (`tok_v_r`): a token is ours iff
    `rxpkt.tk_valid && rxpkt.tk_crc_ok && (rxpkt.tk_addr == ep0.dev_addr)`.
    The device answers **only its own address** — `dev_addr` starts 0 (the
-   enumeration default) and is latched by `usb::Ep0` when SET_ADDRESS
+   enumeration default) and is latched by `endpoint::Ep0` when SET_ADDRESS
    completes. SOF tokens decode (the frame number is captured by `rxpkt`)
    but are otherwise ignored.
 2. **Endpoint decode** (`ep0_tk_setup_r` / `ep0_tk_in_r` / `ep0_tk_out_r`,
@@ -99,7 +99,7 @@ read is bit-identical); the gate is `ep0_data_take` =
 `ep0.ep0_busy || (ep0.ep0_stalling && last_out_ep0)` — while EP0 STALLs,
 it still owns the stalled transfer's own data stage, tracked by the
 `last_out_ep0` register ("last valid token was OUT-to-EP0").
-`usb::Serial` keeps the arrival-cycle strobe (`ser_dt_valid` =
+`endpoint::Serial` keeps the arrival-cycle strobe (`ser_dt_valid` =
 `rxpkt.dt_valid && serial.ser_busy && !ep0_data_take`; `ser_busy` is
 `armed_out`) — its accept decision is itself registered one clk later
 (`dt_acc`/`dt_rej`), so its cone is not critical.
@@ -120,7 +120,7 @@ tx_pid_w = ep0_resp_req ? ep0.resp_pid
           : 10w4;                       // 10 = the NAK pid: EP2, nothing armed
 ```
 
-- `ep0_resp_req` (from `usb::Ep0`) > `ser_resp_req` (from `usb::Serial`)
+- `ep0_resp_req` (from `endpoint::Ep0`) > `ser_resp_req` (from `endpoint::Serial`)
   > EP2. EP2 is the notification endpoint: the core **never arms it**, so
   every IN/OUT token to EP2 gets a NAK from the **registered**
   `ep2_nak_req` (a combinational NAK off the token decode would drag the
@@ -158,7 +158,7 @@ tx_ready          — device → consumer: tx FIFO has room
   consuming the last byte (the 7-bit count must never underflow).
 - **`rx_ready` low → NAK**: with the echo server as consumer, `rx_ready`
   throttles the pop rate to the UART's 115200-baud drain rate. The rx
-  FIFO fills, `usb::Serial`'s `rx_room` test fails → NAK → the host
+  FIFO fills, `endpoint::Serial`'s `rx_room` test fails → NAK → the host
   retries. End-to-end flow control with no byte loss.
 - **`tx_strobe`** pushes into the tx FIFO through the **registered**
   write gate `txfifo_wr_d` (`tx_strobe && !txfifo.full`): the count
@@ -194,7 +194,7 @@ the core (the extra register keeps the pad-adjacent POR flop from
 sourcing the core-wide reset net). `bus_reset` (detected by `usb::RxPhy`)
 is ORed into the reset of the FIFOs (`rst || bus_reset` on both), the
 router strobes, the snapshot loader, and the rx pop/push pipes — and
-propagates to `usb::Serial` and `usb::Ep0` to clear toggles and address.
+propagates to `endpoint::Serial` and `endpoint::Ep0` to clear toggles and address.
 A few registers deliberately reset on `rst` **only**, not `bus_reset`:
 `ep2_nak_req`, `tx_owner`, `rom_base_r`, and `configured_d`.
 SET_CONFIGURATION completion toggles `cfg_strobe`

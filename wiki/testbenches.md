@@ -58,7 +58,7 @@ The scenarios (T1–T9):
 |---|---|
 | T1 | SETUP token to addr=3 ep=0 decodes with right PID/addr/EP/CRC |
 | T2 | SOF frame 1234 decodes |
-| T3 | 8-byte DATA0 (a real `GET_DESCRIPTOR` shape) decodes; the flopped head window (bytes 0..7, what `usb::Ep0` latches) *and* the payload RAM both match via the packet RAM read port |
+| T3 | 8-byte DATA0 (a real `GET_DESCRIPTOR` shape) decodes; the flopped head window (bytes 0..7, what `endpoint::Ep0` latches) *and* the payload RAM both match via the packet RAM read port |
 | T4 | A deliberately corrupted-CRC data packet must **not** pass (`host_send_data_corrupt`) — a negative test |
 | T5 | TX round-trip: 16-byte DATA1 captured by the BFM *and* decoded by the core's own RX |
 | T6 | TX zero-length packet (ZLP) survives |

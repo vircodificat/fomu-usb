@@ -28,12 +28,12 @@ USB_SRVS := ext/usb_uart.sv
 PADS_SV  := ext/usb_pads.sv
 ECHO_SV  := ext/echo_fifo.sv
 EXT_SRVS := $(USB_SRVS) $(PADS_SV) $(ECHO_SV)
-# crc.sv / phy.sv / tx_phy.sv come from src/crc.vir / src/phy.vir /
-# src/tx_phy.vir (see also the import lines at the top of src/usb.vir).
+# crc.sv / endpoint.sv / phy.sv come from src/crc.vir / src/endpoint.vir /
+# src/phy.vir (see also the import lines at the top of src/usb.vir).
 # Core = everything a TB that doesn't drive the echo path can elaborate
 # without ext/echo_fifo.sv (EchoServer's EchoFifo ext body); USB_BUILD
 # adds echo/uart on top for the serial TB and synth.
-USB_BUILD_CORE := build/builtin.sv build/crc.sv build/usb.sv build/phy.sv
+USB_BUILD_CORE := build/builtin.sv build/crc.sv build/endpoint.sv build/usb.sv build/phy.sv
 USB_BUILD := $(USB_BUILD_CORE) build/echo.sv build/uart.sv
 
 # Testbench sources.  tb/usb_host_bfm.v is an include file (tasks/macros

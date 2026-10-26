@@ -201,7 +201,7 @@ safe — the pointers move past each other independently, `cnt` unchanged.
 
 **`count` and room math.** Callers reason about *room*, not occupancy.
 `usb::UsbUart` computes `tx_room = 16w7 - txfifo.count` and passes it to
-`usb::Serial` (which currently leaves it unused — arm sizing reads
+`endpoint::Serial` (which currently leaves it unused — arm sizing reads
 `txfifo.count` directly), and the whole-packet admission check computes
 `rx_sum = rxfifo.count + rxpkt.dt_len` and accepts an OUT packet only when
 `rx_sum <= 64` (`rx_room_ok`, `src/usb.vir`) — see below.
@@ -270,7 +270,7 @@ write-decode cones out of the scarce iCE40 fabric (see
 The rule is enforced by the caller, not the FIFO: `rx_room_ok` in
 `usb::UsbUart` (`src/usb.vir`) adds the packet length to the current fill —
 `rx_sum = rxfifo.count + rxpkt.dt_len <= 64` — and passes it to
-`usb::Serial` as `rx_room`, which registers the accept/reject decision one
+`endpoint::Serial` as `rx_room`, which registers the accept/reject decision one
 clk after the data packet arrives: accept (ACK) only on a good CRC, the
 expected PID, and room for the whole packet; NAK otherwise, and the host
 retries. Bytes never drop.
