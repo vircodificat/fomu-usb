@@ -112,7 +112,10 @@ last_out_ep0))`) and each incoming ACK (`ep0_hs_ack = rxpkt.hs_valid &&
 ## The state machine
 
 `endpoint::Ep0` is a classic registered FSM (`st`, the 10-state `Ep0State` enum
-in `src/endpoint.vir`) plus a small pipeline of helper registers. The state
+in `src/endpoint.vir`) plus a small pipeline of helper registers — factored
+into three mods: the FSM + response/status/hint registers in `endpoint::Ep0`,
+the request-decode pipeline in `endpoint::Ep0ReqDecode`, the data-stage send
+datapath in `endpoint::Ep0SendEngine` (all in `src/endpoint.vir`). The state
 encodings are deliberately non-sequential: `Parse = 8`, `Setup = 9`,
 `Arm = 10` are the three decode stages that follow `RcvReq = 1`, written in
 the order the request flows through them (`StatusI = 5`, `StatusO = 6` and
@@ -156,7 +159,7 @@ ZLP of a control read.
 Decoding "which request is this?" means comparing byte values at three
 levels (request type → descriptor type → string index). That compare tree
 is too deep for one 48 MHz clock, so it is *pipelined one compare per
-clock* (see the `endpoint::Ep0` banner in `src/endpoint.vir`):
+clock* (see the `endpoint::Ep0ReqDecode` banner in `src/endpoint.vir`):
 
 - **`EP_RCV_REQ`** — wait for the SETUP DATA0 (8 bytes, CRC good:
   `req_acc_r`), ACK it, latch the request bytes into `rq*`.
@@ -253,7 +256,7 @@ The tags are not decoration. Every request latches `addr_pending <=
 rq2[6:0]`, including GET_DESCRIPTOR — whose `wValue` low byte is 0. At a
 GET_DESCRIPTOR's status stage, `pend_addr` is 0, so the 0 parked value is
 *not* applied; without the tag, every control read would wipe `dev_addr`
-back to 0 mid-enumeration (the side-effects comment in `endpoint::Ep0` records
+back to 0 mid-enumeration (the side-effects comment in `endpoint::Ep0ReqDecode` records
 exactly this bug).
 
 The token router in `usb::UsbUart` compares every token's address field

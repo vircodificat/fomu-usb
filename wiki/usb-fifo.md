@@ -270,7 +270,8 @@ write-decode cones out of the scarce iCE40 fabric (see
 The rule is enforced by the caller, not the FIFO: `rx_room_ok` in
 `usb::UsbUart` (`src/usb.vir`) adds the packet length to the current fill —
 `rx_sum = rxfifo.count + rxpkt.dt_len <= 64` — and passes it to
-`endpoint::Serial` as `rx_room`, which registers the accept/reject decision one
+`endpoint::SerialOutData` (routed via `endpoint::Serial`) as `rx_room`, which
+registers the accept/reject decision one
 clk after the data packet arrives: accept (ACK) only on a good CRC, the
 expected PID, and room for the whole packet; NAK otherwise, and the host
 retries. Bytes never drop.

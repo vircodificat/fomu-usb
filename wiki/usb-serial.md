@@ -156,10 +156,12 @@ a NAK.
 | `ser_busy` | out | 1 | OUT data packet expected (= `armed_out`) |
 | `ser_ack_wait` | out | 1 | our data packet is in flight (= `pkt_pending`) |
 
-State: `tog_tx`, `tog_rx`, `pkt_pending`, `pkt_len`, `armed_out`,
-`dt_acc`, `dt_rej` (the protocol registers in `endpoint::Serial`); the response
-registers `resp_req_r`/`resp_pid_r`/`resp_len_r`/`resp_fresh_r` hold the
-latched response the core's arbiter picks up.
+State: the rx side (`tog_rx`, `dt_acc`, `dt_rej`) lives in
+`endpoint::SerialOutData`; the tx side (`tog_tx`, `pkt_len`,
+`ser_ack_wait`) in `endpoint::SerialInData` (`armed_out` / `pkt_pending`
+are the netlist aliases); the response registers
+`resp_req_r`/`resp_pid_r`/`resp_len_r`/`resp_fresh_r` hold the latched
+response the core's arbiter picks up.
 
 ## Key takeaways
 
