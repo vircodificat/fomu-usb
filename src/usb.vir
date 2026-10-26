@@ -210,21 +210,20 @@ mod RxRam {
 
 //> Bit stream -> packet records: consumes usb::RxPhy's decoded bit
 //> stream (bit_i/bit_valid/sop/eop/pkt_err) and emits record pulses
-//> -- tk (pulsed Valid[TokenRec] for token arrivals), dt_* (data:
-//> payload + read port), hs_* (handshake) -- for the router in the
-//> core top.
+//> -- tk (pulsed Valid[TokenRec] for token arrivals), dt (pulsed
+//> Valid[DataRec] for data arrivals), hs_* (handshake) -- for the
+//> router in the core top.
 //>
 //> The held records (Valid[TokenRec] / Valid[DataRec] / Valid[HsRec])
 //> are passed through as tok_rec / data_rec / hs_rec for in-design
-//> consumers (which unpack them with match).  The token arrival is
-//> also promoted to a pulsed Valid[TokenRec] (tk, @Valid for exactly
-//> one cycle on capture), serving as both the strobe and the struct
-//> payload.  The dt_* and hs_* flat ports remain for TB
-//> compatibility (tb/tb_usb_phy.v).  A packet record is emitted only
-//> if the packet was good; CRC failures deliver the record with
-//> *_crc_ok low instead (the protocol layer retries), while stuff
-//> errors, bad PIDs and over-length payloads make the packet silent
-//> (bad).
+//> consumers (which unpack them with match).  Token and data arrivals
+//> are also promoted to pulsed Valid[T] ports (tk / dt, @Valid for
+//> exactly one cycle on capture), serving as both the strobe and the
+//> struct payload.  The hs_* flat ports remain for TB compatibility
+//> (tb/tb_usb_phy.v).  A packet record is emitted only if the packet
+//> was good; CRC failures deliver the record with *_crc_ok low
+//> instead (the protocol layer retries), while stuff errors, bad PIDs
+//> and over-length payloads make the packet silent (bad).
 mod RxPacket {
     //> 48 MHz clock: 4 clock cycles per USB FS bit.
     incoming clock : Clock
@@ -278,22 +277,10 @@ mod RxPacket {
         it := core.hs_rec
     }
 
-    // ---- flat pass-throughs (data + handshake) --------------------------
-    //> The held records (usb::RxPacketCore's captures), unpacked to
-    //> the FLAT record ports.  While a record is @Invalid, its flat
-    //> fields serve the pre-split reset values (fields 0, crc
-    //> verdicts false).  The token record no longer has flat fields;
-    //> see the pulsed `tk` port below.
-    wire data_p : DataRec {
-        it := match core.data_rec {
-            case @Valid(d) => d
-            case @Invalid() => ${
-                pid = 0w4,
-                len = 0w7,
-                crc_ok = false,
-            }
-        }
-    }
+    // ---- flat pass-throughs (handshake) ---------------------------------
+    //> The held handshake record (usb::RxPacketCore's capture), unpacked
+    //> to the FLAT record port.  While the record is @Invalid, its flat
+    //> field serves the pre-split reset value (pid = 0).
     wire hs_p : HsRec {
         it := match core.hs_rec {
             case @Valid(h) => h
@@ -322,17 +309,22 @@ mod RxPacket {
             else => @Invalid()
         }
     }
-    //> 1-clock pulse: a data record was latched this edge.
-    outgoing dt_valid : Bit {
-        it := core.dt_strobe
-    }
-    //> Data PID (DATA0 3 / DATA1 B).
-    outgoing dt_pid : Word[4] {
-        it := data_p->pid
-    }
-    //> Payload byte count (bc - 2: the 2 crc16 wire bytes are excluded).
-    outgoing dt_len : Word[7] {
-        it := data_p->len
+    // ---- data arrival pulse -------------------------------------------
+    //> Pulsed data record (@Valid for one cycle on capture, serving
+    //> as both the arrival strobe and the struct payload for
+    //> consumers that register the fields themselves).
+    outgoing dt : Valid[DataRec] {
+        it := when {
+            case core.dt_strobe => @Valid(match core.data_rec {
+                case @Valid(d) => d
+                case @Invalid() => ${
+                    pid = 0w4,
+                    len = 0w7,
+                    crc_ok = false,
+                }
+            })
+            else => @Invalid()
+        }
     }
     //> Flopped payload head window, packet bytes 0..7 (consumers that
     //> need several bytes AT ONCE -- the EP0 request latch,
@@ -345,10 +337,7 @@ mod RxPacket {
     outgoing dt_rd_data : Word[8] {
         it := core.dt_rd_data
     }
-    //> CRC16 residual check (16'h800D after a good payload stream).
-    outgoing dt_crc_ok : Bit {
-        it := data_p->crc_ok
-    }
+
     //> 1-clock pulse: a handshake record was latched this edge.
     outgoing hs_valid : Bit {
         it := core.hs_strobe
@@ -1289,8 +1278,10 @@ mod UsbTokenRouter {
     //> struct payload; consumers that need stable field access between
     //> packets register the struct fields themselves).
     incoming tk : Valid[TokenRec]
-    //> Packet assembler data-record strobe (a data packet's EOP).
-    incoming dt_valid : Bit
+    //> Packet assembler's pulsed data record (@Valid for one cycle
+    //> on capture, serving as both the arrival strobe and the struct
+    //> payload).
+    incoming dt : Valid[DataRec]
     //> Packet assembler handshake-record strobe (a handshake's EOP).
     incoming hs_valid : Bit
     //> The packet assembler's held handshake record.
@@ -1457,11 +1448,14 @@ mod UsbTokenRouter {
         it := ep0_busy || (ep0_stalling && last_out_ep0)
     }
     wire ep0_dt_gate : Bit {
-        it := dt_valid && ep0_data_take
+        it := match dt {
+            case @Valid(dontcare) => ep0_data_take
+            case @Invalid() => false
+        }
     }
     //> 1-clock strobe: a data packet was routed to EP0 (registered
-    //> one clock after dt_valid; the fields hold, so the delayed read
-    //> is bit-identical).
+    //> one clock after the pulsed data arrival; the fields hold, so
+    //> the delayed read is bit-identical).
     outgoing reg ep0_dt_valid_r : Bit on clock {
         initial it <= false
         it <= when {
@@ -1473,7 +1467,10 @@ mod UsbTokenRouter {
     //> endpoint (its accept decision registers one clock later, so
     //> this stays unregistered).
     outgoing ser_dt_valid : Bit {
-        it := dt_valid && ser_busy && !ep0_data_take
+        it := match dt {
+            case @Valid(dontcare) => ser_busy && !ep0_data_take
+            case @Invalid() => false
+        }
     }
 
     //> Handshake router: the module with a response in flight owns
@@ -2052,9 +2049,7 @@ mod UsbUart {
         // likewise unused externally; the pulsed tk port carries
         // the arrival struct for the router.
         unused it.tok_rec
-        unused it.dt_pid
-        unused it.dt_len
-        unused it.dt_crc_ok
+
         unused it.hs_pid
     }
 
@@ -2102,7 +2097,7 @@ mod UsbUart {
         it.bus_reset := rxphy.bus_reset
         it.dev_addr  := ep0.dev_addr
         it.tk  := rxpkt.tk
-        it.dt_valid  := rxpkt.dt_valid
+        it.dt  := rxpkt.dt
         it.hs_valid  := rxpkt.hs_valid
         it.hs        := rxpkt.hs_rec
         it.ep0_busy    := ep0.ep0_busy

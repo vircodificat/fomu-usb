@@ -40,9 +40,13 @@ module tb_usb_phy;
     wire [3:0] tk_endp   = tk[17:14];
     wire [10:0] tk_frame = tk[28:18];
     wire       tk_crc_ok = tk[6];
-    wire dt_valid, dt_crc_ok, hs_valid;
-    wire [3:0] dt_pid, hs_pid;
-    wire [6:0] dt_len;
+    wire [13:0] dt;           // pulsed Valid[DataRec] (packed)
+    wire dt_valid   = (dt[1:0] == 2'b10);     // @Valid tag
+    wire [3:0] dt_pid    = dt[5:2];
+    wire [6:0] dt_len    = dt[12:6];
+    wire       dt_crc_ok = dt[13];
+    wire hs_valid;
+    wire [3:0] hs_pid;
     // rx packet payload capture (off-fabric interface): flopped head
     // window + payload RAM read port; the TB drives the read address
     // (reg) and streams the RAM out into s_dt_data for the payload
@@ -55,9 +59,9 @@ module tb_usb_phy;
         .bit_i(rx_bit), .bit_valid(rx_bitv),
         .sop(rx_sop), .eop(rx_eop), .pkt_err(rx_perr),
         .tk(tk),
-        .dt_valid(dt_valid), .dt_pid(dt_pid), .dt_len(dt_len),
+        .dt(dt),
         .dt_head(dt_head), .dt_rd_data(dt_rd_data),
-        .dt_rd_addr(dt_rd_addr), .dt_crc_ok(dt_crc_ok),
+        .dt_rd_addr(dt_rd_addr),
         .hs_valid(hs_valid), .hs_pid(hs_pid));
 
     // ------------------------------------------------------------------
