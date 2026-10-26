@@ -209,22 +209,19 @@ mod RxRam {
 }
 
 //> Bit stream -> packet records: consumes usb::RxPhy's decoded bit
-//> stream (bit_i/bit_valid/sop/eop/pkt_err) and emits 1-clock record
-//> pulses -- tk_* (token: OUT/IN/SOF), dt_* (data: payload +
-//> read port), hs_* (handshake) -- for the router in the core top.
+//> stream (bit_i/bit_valid/sop/eop/pkt_err) and emits record pulses
+//> -- tk (pulsed Valid[TokenRec] for token arrivals), dt_* (data:
+//> payload + read port), hs_* (handshake) -- for the router in the
+//> core top.
 //>
-//> The FLAT record ports are a contract: tb/tb_usb_phy.v instantiates
-//> this mod directly, and wiki/usb-rx-packet.md documents the port
-//> list.  The packet engine (and the three record captures it feeds)
-//> lives in usb::RxPacketCore, instantiated below; the held records
-//> (Valid[TokenRec] / Valid[DataRec] / Valid[HsRec]) are unpacked to
-//> the flat tk_*/dt_*/hs_* fields here, with the @Invalid defaults
-//> reproducing the pre-split reset values (fields 0, crc verdicts
-//> false), so the port list is unchanged.  The records themselves
-//> are ALSO passed through (tok_rec/data_rec/hs_rec) for the
-//> in-design consumers, which unpack them with match.  A packet
-//> record is emitted
-//> only if the packet was good; CRC failures deliver the record with
+//> The held records (Valid[TokenRec] / Valid[DataRec] / Valid[HsRec])
+//> are passed through as tok_rec / data_rec / hs_rec for in-design
+//> consumers (which unpack them with match).  The token arrival is
+//> also promoted to a pulsed Valid[TokenRec] (tk, @Valid for exactly
+//> one cycle on capture), serving as both the strobe and the struct
+//> payload.  The dt_* and hs_* flat ports remain for TB
+//> compatibility (tb/tb_usb_phy.v).  A packet record is emitted only
+//> if the packet was good; CRC failures deliver the record with
 //> *_crc_ok low instead (the protocol layer retries), while stuff
 //> errors, bad PIDs and over-length payloads make the packet silent
 //> (bad).
@@ -266,8 +263,8 @@ mod RxPacket {
 
     // ---- record pass-throughs -------------------------------------------
     //> The held records, for the in-design consumers (they unpack
-    //> them with match).  The flat ports below remain the
-    //> plain-Verilog TB contract (tb/tb_usb_phy.v).
+    //> them with match).  The token record is also promoted to a
+    //> pulsed Valid[TokenRec] below (tk).
     //> The held token record (until the next token).
     outgoing tok_rec : Valid[TokenRec] {
         it := core.tok_rec
@@ -281,23 +278,12 @@ mod RxPacket {
         it := core.hs_rec
     }
 
-    // ---- flat pass-throughs --------------------------------------------
+    // ---- flat pass-throughs (data + handshake) --------------------------
     //> The held records (usb::RxPacketCore's captures), unpacked to
     //> the FLAT record ports.  While a record is @Invalid, its flat
     //> fields serve the pre-split reset values (fields 0, crc
-    //> verdicts false).
-    wire tok_p : TokenRec {
-        it := match core.tok_rec {
-            case @Valid(t) => t
-            case @Invalid() => ${
-                pid = 0w4,
-                crc_ok = false,
-                addr = 0w7,
-                endp = 0w4,
-                frame = 0w11,
-            }
-        }
-    }
+    //> verdicts false).  The token record no longer has flat fields;
+    //> see the pulsed `tk` port below.
     wire data_p : DataRec {
         it := match core.data_rec {
             case @Valid(d) => d
@@ -317,29 +303,24 @@ mod RxPacket {
         }
     }
 
-    //> 1-clock pulse: a token record was latched this edge.
-    outgoing tk_valid : Bit {
-        it := core.tk_strobe
-    }
-    //> Token PID (OUT 1 / IN 9 / SOF 5 / SETUP D).
-    outgoing tk_pid : Word[4] {
-        it := tok_p->pid
-    }
-    //> Device address (tk_sh[6:0]; SOF packets leave it stale).
-    outgoing tk_addr : Word[7] {
-        it := tok_p->addr
-    }
-    //> Endpoint (tk_sh[10:7]; SOF packets leave it stale).
-    outgoing tk_endp : Word[4] {
-        it := tok_p->endp
-    }
-    //> SOF frame number (tk_sh[10:0]; non-SOF tokens leave it stale).
-    outgoing tk_frame : Word[11] {
-        it := tok_p->frame
-    }
-    //> CRC5 residual check (5'h0C after a good token stream).
-    outgoing tk_crc_ok : Bit {
-        it := tok_p->crc_ok
+    // ---- token arrival pulse -------------------------------------------
+    //> Pulsed token record (@Valid for one cycle on capture, serving
+    //> as both the arrival strobe and the struct payload for consumers
+    //> that register the fields themselves -- see UsbTokenRouter).
+    outgoing tk : Valid[TokenRec] {
+        it := when {
+            case core.tk_strobe => @Valid(match core.tok_rec {
+                case @Valid(t) => t
+                case @Invalid() => ${
+                    pid = 0w4,
+                    crc_ok = false,
+                    addr = 0w7,
+                    endp = 0w4,
+                    frame = 0w11,
+                }
+            })
+            else => @Invalid()
+        }
     }
     //> 1-clock pulse: a data record was latched this edge.
     outgoing dt_valid : Bit {
@@ -1303,11 +1284,11 @@ mod UsbTokenRouter {
     //> The device's current address (ep0.dev_addr): only tokens whose
     //> address matches route anywhere.
     incoming dev_addr : Word[7]
-    //> Packet assembler token-record strobe (a token's EOP).
-    incoming tk_valid : Bit
-    //> The packet assembler's held token record (fields hold between
-    //> packets; the strobe is the arrival event).
-    incoming tok : Valid[TokenRec]
+    //> Packet assembler's pulsed token record (@Valid for exactly one
+    //> cycle on capture, serving as both the arrival strobe and the
+    //> struct payload; consumers that need stable field access between
+    //> packets register the struct fields themselves).
+    incoming tk : Valid[TokenRec]
     //> Packet assembler data-record strobe (a data packet's EOP).
     incoming dt_valid : Bit
     //> Packet assembler handshake-record strobe (a handshake's EOP).
@@ -1329,33 +1310,26 @@ mod UsbTokenRouter {
     //> A serial response is in flight (the handshake goes to serial).
     incoming ser_ack_wait : Bit
 
-    // ---- record field extraction ----------------------------------------
-    //> The @Invalid defaults reproduce the flat-port reset values
-    //> (fields 0, crc verdicts false); between packets the held
-    //> @Valid record serves the fields.
-    wire tk : TokenRec {
-        it := match tok {
-            case @Valid(t) => t
-            case @Invalid() => ${
-                pid = 0w4,
-                crc_ok = false,
-                addr = 0w7,
-                endp = 0w4,
-                frame = 0w11,
-            }
+    // ---- record field extraction (registered) ----------------------------
+    //> Registered copies of the pulsed token record's pid and endp
+    //> fields, captured on the arrival cycle (when tk is @Valid) and
+    //> held between packets for the per-endpoint decodes one clock
+    //> later.  This replaces the combinational field extraction from
+    //> the held struct, keeping the pid/endp decode in flip-flops
+    //> instead of one combinational path.
+    reg tk_pid_r : Word[4] on clock {
+        initial it <= 0w4
+        it <= match tk {
+            case @Valid(t) => t->pid
+            case @Invalid() => it
         }
     }
-    wire tk_crc_ok : Bit {
-        it := tk->crc_ok
-    }
-    wire tk_addr : Word[7] {
-        it := tk->addr
-    }
-    wire tk_pid : Word[4] {
-        it := tk->pid
-    }
-    wire tk_endp : Word[4] {
-        it := tk->endp
+    reg tk_endp_r : Word[4] on clock {
+        initial it <= 0w4
+        it <= match tk {
+            case @Valid(t) => t->endp
+            case @Invalid() => it
+        }
     }
     wire hs_pid : Word[4] {
         it := match hs {
@@ -1368,17 +1342,21 @@ mod UsbTokenRouter {
     //> The device answers only tokens whose CRC5 checks out AND whose
     //> address matches its current dev_addr (starts 0; SET_ADDRESS
     //> latches at status completion inside ep0).  SOF tokens decode
-    //> but are ignored.  The address compare + pid/endp decode are
-    //> REGISTERED (+1 clock on every token strobe -- well inside the
-    //> device turnaround budget): the dev_addr compare then feeds ONE
+    //> but are ignored.  The address compare + CRC check are
+    //> REGISTERED (+1 clock on the pulsed arrival -- well inside the
+    //> device turnaround budget): the match expression feeds ONE
     //> register's D-cone instead of fanning into every consumer's
-    //> clock-enable logic.  tk_pid and tk_endp hold their values
-    //> between packets, so decoding them one clock late is exact.
+    //> clock-enable logic.  The pid/endp fields are separately
+    //> registered (tk_pid_r/tk_endp_r) so the per-endpoint decodes
+    //> one clock later read from flip-flops.
     reg tok_v_r : Bit on clock {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
-            else => tk_valid && tk_crc_ok && (tk_addr == dev_addr)
+            else => match tk {
+                case @Valid(t) => t->crc_ok && (t->addr == dev_addr)
+                case @Invalid() => false
+            }
         }
     }
 
@@ -1393,7 +1371,7 @@ mod UsbTokenRouter {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
-            else => tok_v_r && (tk_pid == 13w4) && (tk_endp == 0w4)
+            else => tok_v_r && (tk_pid_r == 13w4) && (tk_endp_r == 0w4)
         }
     }
     //> 1-clock strobe: a valid IN token reached EP0 (endp 0).
@@ -1401,7 +1379,7 @@ mod UsbTokenRouter {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
-            else => tok_v_r && (tk_pid == 9w4) && (tk_endp == 0w4)
+            else => tok_v_r && (tk_pid_r == 9w4) && (tk_endp_r == 0w4)
         }
     }
     //> 1-clock strobe: a valid OUT token reached EP0 (endp 0).
@@ -1409,7 +1387,7 @@ mod UsbTokenRouter {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
-            else => tok_v_r && (tk_pid == 1w4) && (tk_endp == 0w4)
+            else => tok_v_r && (tk_pid_r == 1w4) && (tk_endp_r == 0w4)
         }
     }
     //> 1-clock strobe: a valid IN token reached the serial endpoint
@@ -1418,7 +1396,7 @@ mod UsbTokenRouter {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
-            else => tok_v_r && (tk_pid == 9w4) && (tk_endp == 1w4)
+            else => tok_v_r && (tk_pid_r == 9w4) && (tk_endp_r == 1w4)
         }
     }
     //> 1-clock strobe: a valid OUT token reached the serial endpoint
@@ -1427,7 +1405,7 @@ mod UsbTokenRouter {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
-            else => tok_v_r && (tk_pid == 1w4) && (tk_endp == 1w4)
+            else => tok_v_r && (tk_pid_r == 1w4) && (tk_endp_r == 1w4)
         }
     }
     //> 1-clock strobe: a valid IN token reached the notif endpoint
@@ -1436,7 +1414,7 @@ mod UsbTokenRouter {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
-            else => tok_v_r && (tk_pid == 9w4) && (tk_endp == 2w4)
+            else => tok_v_r && (tk_pid_r == 9w4) && (tk_endp_r == 2w4)
         }
     }
     //> 1-clock strobe: a valid OUT token reached the notif endpoint
@@ -1445,7 +1423,7 @@ mod UsbTokenRouter {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
-            else => tok_v_r && (tk_pid == 1w4) && (tk_endp == 2w4)
+            else => tok_v_r && (tk_pid_r == 1w4) && (tk_endp_r == 2w4)
         }
     }
 
@@ -1460,7 +1438,7 @@ mod UsbTokenRouter {
         initial it <= false
         it <= when {
             case reset || bus_reset => false
-            case tok_v_r => (tk_pid == 1w4) && (tk_endp == 0w4)
+            case tok_v_r => (tk_pid_r == 1w4) && (tk_endp_r == 0w4)
             else => it
         }
     }
@@ -2075,16 +2053,13 @@ mod UsbUart {
         it.dt_rd_addr := bytestream.push_i[6..0]
         // SOF frames decode but are ignored (the device does no SOF
         // bookkeeping).
-        // SOF frames decode but are ignored (the device does no SOF
-        // bookkeeping); the flat frame field is left unconnected --
-        // the in-design consumers read the record fields off tok_rec
-        // instead.  The remaining flat field outputs are likewise
-        // TB-only now (the in-design consumers take the records).
-        unused it.tk_frame
-        unused it.tk_pid
-        unused it.tk_addr
-        unused it.tk_endp
-        unused it.tk_crc_ok
+        // The dt_* and hs_* flat field outputs are TB-only now (the
+        // in-design consumers take the held records).  The token flat
+        // fields are gone -- the router consumes the pulsed
+        // Valid[TokenRec] directly.  tok_rec (the held record) is
+        // likewise unused externally; the pulsed tk port carries
+        // the arrival struct for the router.
+        unused it.tok_rec
         unused it.dt_pid
         unused it.dt_len
         unused it.dt_crc_ok
@@ -2134,8 +2109,7 @@ mod UsbUart {
         it.reset     := reset
         it.bus_reset := rxphy.bus_reset
         it.dev_addr  := ep0.dev_addr
-        it.tk_valid  := rxpkt.tk_valid
-        it.tok       := rxpkt.tok_rec
+        it.tk  := rxpkt.tk
         it.dt_valid  := rxpkt.dt_valid
         it.hs_valid  := rxpkt.hs_valid
         it.hs        := rxpkt.hs_rec

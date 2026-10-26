@@ -33,11 +33,16 @@ module tb_usb_phy;
         .sop(rx_sop), .eop(rx_eop), .active(rx_act),
         .error(rx_perr), .bus_reset(rx_breset));
 
-    wire tk_valid, tk_crc_ok, dt_valid, dt_crc_ok, hs_valid;
-    wire [3:0] tk_pid, dt_pid, hs_pid;
-    wire [6:0] tk_addr, dt_len;
-    wire [3:0] tk_endp;
-    wire [10:0] tk_frame;
+    wire [28:0] tk;           // pulsed Valid[TokenRec] (packed)
+    wire tk_valid   = (tk[1:0] == 2'b10);     // @Valid tag
+    wire [3:0] tk_pid    = tk[5:2];
+    wire [6:0] tk_addr   = tk[13:7];
+    wire [3:0] tk_endp   = tk[17:14];
+    wire [10:0] tk_frame = tk[28:18];
+    wire       tk_crc_ok = tk[6];
+    wire dt_valid, dt_crc_ok, hs_valid;
+    wire [3:0] dt_pid, hs_pid;
+    wire [6:0] dt_len;
     // rx packet payload capture (off-fabric interface): flopped head
     // window + payload RAM read port; the TB drives the read address
     // (reg) and streams the RAM out into s_dt_data for the payload
@@ -49,8 +54,7 @@ module tb_usb_phy;
         .clock(clk), .reset(rst), .bus_reset(rx_breset),
         .bit_i(rx_bit), .bit_valid(rx_bitv),
         .sop(rx_sop), .eop(rx_eop), .pkt_err(rx_perr),
-        .tk_valid(tk_valid), .tk_pid(tk_pid), .tk_addr(tk_addr),
-        .tk_endp(tk_endp), .tk_frame(tk_frame), .tk_crc_ok(tk_crc_ok),
+        .tk(tk),
         .dt_valid(dt_valid), .dt_pid(dt_pid), .dt_len(dt_len),
         .dt_head(dt_head), .dt_rd_data(dt_rd_data),
         .dt_rd_addr(dt_rd_addr), .dt_crc_ok(dt_crc_ok),
