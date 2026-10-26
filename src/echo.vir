@@ -5,10 +5,10 @@ import uart
 //>
 //> Data path (the echo):
 //>
-//>     host --USB--> usb_rx_data/usb_rx_valid --> EchoFifo --> UartSender --> txd
+//>     host --USB--> usb_rx (Pipe) --> EchoFifo --> UartSender --> txd
 //>                                                                    | (loop wire,
 //>                                                                    |  see top.vir)
-//>     host <--USB-- tx_data/tx_strobe <-- hold slot <-- UartReceiver <-- rxd
+//>     host <--USB-- usb_tx (Pipe) <-- hold slot <-- UartReceiver <-- rxd
 //>
 //> Bytes from the host are *rendered* onto the raw `txd` line at
 //> 115200 8N1 (src/uart.vir); bytes read from the raw `rxd` line are
@@ -19,14 +19,14 @@ import uart
 //>
 //> Flow control, end to end (nothing in this chain can drop a byte):
 //>
-//> - `room` is low once the EchoFifo holds 12 bytes; the USB core then
+//> - `usb_rx.ready` is low once the EchoFifo holds 12 bytes; the USB core then
 //>   stops popping its rx FIFO and NAKs bulk-OUT packets, and the host
 //>   retries.
 //> - The sender only starts a new byte once the previously *received*
 //>   byte has been handed to the USB core (`tx_drained`), so the hold
 //>   slot can never be overwritten by a later received byte.
 //> - Bytes are only pushed into the USB core's tx FIFO when it has
-//>   room (`usb_tx_ready`).
+//>   room (`usb_tx.ready`).
 
 ext mod EchoFifo {
     //> A 16x8 circular FIFO (storage in ext/echo_fifo.sv -- Virdant
@@ -64,48 +64,51 @@ mod EchoServer {
     //> System clock, 48 MHz on Fomu (one UART bit time is 417 clks;
     //> see src/uart.vir).
     incoming clock : Clock
-    //> Byte from the host, paired with `usb_rx_valid`: a 1-clk strobe
-    //> per byte popped from the core's rx FIFO (rx_valid in
-    //> src/usb.vir).  Pushing `usb_rx_data` into the EchoFifo on that
+
+    //> The USB core's bulk-OUT byte stream (host -> echo): the echo
+    //> is the consumer (server) side.  Each popped byte arrives as a
+    //> 1-clock @Valid payload; pushing it into the EchoFifo on that
     //> same edge IS the pop.
-    incoming usb_rx_data  : Word[8]
-    incoming usb_rx_valid : Bit
-    //> The USB core's tx FIFO has room for another byte (tx_ready in
-    //> src/usb.vir: !txfifo.full, registered and therefore one clk
-    //> stale).  Gates the hold slot's push below.
-    incoming usb_tx_ready : Bit
-    //> Byte toward the host; `tx_strobe` is the 1-clk push strobe.  The
-    //> core registers the write and re-checks !txfifo.full at the write
-    //> edge (txfifo_wr_d in src/usb.vir).
-    // One-slot holding register between the receiver and the USB core.
-    // `tx_drained` guarantees the slot is empty before the sender
-    // starts the next byte, so an incoming byte can never overwrite an
-    // untransmitted one (the two events below can therefore never
-    // coincide).
-    outgoing reg tx_data : Word[8] on clock {
-        initial it <= 0w8
-        it <= when {
-            case receiver.data_valid => receiver.data
-            else                     => it
-        }
-    }
-    outgoing tx_strobe    : Bit
-    //> Flow control back to the USB core (= fifo.room): low = stop
-    //> popping bytes out of the rx FIFO (the core will NAK bulk-OUT
-    //> packets instead).
-    outgoing room         : Bit
+    server socket usb_rx of Pipe[Word[8]]
+    //> The USB core's bulk-IN byte stream (echo -> host): the echo
+    //> is the producer (client) side.  A 1-clock @Valid payload per
+    //> byte; ready is the core's registered tx FIFO room (one clk
+    //> stale -- the core re-checks !txfifo.full at the write edge,
+    //> txfifo_wr_d in src/usb.vir).
+    client socket usb_tx of Pipe[Word[8]]
 
     //> The raw UART lines (115200 8N1).  In the current Top they are
     //> joined through a one-clk registered loopback (src/top.vir).
     outgoing txd : Bit
     incoming rxd : Bit
 
+    //> The rx pipe's payload, unpacked for the EchoFifo push.
+    wire rx_strobe : Bit {
+        it := match usb_rx.data {
+            case @Valid(dontcare) => true
+            case @Invalid()       => false
+        }
+    }
+    wire rx_byte : Word[8] {
+        it := match usb_rx.data {
+            case @Valid(b)  => b
+            case @Invalid() => 0w8
+        }
+    }
+
     mod fifo of EchoFifo {
         it.clock      := clock
-        it.push_data  := usb_rx_data
-        it.push_valid := usb_rx_valid
+        it.push_data  := rx_byte
+        it.push_valid := rx_strobe
         it.pop_en     := fifo_pop
     }
+
+    // Flow control back to the USB core (= fifo.room): low once the
+    // EchoFifo holds 12 bytes = stop popping bytes out of the rx
+    // FIFO (the core will NAK bulk-OUT packets instead).  The 4
+    // slots still free at that threshold absorb the bytes in flight
+    // in the core's pop pipeline (see the EchoFifo contract).
+    usb_rx.ready := fifo.room
 
     mod sender of uart::UartSender {
         it.clock := clock
@@ -150,17 +153,35 @@ mod EchoServer {
         }
     }
 
-    wire do_push : Bit {
-        it := hold_valid && usb_tx_ready
+    // One-slot holding register between the receiver and the USB core.
+    // `tx_drained` guarantees the slot is empty before the sender
+    // starts the next byte, so an incoming byte can never overwrite an
+    // untransmitted one (the two events below can therefore never
+    // coincide).
+    reg tx_data : Word[8] on clock {
+        initial it <= 0w8
+        it <= when {
+            case receiver.data_valid => receiver.data
+            else                     => it
+        }
     }
 
-    tx_strobe := do_push
+    wire do_push : Bit {
+        it := hold_valid && usb_tx.ready
+    }
+
+    // The tx pipe's payload: the hold slot's registered byte rides
+    // @Valid for exactly the 1-clock push strobe.  The core
+    // registers the write and re-checks !txfifo.full at the write
+    // edge (txfifo_wr_d in src/usb.vir).
+    usb_tx.data := when {
+        case do_push => @Valid(tx_data)
+        else         => @Invalid()
+    }
 
     // The sender may start the next byte only once the previously
     // received byte has been handed to the USB core.
     wire tx_drained : Bit {
         it := !hold_valid
     }
-
-    room := fifo.room
 }

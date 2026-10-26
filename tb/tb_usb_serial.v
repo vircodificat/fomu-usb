@@ -51,18 +51,25 @@ module tb_usb_serial;
     wire rxing, txing;
     wire dp_tx, dn_tx, output_enable, dp_rx, dn_rx;
 
+    // Byte-stream interface: both sides now speak Pipe[Word[8]]
+    // handshake sockets (flattened by vir into the escaped \rx.* /
+    // \tx.* / \usb_rx.* / \usb_tx.* ports), so they wire 1:1 --
+    // exactly as export mod Top in src/top.vir bulk-connects them
+    // with :=:.  A Valid[Word[8]] payload is {byte, tag}: tag 2'b10 =
+    // @Valid, 2'b01 = @Invalid.
+    wire [9:0] usb_rx_data;    // core rx pipe payload (core -> echo)
+    wire       usb_rx_ready;   // echo room throttle (echo -> core)
+    wire [9:0] usb_tx_data;    // echo tx pipe payload (echo -> core)
+    wire       usb_tx_ready;   // core tx FIFO room (core -> echo)
+
     \usb::UsbController dut(
         .clock(clk),
         .por_done(por_done),
         .rxing(rxing), .txing(txing),
-        // byte-stream interface (the Virdant echo server consumes it,
-        // exactly as the platform top in build/top.sv wires it)
-        .rx_data(echo_rx_data),
-        .rx_valid(echo_rx_valid),
-        .tx_ready(core_tx_ready),
-        .tx_data(echo_tx_data),
-        .tx_strobe(echo_tx_strobe),
-        .rx_ready(echo_room),
+        .\rx.data  (usb_rx_data),
+        .\rx.ready (usb_rx_ready),
+        .\tx.data  (usb_tx_data),
+        .\tx.ready (usb_tx_ready),
         // pad-facing side (wired to \usb::UsbPads below, as src/top.vir
         // wires it)
         .dp_tx(dp_tx), .dn_tx(dn_tx), .output_enable(output_enable),
@@ -78,22 +85,14 @@ module tb_usb_serial;
     // host bytes are rendered onto uart_txd at 115200 8N1 and looped
     // into uart_rxd, and whatever the echo server reads there goes back
     // to the host.
-    wire [7:0] echo_rx_data;
-    wire       echo_rx_valid;
-    wire       core_tx_ready;
-    wire [7:0] echo_tx_data;
-    wire       echo_tx_strobe;
-    wire       echo_room;
     wire       uart_txd, uart_rxd;
 
     \echo::EchoServer echo(
         .clock(clk),
-        .usb_rx_data (echo_rx_data),
-        .usb_rx_valid(echo_rx_valid),
-        .usb_tx_ready(core_tx_ready),
-        .tx_data     (echo_tx_data),
-        .tx_strobe   (echo_tx_strobe),
-        .room        (echo_room),
+        .\usb_rx.data  (usb_rx_data),
+        .\usb_rx.ready (usb_rx_ready),
+        .\usb_tx.data  (usb_tx_data),
+        .\usb_tx.ready (usb_tx_ready),
         .txd         (uart_txd),
         .rxd         (uart_rxd)
     );

@@ -7,14 +7,14 @@
 ## The data path
 
 ```
-host --USB--> usb_rx_data/usb_rx_valid --> EchoFifo --> UartSender --> txd
+host --USB--> usb_rx (Pipe) --> EchoFifo --> UartSender --> txd
                                                                 | (1-clk registered
                                                                 |  loopback, src/top.vir)
-host <--USB-- tx_data/tx_strobe <-- hold slot <-- UartReceiver <-- rxd
+host <--USB-- usb_tx (Pipe) <-- hold slot <-- UartReceiver <-- rxd
 ```
 
-- **Host → line:** every byte the USB core pops (`usb_rx_valid` strobe) is pushed into the [EchoFifo](echo-fifo.md); the head byte is handed to `UartSender` when it can take it, and serialized onto `txd`.
-- **Line → host:** `UartReceiver` deserializes `rxd`; a completed byte lands in the **hold slot**; the slot is pushed into the USB core's tx FIFO (`tx_data`/`tx_strobe`) when that FIFO has room.
+- **Host → line:** every byte the USB core pops (a 1-clock `@Valid` payload on the `usb_rx` Pipe socket) is pushed into the [EchoFifo](echo-fifo.md); the head byte is handed to `UartSender` when it can take it, and serialized onto `txd`.
+- **Line → host:** `UartReceiver` deserializes `rxd`; a completed byte lands in the **hold slot**; the slot is pushed into the USB core's tx FIFO (a 1-clock `@Valid` payload on the `usb_tx` Pipe socket) when that FIFO has room.
 
 ## The top-level loopback register
 
@@ -34,9 +34,9 @@ The loopback is **registered**: `rxd` follows `txd` with one clock of delay. The
 
 Nothing in this chain can drop a byte:
 
-- **`room`** is the FIFO's room signal (`count < 12`, see [echo-fifo.md](echo-fifo.md)) driven straight back to the USB core as `rx_ready`. While the queue fills, the core stops popping and **NAKs bulk-OUT packets** — the host retries, nothing is lost. (NAK vs other handshake PID: [usb-primer.md](usb-primer.md).)
+- **`usb_rx.ready`** is the FIFO's room signal (`count < 12`, see [echo-fifo.md](echo-fifo.md)) driven straight back to the USB core as the rx pipe's flow control. While the queue fills, the core stops popping and **NAKs bulk-OUT packets** — the host retries, nothing is lost. (NAK vs other handshake PID: [usb-primer.md](usb-primer.md).)
 - **`tx_drained`** is `!hold_valid`: the sender may start the next byte only once the previously *received* byte has been handed to the USB core. This guarantees the **hold slot is empty before the sender starts**, so `receiver.data_valid` can never overwrite an untransmitted byte — the two events can never coincide.
-- **`usb_tx_ready`**: the core's registered tx-FIFO room signal (one clk stale). Bytes are pushed into the USB core's tx FIFO (`do_push`) only when it is high; otherwise `hold_valid` stays set and `tx_drained` stays low, throttling the whole upstream chain.
+- **`usb_tx.ready`**: the core's registered tx-FIFO room signal (one clk stale). Bytes are pushed into the USB core's tx FIFO (`do_push`) only when it is high; otherwise `hold_valid` stays set and `tx_drained` stays low, throttling the whole upstream chain.
 
 ## The hold slot registers
 
@@ -72,6 +72,6 @@ sender.data_valid := pop_r
 
 - Data path: USB rx → `EchoFifo` → `UartSender` → `txd`; `rxd` → `UartReceiver` → hold slot → USB tx → host.
 - The **loopback lives at the top level** (`src/top.vir`) and is **registered** — one clock of latency, which breaks the through-the-UART critical path without disturbing mid-bit sampling; cut it to talk to a real external UART.
-- `room` NAKs bulk-OUT while the queue fills; `tx_drained` (`!hold_valid`) guarantees the hold slot is empty before the sender starts, so overwrite and completion can never coincide; pushes wait for `usb_tx_ready`.
+- `usb_rx.ready` NAKs bulk-OUT while the queue fills; `tx_drained` (`!hold_valid`) guarantees the hold slot is empty before the sender starts, so overwrite and completion can never coincide; pushes wait for `usb_tx.ready`.
 - The hold slot is a one-byte register pair (`hold_data`/`hold_valid`) — set by `receiver.data_valid`, cleared by `do_push` into the USB tx FIFO.
 - The sender is loaded by `pop_r`, one clock after `fifo_pop`, matching `EchoFifo`'s registered `pop_data`; `!pop_r` keeps exactly one byte in flight.

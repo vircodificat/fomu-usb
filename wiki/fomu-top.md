@@ -68,7 +68,7 @@ led_green := !actual_top.txing
 led_blue  := true                  // tied off
 ```
 
-`rxing`/`txing` come from `usb::UsbUart` inside the core: two free-running 23-bit countdown counters, reloaded to `0x7F_FFFF` (~175 ms) on every `rx_valid`/`tx_strobe` strobe and counting down to rest. The 1-clk strobes are far too fast to see; the stretch makes sustained traffic read as a solid light and a single packet still visible. Deliberately **no reset** on these counters (power-on zero is enough), and EP0 control traffic does not light them — only bulk data pulses `rx_valid`/`tx_strobe`.
+`rxing`/`txing` come from `usb::UsbUart` inside the core: two free-running 23-bit countdown counters, reloaded to `0x7F_FFFF` (~175 ms) on every `rx`/`tx` pipe payload strobe and counting down to rest. The 1-clk strobes are far too fast to see; the stretch makes sustained traffic read as a solid light and a single packet still visible. Deliberately **no reset** on these counters (power-on zero is enough), and EP0 control traffic does not light them — only bulk data pulses `rx_valid`/`tx_strobe`.
 
 Red lights while the USB is **receiving** (host → device), green while **sending** (device → host). The LED is your one-bit diagnostic: no light under traffic → check the clock, POR, and the pull-up wiring first.
 

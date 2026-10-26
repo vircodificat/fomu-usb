@@ -106,7 +106,7 @@ Device → host (the "echo" direction):
 uart_rx_line
   → UartReceiver    (uart::UartReceiver: start-bit detect, mid-bit sampling)
   → hold slot       (reg hold_data, src/echo.vir)
-  → tx FIFO         (usb::TxFifo, pushed while usb_tx_ready)
+  → tx FIFO         (usb::TxFifo, pushed while usb_tx.ready)
   → endpoint::Serial     (DATA0/1 toggle, host ACK handshake)
   → usb::TxPhy      (CRC16, stuffing, NRZI, sync, EOP)
   → usb::UsbUart    (response arbiter)

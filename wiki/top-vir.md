@@ -42,18 +42,15 @@ Only the **board pins** cross the export boundary: `clock` (in), `usb_dp`/`usb_d
 
 ```text
 mod echo of echo::EchoServer {
-    it.clock        := clock
-    it.usb_rx_data  := actual_top.rx_data
-    it.usb_rx_valid := actual_top.rx_valid
-    it.usb_tx_ready := actual_top.tx_ready
+    it.clock := clock
+    it.rxd   := uart_rx_reg
+    it.usb_rx :=: actual_top.rx
+    actual_top.tx :=: it.usb_tx
 }
-actual_top.tx_data   := echo.tx_data
-actual_top.tx_strobe := echo.tx_strobe
-actual_top.rx_ready  := echo.room
 ```
 
-- Host→device bytes (`rx_data`/`rx_valid`) feed the echo server; device→host bytes (`tx_data`/`tx_strobe`) come back.
-- **`rx_ready := echo.room`** is the whole of the receive-side flow control: the echo server's FIFO `room` signal (see [echo-fifo.md](echo-fifo.md)) tells the USB core to stop popping — the core NAKs bulk-OUT instead. The echo server never drops a byte (see [echo-server.md](echo-server.md)).
+- Both sides speak `Pipe[Word[8]]` handshake sockets, so the two bulk connects (`:=:`) are the whole byte-stream wiring: the echo is the rx consumer (server) and the tx producer (client).
+- **`usb_rx.ready` (the echo's FIFO `room`)** is the whole of the receive-side flow control: the echo server's FIFO room signal (see [echo-fifo.md](echo-fifo.md)) tells the USB core to stop popping — the core NAKs bulk-OUT instead. The echo server never drops a byte (see [echo-server.md](echo-server.md)).
 
 ## The power-on reset and `usb_dp_pu`
 
@@ -111,6 +108,6 @@ Cut the loop (drive `echo.rxd` from a pin instead) to talk to an external UART �
 - A platform export (`export mod Top for ice40::Fomu`) is board-level wiring: it instantiates `UsbPor`, `UsbController`, `UsbPads`, and `EchoServer`, and pins the ports for the Fomu board.
 - `usb_dp_pu := por.por_done` must be wired explicitly — the platform default (low) means the host never sees the device attach.
 - The pad-facing core wires are unidirectional; the only bidirectional nets live inside the `UsbPads` ext body.
-- `rx_ready := echo.room` is the entire receive-side flow control between the echo server and the USB core.
+- `usb_rx.ready` (the echo's FIFO room, riding the rx Pipe socket) is the entire receive-side flow control between the echo server and the USB core.
 - LEDs: red = receiving (`rxing`), green = sending (`txing`), blue tied off; both activity signals are stretched ~175 ms so traffic is visible.
 - The loopback jumper (`echo.txd` → registered → `echo.rxd`) is what makes the device an echo server; the register breaks the UART's combinational loop path.

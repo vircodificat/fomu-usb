@@ -13,8 +13,7 @@ import phy
 //> arbiter (UsbArbiter), the bulk-IN snapshot loader (UsbSnapshotLoader)
 //> and the bulk byte-stream engine (UsbByteStream, exposing the byte
 //> stream as two Pipe[Word[8]] handshake sockets; UsbController
-//> flattens them back to the flat rx_data/rx_valid/tx_ready/tx_strobe
-//> ports at the ext-world boundary).  The physical-layer mods (NrziDecoder,
+//> forwards those sockets unchanged to the ext-world boundary).  The physical-layer mods (NrziDecoder,
 //> BitDestuffer, RxPhy, TxPhy) live in src/phy.vir; the serial CRC
 //> LFSRs (Crc5/Crc16) in src/crc.vir.  Only what Virdant cannot express
 //> stays vendored in
@@ -2030,9 +2029,8 @@ mod UsbUart {
     }
     //> Bulk-OUT byte stream toward the consumer: popped rx-FIFO
     //> bytes, with the consumer's ready as end-to-end flow control.
-    //> UsbController flattens this to rx_data/rx_valid/rx_ready ports
-    //> (the ext-world boundary stays flat for the Verilog
-    //> testbench).
+    //> Forwarded unchanged through UsbController to the ext-world
+    //> boundary.
     client socket rx of Pipe[Word[8]]
     //> Bulk-IN byte stream from the consumer: bytes into the tx
     //> FIFO, with the registered FIFO room as backpressure.
@@ -2193,10 +2191,9 @@ mod UsbUart {
         it.dat        := rxpkt.data_rec
         it.dt_rd_data := rxpkt.dt_rd_data
         it.tx_pop     := loader.load_run
-        it.rx.ready   := rx.ready
-        rx.data       := it.rx.data
-        it.tx.data    := tx.data
-        tx.ready      := it.tx.ready
+        // The rx/tx pipes: bulk-forwarded to this module's boundary.
+        rx :=: it.rx
+        tx :=: it.tx
     }
 
     //> Serial accepted an OUT packet (its ACK response): the rx push
@@ -2294,18 +2291,18 @@ mod UsbController {
     incoming por_done : Bit
 
     // Byte-stream interface to the byte-stream consumer (the echo
-    // server in src/top.vir).  The core's byte-stream pipes are
-    // flattened here: the ext-world boundary (the Verilog
-    // testbench) stays flat.  rx_data/rx_valid/tx_ready are defined
-    // below, unwrapping the core's Pipe[Word[8]] sockets.
-    //> Byte toward the host.
-    incoming tx_data   : Word[8]
-    //> 1-clock push strobe for tx_data.
-    incoming tx_strobe : Bit
-    //> Flow control from the rx consumer: low = consumer full, stop
-    //> popping (the core NAKs bulk-OUT packets and the host retries
-    //> instead).
-    incoming rx_ready  : Bit
+    // server in src/top.vir): the core's Pipe[Word[8]] sockets,
+    // forwarded unchanged (the ext-world boundary speaks the same
+    // handshake the core's byte-stream engine uses internally).
+    //> Bulk-OUT byte stream toward the consumer: popped rx-FIFO
+    //> bytes (@Valid payload), with the consumer's ready as
+    //> end-to-end flow control (low = consumer full: the core stops
+    //> popping, NAKs bulk-OUT packets, and the host retries).
+    client socket rx of Pipe[Word[8]]
+    //> Bulk-IN byte stream from the consumer: bytes into the tx
+    //> FIFO (the consumer drives a 1-clock @Valid payload per
+    //> byte), with the registered FIFO room as backpressure.
+    server socket tx of Pipe[Word[8]]
 
     //> The core is receiving data (host -> device); stretched ~175 ms
     //> past the last byte (drives led_red, active low, at the top).
@@ -2338,42 +2335,14 @@ mod UsbController {
         it.reset    := core_reset
         it.dp_rx    := dp_rx
         it.dn_rx    := dn_rx
-        // The rx pipe: forward the consumer's ready; the popped
-        // bytes come back inside the @Valid payload.
-        it.rx.ready := rx_ready
-        // The tx pipe: wrap the flat strobe into a @Valid payload
-        // (one-cycle strobe -> one-cycle @Valid).
-        it.tx.data  := when {
-            case tx_strobe => @Valid(tx_data)
-            else           => @Invalid()
-        }
+        // The rx/tx pipes: bulk-forwarded from the core.
+        rx :=: it.rx
+        tx :=: it.tx
 
         dp_tx         := it.dp_tx
         dn_tx         := it.dn_tx
         output_enable := it.output_enable
         rxing         := it.rxing
         txing         := it.txing
-    }
-
-    //> Byte from the host (the core rx pipe's @Valid payload,
-    //> unwrapped); valid for one cycle with rx_valid.
-    outgoing rx_data : Word[8] {
-        it := match core.rx.data {
-            case @Valid(b)  => b
-            case @Invalid() => 0w8
-        }
-    }
-    //> 1-clock strobe per received byte (the core rx pipe's payload
-    //> tag).
-    outgoing rx_valid : Bit {
-        it := match core.rx.data {
-            case @Valid(dontcare) => true
-            case @Invalid()       => false
-        }
-    }
-    //> The tx FIFO has room for another byte (the core tx pipe's
-    //> ready).
-    outgoing tx_ready : Bit {
-        it := core.tx.ready
     }
 }

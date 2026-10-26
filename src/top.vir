@@ -31,7 +31,7 @@ export mod Top for ice40::Fomu {
     // unidirectional wires (dp_rx/dn_rx in; dp_tx/dn_tx/output_enable
     // out) -- the only bidirectional nets in the design live inside
     // the UsbPads ext mod below.
-    mod actual_top of usb::UsbController {
+    mod usb_controller of usb::UsbController {
         it.clock := clock
         it.por_done := true
     }
@@ -41,44 +41,41 @@ export mod Top for ice40::Fomu {
     // cells; see ext/usb_pads.sv).  From Virdant's view these are
     // ordinary outgoing wires the wrapper assigns to the Top ports.
     mod pads of usb::UsbPads {
-        it.dp_tx := actual_top.dp_tx
-        it.dn_tx := actual_top.dn_tx
-        it.output_enable := actual_top.output_enable
+        usb_dp := it.usb_dp
+        usb_dn := it.usb_dn
+
+        it.dp_tx := usb_controller.dp_tx
+        it.dn_tx := usb_controller.dn_tx
+
+        usb_controller.dp_rx := it.dp_rx
+        usb_controller.dn_rx := it.dn_rx
+
+        it.output_enable := usb_controller.output_enable
     }
-    usb_dp := pads.usb_dp
-    usb_dn := pads.usb_dn
-    actual_top.dp_rx := pads.dp_rx
-    actual_top.dn_rx := pads.dn_rx
 
     // The LEDs (active low on PVT) map the USB controller's activity
     // signals onto the pads: red lights while the USB is receiving
     // data (rxing), green while it is sending (txing); blue is unused
     // (tied off).  The core's rxing/txing are stretched ~175 ms past
     // the last byte, so sustained traffic reads as solid light.
-    led_red   := !actual_top.rxing
-    led_green := !actual_top.txing
+    led_red   := !usb_controller.rxing
+    led_green := !usb_controller.txing
     led_blue  := true
 
     // The echo server: the byte-level consumer of the USB core.  Bytes
     // from the host are rendered onto the raw UART tx line; bytes read
     // from the raw rx line go back to the host.  See src/echo.vir.
+    // Both sides now speak Pipe[Word[8]] sockets, so the echo's
+    // usb_rx (server) / usb_tx (client) bulk-connect straight onto
+    // the controller's rx (client) / tx (server).
     mod echo of echo::EchoServer {
-        it.clock        := clock
-        it.usb_rx_data  := actual_top.rx_data
-        it.usb_rx_valid := actual_top.rx_valid
-        it.usb_tx_ready := actual_top.tx_ready
-    }
-    actual_top.tx_data   := echo.tx_data
-    actual_top.tx_strobe := echo.tx_strobe
-    actual_top.rx_ready  := echo.room
+        it.clock := clock
+        it.rxd   := uart_rx_reg
 
-    // The raw UART lines, as internal wires.  This is the point to
-    // consume them: uart_tx_line carries everything the host writes,
-    // rendered at 115200 8N1; uart_rx_line feeds the echo.  The single
-    // assignment below is the loopback jumper that makes the device an
-    // echo server -- replace it (and bring the wires to real pins) to
-    // talk to an external UART instead.
-    wire uart_tx_line : Bit { it := echo.txd }
+        it.usb_rx         :=: usb_controller.rx
+        usb_controller.tx :=: it.usb_tx
+    }
+
     // The loopback jumper is REGISTERED: without the register the raw
     // wire forms one long combinational path through the UART
     // (sender.data_buf -> bit_idx mux -> txd -> rxd -> receiver.state /
@@ -86,7 +83,6 @@ export mod Top for ice40::Fomu {
     // clk of loop latency is 1/417 of a UART bit time -- invisible to
     // the 8N1 receiver (mid-bit sampling shifts by one cycle of 417).
     reg uart_rx_reg : Bit on clock {
-        it <= uart_tx_line
+        it <= echo.txd
     }
-    echo.rxd := uart_rx_reg
 }
