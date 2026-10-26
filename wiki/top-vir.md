@@ -27,15 +27,10 @@ Only the **board pins** cross the export boundary: `clock` (in), `usb_dp`/`usb_d
 
 | Port | Dir | Meaning |
 |---|---|---|
-| `rx_data` | out | byte from the host |
-| `rx_valid` | out | 1-clk strobe per received byte |
-| `tx_ready` | out | tx FIFO has room |
-| `tx_data` | in | byte toward the host |
-| `tx_strobe` | in | 1-clk push strobe |
-| `rx_ready` | in | low = consumer full: the core stops popping and NAKs bulk-OUT |
+| `rx` | client socket, `Pipe[Word[8]]` | popped bytes toward the consumer; the consumer's ready is end-to-end flow control |
+| `tx` | server socket, `Pipe[Word[8]]` | the consumer's bytes into the tx FIFO; ready is the registered FIFO room |
 | `rxing` / `txing` | out | activity indicators (drive the LEDs) |
-| `dp_tx`/`dn_tx`/`output_enable` | out | drive levels + tristate control, to `UsbPads` |
-| `dp_rx`/`dn_rx` | in | pad samples, from `UsbPads` |
+| `usb` | client socket, `usb::UsbTxRx` | the pad-facing link: D+/D- drive levels + tristate control out, pad samples in |
 | `por_done` | in | from `UsbPor`; registered internally into the core reset |
 
 ## Wiring the echo server into the USB stream
@@ -67,17 +62,13 @@ Unwired platform ports default to low. `usb_dp_pu` low = D+ 1.5 kΩ pull-up off 
 
 ```text
 mod pads of usb::UsbPads {
-    it.dp_tx          := actual_top.dp_tx
-    it.dn_tx          := actual_top.dn_tx
-    it.output_enable  := actual_top.output_enable
+    usb_dp := it.usb_dp
+    usb_dn := it.usb_dn
+    it.usb :=: actual_top.usb
 }
-usb_dp := pads.usb_dp
-usb_dn := pads.usb_dn
-actual_top.dp_rx := pads.dp_rx
-actual_top.dn_rx := pads.dn_rx
 ```
 
-The pad-facing side of the core is deliberately **unidirectional** wires (`dp_tx`/`dn_tx`/`output_enable` out, `dp_rx`/`dn_rx` in); the electrical bidirectionality (drive vs. release the bus) lives entirely inside the `UsbPads` ext body's `SB_IO` cells (see [fomu-top.md](fomu-top.md)). From Virdant's point of view `usb_dp`/`usb_dn` are ordinary outgoing wires the export assigns to the `Top` ports.
+The core-facing side of `UsbPads` is the `usb::UsbTxRx` socket (drive levels + tristate control on the cosi channels, pad samples back on the soci channels), bulk-connected (`:=:`) to the controller's `usb` socket. The pad-facing side is deliberately **unidirectional**; the electrical bidirectionality (drive vs. release the bus) lives entirely inside the `UsbPads` ext body's `SB_IO` cells (see [fomu-top.md](fomu-top.md)). From Virdant's point of view `usb_dp`/`usb_dn` are ordinary outgoing wires the export assigns to the `Top` ports.
 
 ## The activity LEDs
 

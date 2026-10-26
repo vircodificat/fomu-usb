@@ -40,7 +40,8 @@ conventions — and is worth re-reading after this page.
 (descriptors and status — with `GET_STATUS` reading as zero bytes),
 [`endpoint::Serial`](usb-serial.md) (the bulk-IN snapshot RAM), and the
 always-NAK EP2. The drive
-levels leave the core top as `dp_tx`/`dn_tx`/`output_enable` and reach the
+levels leave the core top on the `usb::UsbTxRx` socket's cosi channels
+(`dp_tx`/`dn_tx`/`output_enable`) and reach the
 wires through the SB_IO tristate pad cells in `ext/usb_pads.sv`
 ([`fomu-top`](fomu-top.md)) — one shared output enable for the pair, since
 the core drives both lines together or neither.

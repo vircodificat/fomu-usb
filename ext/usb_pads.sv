@@ -23,27 +23,28 @@ module \usb::UsbPads (
     // Pad side: the physical USB wires (PCF pins A1/A2).
     inout  wire usb_dp,
     inout  wire usb_dn,
-    // Core side, into the pads.
-    input  wire dp_tx,         // D+ drive level (valid while output_enable)
-    input  wire dn_tx,         // D- drive level (valid while output_enable)
-    input  wire output_enable, // tristate control: drive the bus when high
+    // Core side, into the pads (the usb::UsbTxRx socket channels,
+    // flattened by vir into escaped \usb.* port names).
+    input  wire \usb.dp_tx ,         // D+ drive level (valid while output_enable)
+    input  wire \usb.dn_tx ,         // D- drive level (valid while output_enable)
+    input  wire \usb.output_enable , // tristate control: drive the bus when high
     // Core side, out of the pads.
-    output wire dp_rx,         // D+ sample (SB_IO D_IN_0)
-    output wire dn_rx          // D- sample (SB_IO D_IN_0)
+    output wire \usb.dp_rx ,         // D+ sample (SB_IO D_IN_0)
+    output wire \usb.dn_rx           // D- sample (SB_IO D_IN_0)
 );
     // One OUTPUT_ENABLE for the pair: the core drives both lines
     // together (or neither — while oe is low the pads float to the
     // idle J state held by the host and the D+ 1.5k pull-up).
     SB_IO #(.PIN_TYPE(6'b101001)) sb_io_dp (
         .PACKAGE_PIN   (usb_dp),
-        .OUTPUT_ENABLE (output_enable),
-        .D_OUT_0       (dp_tx),
-        .D_IN_0        (dp_rx)
+        .OUTPUT_ENABLE (\usb.output_enable ),
+        .D_OUT_0       (\usb.dp_tx ),
+        .D_IN_0        (\usb.dp_rx )
     );
     SB_IO #(.PIN_TYPE(6'b101001)) sb_io_dn (
         .PACKAGE_PIN   (usb_dn),
-        .OUTPUT_ENABLE (output_enable),
-        .D_OUT_0       (dn_tx),
-        .D_IN_0        (dn_rx)
+        .OUTPUT_ENABLE (\usb.output_enable ),
+        .D_OUT_0       (\usb.dn_tx ),
+        .D_IN_0        (\usb.dn_rx )
     );
 endmodule

@@ -70,15 +70,18 @@ module tb_usb_serial;
         .\rx.ready (usb_rx_ready),
         .\tx.data  (usb_tx_data),
         .\tx.ready (usb_tx_ready),
-        // pad-facing side (wired to \usb::UsbPads below, as src/top.vir
-        // wires it)
-        .dp_tx(dp_tx), .dn_tx(dn_tx), .output_enable(output_enable),
-        .dp_rx(dp_rx), .dn_rx(dn_rx));
+        // pad-facing side: the UsbTxRx socket channels (flattened to
+        // escaped \usb.* ports), wired to \usb::UsbPads below, as
+        // src/top.vir bulk-connects them)
+        .\usb.dp_tx         (dp_tx), .\usb.dn_tx         (dn_tx),
+        .\usb.output_enable (output_enable),
+        .\usb.dp_rx         (dp_rx), .\usb.dn_rx         (dn_rx));
 
     \usb::UsbPads pads(
         .usb_dp(usb_dp), .usb_dn(usb_dn),
-        .dp_tx(dp_tx), .dn_tx(dn_tx), .output_enable(output_enable),
-        .dp_rx(dp_rx), .dn_rx(dn_rx));
+        .\usb.dp_tx         (dp_tx), .\usb.dn_tx         (dn_tx),
+        .\usb.output_enable (output_enable),
+        .\usb.dp_rx         (dp_rx), .\usb.dn_rx         (dn_rx));
 
     // The Virdant echo server (generated Verilog from src/echo.vir) and
     // the raw UART loop wires -- mirrors export mod Top in src/top.vir:

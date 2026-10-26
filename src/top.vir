@@ -38,19 +38,15 @@ export mod Top for ice40::Fomu {
 
     // The pads: the one part that drops down into Verilog, because it
     // is the only part that needs `inout` (two iCE40 SB_IO tristate
-    // cells; see ext/usb_pads.sv).  From Virdant's view these are
-    // ordinary outgoing wires the wrapper assigns to the Top ports.
+    // cells; see ext/usb_pads.sv).  The core-facing side is the
+    // UsbTxRx socket, bulk-connected to the controller's; from
+    // Virdant's view the socket channels are ordinary unidirectional
+    // wires the wrapper assigns to the Top ports.
     mod pads of usb::UsbPads {
         usb_dp := it.usb_dp
         usb_dn := it.usb_dn
 
-        it.dp_tx := usb_controller.dp_tx
-        it.dn_tx := usb_controller.dn_tx
-
-        usb_controller.dp_rx := it.dp_rx
-        usb_controller.dn_rx := it.dn_rx
-
-        it.output_enable := usb_controller.output_enable
+        it.usb :=: usb_controller.usb
     }
 
     // The LEDs (active low on PVT) map the USB controller's activity

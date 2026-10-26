@@ -3,6 +3,19 @@ import endpoint
 import ice40
 import phy
 
+//> The USB pad-facing link between UsbController and UsbPads: the
+//> core's D+/D- drive levels and tristate control (cosi; the client
+//> is the core) and the pad samples back (soci; the server is the
+//> pads).  Electrical bidirectionality stays inside UsbPads' SB_IO
+//> cells; every channel here is unidirectional.
+socket UsbTxRx {
+    cosi dp_tx : Bit
+    cosi dn_tx : Bit
+    cosi output_enable : Bit
+
+    soci dp_rx : Bit
+    soci dn_rx : Bit
+}
 //> The USB core in Virdant: everything between the byte stream and the
 //> USB pads.  This file holds the pad interface (UsbPads), the power-on
 //> reset (PowerOnReset), the packet/token decoder (RxPacket), the
@@ -24,8 +37,7 @@ import phy
 //> Topology (wired by export mod Top in src/top.vir):
 //>
 //>     UsbPor (~175 ms) --por_done--> UsbController --byte stream--> echo
-//>     UsbController --dp_tx/dn_tx/output_enable--> UsbPads (ext, SB_IO)
-//>     UsbPads --dp_rx/dn_rx--> UsbController
+//>     UsbController <=UsbTxRx socket=> UsbPads (ext, SB_IO)
 //>
 //> The pad-facing side is deliberately UNIDIRECTIONAL: the only
 //> bidirectional nets in the whole design live inside UsbPads.
@@ -49,22 +61,10 @@ ext mod UsbPads {
     //> USB D- pad side, out to the Top port (PCF pin A2 in fomu.pcf);
     //> ditto.
     outgoing usb_dn : Bit
-    //> D+ drive level into the pads (SB_IO D_OUT_0): driven onto the
-    //> wire only while output_enable is high; ignored otherwise.
-    incoming dp_tx         : Bit
-    //> D- drive level into the pads (SB_IO D_OUT_0): same gating as
-    //> dp_tx.
-    incoming dn_tx         : Bit
-    //> Tristate control from the core: drive the bus while high; low =
-    //> listen (the pads release the bus, which idles in the J state
-    //> held by the host and the D+ 1.5k pull-up).
-    incoming output_enable : Bit
-    //> D+ sample out of the pads (SB_IO D_IN_0, registered inside the
-    //> pad cell).
-    outgoing dp_rx : Bit
-    //> D- sample out of the pads (SB_IO D_IN_0, registered inside the
-    //> pad cell).
-    outgoing dn_rx : Bit
+    //> The core-facing side: the drive levels / tristate control come
+    //> in on the cosi channels, the pad samples go back on the soci
+    //> channels (see the usb::UsbTxRx socket banner).
+    server socket usb of UsbTxRx
 }
 
 //> Power-on reset / USB attach delay
@@ -2311,18 +2311,19 @@ mod UsbController {
     //> past the last byte (drives led_green, active low).
     outgoing txing : Bit
 
-    // Pad-facing side: unidirectional wires to/from the UsbPads ext
-    // mod (wired by export mod Top in src/top.vir).
+    // Pad-facing side: the UsbTxRx socket to the UsbPads ext mod
+    // (bulk-connected in src/top.vir).  The client is this
+    // controller: it drives the D+/D- levels and the tristate
+    // control; the pad samples come back on the soci channels.
     //> D+ drive level out to UsbPads (gated by output_enable).
-    outgoing dp_tx         : Bit
     //> D- drive level out to UsbPads.
-    outgoing dn_tx         : Bit
-    //> Pad drive enable out to UsbPads.
-    outgoing output_enable : Bit
-    //> D+ pad sample in from UsbPads.
-    incoming dp_rx         : Bit
+    //> Tristate control out to UsbPads: drive the bus while high;
+    //> low = listen (the pads release the bus, which idles in the J
+    //> state held by the host and the D+ 1.5k pull-up).
+    //> D+ pad sample in from UsbPads (SB_IO D_IN_0, registered
+    //> inside the pad cell).
     //> D- pad sample in from UsbPads.
-    incoming dn_rx         : Bit
+    client socket usb of UsbTxRx
 
     //> the core reset persists until a cycle after the power-on reset is complete
     reg core_reset : Bit on clock {
@@ -2333,15 +2334,17 @@ mod UsbController {
     mod core of UsbUart {
         it.clock    := clock
         it.reset    := core_reset
-        it.dp_rx    := dp_rx
-        it.dn_rx    := dn_rx
+        // The pad-facing UsbTxRx socket: forwarded channel-by-channel
+        // from UsbUart's flat pad ports.
+        usb.dp_tx         := it.dp_tx
+        usb.dn_tx         := it.dn_tx
+        usb.output_enable := it.output_enable
+        it.dp_rx          := usb.dp_rx
+        it.dn_rx          := usb.dn_rx
         // The rx/tx pipes: bulk-forwarded from the core.
         rx :=: it.rx
         tx :=: it.tx
 
-        dp_tx         := it.dp_tx
-        dn_tx         := it.dn_tx
-        output_enable := it.output_enable
         rxing         := it.rxing
         txing         := it.txing
     }

@@ -23,14 +23,14 @@ USB needs a **bidirectional** pad: the device drives D± during packet transmiss
 ```verilog
 SB_IO #(.PIN_TYPE(6'b101001)) sb_io_dp (
     .PACKAGE_PIN(usb_dp), .OUTPUT_ENABLE(output_enable),
-    .D_OUT_0(dp_tx), .D_IN_0(dp_rx));
+    .D_OUT_0(\usb.dp_tx ), .D_IN_0(\usb.dp_rx ));
 ```
 
 `ext/usb_pads.sv` is the body of the `usb::UsbPads` ext mod (declared in `src/usb.vir`) and contains exactly two such cells (one per line) — no clock, no reset, no state. This is exactly the lowering migen performs for a 1-bit `Tristate` on iCE40.
 
 - `PACKAGE_PIN` is `inout` in Verilog — the pin itself.
 - `OUTPUT_ENABLE` (the core's `output_enable`) selects drive vs release; **one `oe` is shared for the D+/D− pair**, since USB always drives or releases both lines together (while low, the pads float to the idle J state held by the host and the D+ pull-up).
-- The design's **only bidirectional nets** live inside this module. From Virdant's view every wire is unidirectional: the core drives via `dp_tx`/`dn_tx` gated by `output_enable`, samples via `dp_rx`/`dn_rx`, and the ext mod declaration types the pad side `outgoing Bit` — the `inout` is the Verilog-side plumbing that gets the `SB_IO` `PACKAGE_PIN` nets out to the `Top` ports and the PCF pins. Virdant cannot express a bidirectional pad yet, so the bidirectionality never crosses the Virdant boundary.
+- The design's **only bidirectional nets** live inside this module. From Virdant's view every wire is unidirectional: the core drives via the `usb` socket's `dp_tx`/`dn_tx` channels gated by `output_enable`, samples via `dp_rx`/`dn_rx` (the `usb::UsbTxRx` socket) — the `inout` is the Verilog-side plumbing that gets the `SB_IO` `PACKAGE_PIN` nets out to the `Top` ports and the PCF pins. Virdant cannot express a bidirectional pad yet, so the bidirectionality never crosses the Virdant boundary.
 
 ## Power-on reset / attach delay (`usb::UsbPor` in `src/usb.vir`)
 
@@ -75,7 +75,7 @@ Red lights while the USB is **receiving** (host → device), green while **sendi
 ## Key takeaways
 
 - D± go through two `SB_IO` cells (`PIN_TYPE 6'b101001`, one shared `OUTPUT_ENABLE`) in `ext/usb_pads.sv` — the design's only bidirectional nets.
-- The Virdant pad-facing wires are unidirectional (`dp_tx`/`dn_tx`/`output_enable` out, `dp_rx`/`dn_rx` in); the `inout` is Verilog-side plumbing only.
+- The Virdant pad-facing wires are unidirectional (the `usb` socket's cosi channels out, soci channels in); the `inout` is Verilog-side plumbing only.
 - `usb::UsbPor` counts 8_400_000 cycles (~175 ms) with no parameter; `por_done` releases the D+ pull-up (attach) and, registered once more, forms the core reset.
 - Attach = releasing the 1.5 kΩ D+ pull-up (pin A4); getting that wiring wrong makes the device invisible.
 - LEDs are active low: red = rxing, green = txing, blue off; the ~175 ms stretch makes activity visible.
