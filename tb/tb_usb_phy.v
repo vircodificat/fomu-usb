@@ -74,9 +74,15 @@ module tb_usb_phy;
     wire [6:0] tx_addr;
     wire [7:0] tx_byte = tx_bytes[tx_addr];
     wire tx_busy, tx_done, dut_dp, dut_dn, dut_oe;
+    // The arm record travels as pulsed Valid[TxRec], packed like the
+    // tk/dt records above: tag[1:0] (@Valid = 2'b10), pid[5:2],
+    // len[12:6].  @Valid is a 1-clock pulse (same contract as tk/dt):
+    // held high, the PHY would re-arm a packet every time its FSM
+    // returns to Idle.
+    wire [12:0] tx_arm = tx_start ? {tx_len, tx_pid, 2'b10} : 13'd1;
     \phy::TxPhy txphy(
         .clock(clk), .reset(rst),
-        .tx_start(tx_start), .tx_pid(tx_pid), .tx_len(tx_len),
+        .tx_arm(tx_arm),
         .tx_byte(tx_byte), .tx_addr(tx_addr),
         .tx_busy(tx_busy), .tx_done(tx_done),
         .dp(dut_dp), .dn(dut_dn), .output_enable(dut_oe));

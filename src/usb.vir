@@ -8,7 +8,7 @@ import phy
 //> is the core) and the pad samples back (soci; the server is the
 //> pads).  Electrical bidirectionality stays inside UsbPads' SB_IO
 //> cells; every channel here is unidirectional.
-socket UsbTxRx {
+pub socket UsbTxRx {
     cosi dp_tx : Bit
     cosi dn_tx : Bit
     cosi output_enable : Bit
@@ -53,7 +53,7 @@ socket UsbTxRx {
 //> bidirectionality never crosses this boundary (the ext body's
 //> `inout` port declarations are the Verilog-side plumbing that gets
 //> the SB_IO PACKAGE_PIN nets out to the Top ports / PCF pins).
-ext mod UsbPads {
+pub ext mod UsbPads {
     //> USB D+ pad side, out to the Top port (PCF pin A1 in fomu.pcf);
     //> electrically bidirectional, driven/sampled by the SB_IO cell
     //> inside the ext body.
@@ -68,7 +68,7 @@ ext mod UsbPads {
 }
 
 //> Power-on reset / USB attach delay
-mod PowerOnReset {
+pub mod PowerOnReset {
     //> 48 MHz board clock.
     incoming clock  : Clock
     //> High (sticky) once the POR count completes.  Consumed at the
@@ -127,7 +127,7 @@ struct type TokenRec {
 //> `crc_ok` -- the registered CRC16 residual verdict (16'h800D after
 //>   a good payload stream): a CRC failure delivers the record with
 //>   this low, so the protocol layer retries.
-struct type DataRec {
+pub struct type DataRec {
     pid : Word[4]
     len : Word[7]
     crc_ok : Bit
@@ -1530,11 +1530,10 @@ mod UsbArbiter {
         }
     }
 
-    //> The tx engine start strobe: any pending response request.
-    //> `outgoing wire` (not a plain outgoing sink): this mod itself
-    //> reads it back (tx_owner's D), and UsbUart forwards it to the
-    //> snapshot loader.
-    outgoing wire tx_start : Bit {
+    //> The tx arm strobe: any pending response request.  This mod
+    //> itself reads it back (tx_owner's D) and packs it into the arm
+    //> record below.
+    wire tx_start : Bit {
         it := ep0_req || ser_req || ep2_nak_req
     }
     //> In-flight response owner: 0 none, 1 ep0, 2 serial, 3 ep2
@@ -1552,20 +1551,24 @@ mod UsbArbiter {
             else => it
         }
     }
-    //> The response the tx engine launches (EP2 always NAKs).
-    outgoing tx_pid_w : Word[4] {
+    //> The tx arm record: the strobe (@Valid) plus the response the
+    //> tx engine launches (EP2 always NAKs: pid 10w4, len 0).  The
+    //> same strobe+payload idiom as the RX-side tk/dt records.
+    outgoing tx_arm : Valid[phy::TxRec] {
         it := when {
-            case ep0_req => ep0_pid
-            case ser_req => ser_pid
-            else         => 10w4
-        }
-    }
-    //> The launched response's length in bytes (0 for the EP2 NAK).
-    outgoing tx_len_w : Word[7] {
-        it := when {
-            case ep0_req => ep0_len
-            case ser_req => ser_len
-            else         => 0w7
+            case tx_start => @Valid(${
+                pid = when {
+                    case ep0_req => ep0_pid
+                    case ser_req => ser_pid
+                    else         => 10w4
+                },
+                len = when {
+                    case ep0_req => ep0_len
+                    case ser_req => ser_len
+                    else         => 0w7
+                },
+            })
+            else => @Invalid()
         }
     }
 }
@@ -1588,8 +1591,9 @@ mod UsbSnapshotLoader {
     incoming reset : Bit
     //> Bus reset strobe (via the core): aborts a load in flight.
     incoming bus_reset : Bit
-    //> The tx engine start strobe (arbiter.tx_start).
-    incoming tx_start : Bit
+    //> The tx arm record (arbiter.tx_arm): the @Valid tag is the arm
+    //> strobe.
+    incoming tx_arm : Valid[phy::TxRec]
     //> Serial's response request + fresh-arm strobe: the arm is a NEW
     //> bulk-IN packet (vs a retransmit of the pending snapshot).
     incoming ser_req : Bit
@@ -1597,8 +1601,6 @@ mod UsbSnapshotLoader {
     //> retransmit of the pending snapshot); reloads the snapshot RAM
     //> from the tx FIFO.
     incoming ser_fresh : Bit
-    //> The armed packet's length (arbiter.tx_len_w at the arm).
-    incoming tx_len : Word[7]
     //> The tx FIFO's head byte (combinational, valid the whole cycle):
     //> captured into the snapshot RAM on each load step's edge, paired
     //> with the pop.
@@ -1606,9 +1608,26 @@ mod UsbSnapshotLoader {
     //> The tx byte fetch index (the snapshot RAM's read address).
     incoming rd_addr : Word[7]
 
-    //> A fresh bulk-IN arm: tx_start with serial's fresh-arm strobe.
+    //> The arm record's @Valid tag (the strobe).
+    wire tx_arm_valid : Bit {
+        it := match tx_arm {
+            case @Valid(dontcare) => true
+            case @Invalid()       => false
+        }
+    }
+    //> The armed packet's length (don't-care off the arm; consumed
+    //> only under arm_fresh).
+    wire tx_len : Word[7] {
+        it := match tx_arm {
+            case @Valid(rec) => rec->len
+            case @Invalid()  => 0w7
+        }
+    }
+
+    //> A fresh bulk-IN arm: the arm strobe with serial's fresh-arm
+    //> strobe.
     wire arm_fresh : Bit {
-        it := tx_start && ser_req && ser_fresh
+        it := tx_arm_valid && ser_req && ser_fresh
     }
     //> The load-in-flight run flag (drives the tx FIFO's pop -- see
     //> the tx FIFO banner for why the pop decision is registered).
@@ -1761,8 +1780,8 @@ mod UsbByteStream {
     reg tx_ready : Bit on clock {
         initial it <= false
         it <= !txfifo.full
+        tx.ready := it
     }
-    tx.ready := tx_ready
 
     //> The push cycle: the consumer's @Valid payload (one clock
     //> strobe).
@@ -1980,28 +1999,17 @@ mod UsbByteStream {
 mod UsbUart {
     //> 48 MHz system clock: each USB FS bit spans 4 clock cycles.
     incoming clock : Clock
-    //> Synchronous reset, active high.  Fed by the registered
-    //> por_done (one clock behind UsbPor's release) -- see the por_rst
-    //> doccomment in UsbController for why the extra register stage
-    //> is load-bearing.
+    //> Synchronous reset
     incoming reset : Bit
-    //> Pad-facing UsbTxRx socket.  The client is this module: it
-    //> drives the D+/D- levels and the tristate control (cosi
-    //> channels dp_tx/dn_tx/output_enable), and reads the pad
-    //> samples back (soci channels dp_rx/dn_rx).
-    client socket usb of UsbTxRx {
-        it.dp_tx := txphy.dp
-        it.dn_tx := txphy.dn
-        it.output_enable := txphy.output_enable
-    }
-    //> Bulk-OUT byte stream toward the consumer: popped rx-FIFO
-    //> bytes, with the consumer's ready as end-to-end flow control.
-    //> Forwarded unchanged through UsbController to the ext-world
-    //> boundary.
+    //> USB D+ D- pins (driven by the unified PHY below,
+    //> bulk-forwarded to the pads).
+    client socket usb of UsbTxRx
+
+    //> Bulk-OUT byte stream toward the consumer
     client socket rx of Pipe[Word[8]]
-    //> Bulk-IN byte stream from the consumer: bytes into the tx
-    //> FIFO, with the registered FIFO room as backpressure.
+    //> Bulk-IN byte stream from the consumer
     server socket tx of Pipe[Word[8]]
+
     //> The core is receiving data (host -> device); stretched ~175 ms
     //> past the last byte (drives led_red, active low, at the top).
     outgoing rxing : Bit {
@@ -2013,17 +2021,21 @@ mod UsbUart {
         it := bytestream.txing
     }
 
-    // ---- RX chain -----------------------------------------------------
-    //> The RX PHY (pads -> decoded bit stream).  `active` is unused
-    //> here: the packet engines key off sop/eop/pkt_err instead.
-    //> Its bus_reset strobe (detected long SE0) fans out to every
-    //> USB engine and FIFO below to flush state.
-    mod rxphy of phy::RxPhy {
+    //> The unified PHY (src/phy.vir): the RX chain (decoded bit
+    //> stream + sop/eop/error/bus_reset strobes) and the TX chain
+    //> (packet-record interface) behind the pad-facing UsbTxRx socket,
+    //> bulk-forwarded to this module's boundary.
+    mod usbphy of phy::Phy {
         it.clock := clock
         it.reset := reset
-        it.dp  := usb.dp_rx
-        it.dn  := usb.dn_rx
+        usb :=: it.usb
+
+        it.tx_arm   := arbiter.tx_arm
+        it.tx_byte  := tx_byte
+
         unused it.active
+        unused it.tx_addr
+        unused it.tx_busy
     }
 
     //> The packet assembler (bits -> tk_*/dt_*/hs_* records).  The
@@ -2033,12 +2045,12 @@ mod UsbUart {
     mod rxpkt of RxPacket {
         it.clock       := clock
         it.reset       := reset
-        it.bus_reset := rxphy.bus_reset
-        it.bit_i     := rxphy.bit_o
-        it.bit_valid := rxphy.bit_valid
-        it.sop       := rxphy.sop
-        it.eop       := rxphy.eop
-        it.pkt_err   := rxphy.error
+        it.bus_reset := usbphy.bus_reset
+        it.bit_i     := usbphy.bit_o
+        it.bit_valid := usbphy.bit_valid
+        it.sop       := usbphy.sop
+        it.eop       := usbphy.eop
+        it.pkt_err   := usbphy.error
         it.dt_rd_addr := bytestream.push_i[6..0]
         // SOF frames decode but are ignored (the device does no SOF
         // bookkeeping).
@@ -2061,7 +2073,7 @@ mod UsbUart {
     mod ep0 of endpoint::Ep0 {
         it.clock       := clock
         it.reset       := reset
-        it.bus_reset := rxphy.bus_reset
+        it.bus_reset := usbphy.bus_reset
         it.tk_setup  := router.ep0_tk_setup_r
         it.tk_in     := router.ep0_tk_in_r
         it.tk_out    := router.ep0_tk_out_r
@@ -2074,7 +2086,7 @@ mod UsbUart {
     mod serial of endpoint::Serial {
         it.clock       := clock
         it.reset       := reset
-        it.bus_reset := rxphy.bus_reset
+        it.bus_reset := usbphy.bus_reset
         it.set_cfg   := cfg_strobe
         it.tk_in     := router.ser_tk_in_r
         it.tk_out    := router.ser_tk_out_r
@@ -2094,7 +2106,7 @@ mod UsbUart {
     mod router of UsbTokenRouter {
         it.clock     := clock
         it.reset     := reset
-        it.bus_reset := rxphy.bus_reset
+        it.bus_reset := usbphy.bus_reset
         it.dev_addr  := ep0.dev_addr
         it.tk  := rxpkt.tk
         it.dt  := rxpkt.dt
@@ -2121,7 +2133,7 @@ mod UsbUart {
         it.ser_len := serial.resp_len
         it.ep2_tk_in  := router.ep2_tk_in_r
         it.ep2_tk_out := router.ep2_tk_out_r
-        it.tx_done := txphy.tx_done
+        it.tx_done := usbphy.tx_done
     }
 
     // ---- snapshot loader ------------------------------------------------------
@@ -2131,11 +2143,10 @@ mod UsbUart {
     mod loader of UsbSnapshotLoader {
         it.clock     := clock
         it.reset     := reset
-        it.bus_reset := rxphy.bus_reset
-        it.tx_start  := arbiter.tx_start
+        it.bus_reset := usbphy.bus_reset
+        it.tx_arm    := arbiter.tx_arm
         it.ser_req   := serial.resp_req
         it.ser_fresh := serial.resp_fresh
-        it.tx_len    := arbiter.tx_len_w
         it.fifo_head := bytestream.tx_head
         it.rd_addr   := byte_rd_addr
     }
@@ -2147,7 +2158,7 @@ mod UsbUart {
     mod bytestream of UsbByteStream {
         it.clock      := clock
         it.reset      := reset
-        it.bus_reset  := rxphy.bus_reset
+        it.bus_reset  := usbphy.bus_reset
         it.ser_accept := ser_accept
         it.dat        := rxpkt.data_rec
         it.dt_rd_data := rxpkt.dt_rd_data
@@ -2187,7 +2198,7 @@ mod UsbUart {
     //> further stage.
     reg byte_rd_addr : Word[7] on clock {
         initial it <= 0w7
-        it <= txphy.tx_addr_next
+        it <= usbphy.tx_addr_next
     }
     //> EP0 ROM page start by descriptor select.
     wire rom_page : Word[8] {
@@ -2201,7 +2212,7 @@ mod UsbUart {
         }
     }
     //> The latched EP0 response base: page start + transfer offset,
-    //> latched at arm.  Reset by reset ONLY, not rxphy.bus_reset.
+    //> latched at arm.  Reset by reset ONLY, not usbphy.bus_reset.
     reg rom_base_r : Word[8] on clock {
         initial it <= 0w8
         it <= when {
@@ -2230,39 +2241,23 @@ mod UsbUart {
             else => descrom.rd
         }
     }
-
-    // ---- tx PHY -----------------------------------------------------------
-    mod txphy of phy::TxPhy {
-        it.clock := clock
-        it.reset := reset
-        it.tx_start := arbiter.tx_start
-        it.tx_pid := arbiter.tx_pid_w
-        it.tx_len := arbiter.tx_len_w
-        it.tx_byte := tx_byte
-        unused it.tx_addr
-        unused it.tx_busy
-    }
 }
 
-mod UsbController {
+pub mod UsbController {
     //> 48 MHz board clock.
     incoming clock : Clock
-    //> From UsbPor (instantiated at the top level alongside this
-    //> controller): high once the ~175 ms power-on count is done.
+    //> From PowerOnReset
+    //> high once the ~175 ms power-on count is done.
     incoming por_done : Bit
 
-    // Byte-stream interface to the byte-stream consumer (the echo
-    // server in src/top.vir): the core's Pipe[Word[8]] sockets,
-    // forwarded unchanged (the ext-world boundary speaks the same
-    // handshake the core's byte-stream engine uses internally).
-    //> Bulk-OUT byte stream toward the consumer: popped rx-FIFO
-    //> bytes (@Valid payload), with the consumer's ready as
-    //> end-to-end flow control (low = consumer full: the core stops
-    //> popping, NAKs bulk-OUT packets, and the host retries).
+    //> USB D+ and D- pins
+    client socket usb of UsbTxRx
+
+    //> Byte-stream interface to the byte-stream consumer
+    //> Bulk-OUT byte stream toward the consumer
     client socket rx of Pipe[Word[8]]
-    //> Bulk-IN byte stream from the consumer: bytes into the tx
-    //> FIFO (the consumer drives a 1-clock @Valid payload per
-    //> byte), with the registered FIFO room as backpressure.
+    //> Byte-stream interface to the byte-stream producer
+    //> Bulk-IN byte stream from the consumer
     server socket tx of Pipe[Word[8]]
 
     //> The core is receiving data (host -> device); stretched ~175 ms
@@ -2271,11 +2266,6 @@ mod UsbController {
     //> The core is sending data (device -> host); stretched ~175 ms
     //> past the last byte (drives led_green, active low).
     outgoing txing : Bit
-
-    // Pad-facing side: the UsbTxRx socket to the UsbPads ext mod
-    // (bulk-connected in src/top.vir).  Forwarded unchanged from
-    // the UsbUart core via usb :=: it.usb.
-    client socket usb of UsbTxRx
 
     //> the core reset persists until a cycle after the power-on reset is complete
     reg core_reset : Bit on clock {

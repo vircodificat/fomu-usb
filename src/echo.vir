@@ -60,7 +60,7 @@ ext mod EchoFifo {
     outgoing room       : Bit
 }
 
-mod EchoServer {
+pub mod EchoServer {
     //> System clock, 48 MHz on Fomu (one UART bit time is 417 clks;
     //> see src/uart.vir).
     incoming clock : Clock

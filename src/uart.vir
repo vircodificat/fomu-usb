@@ -59,7 +59,7 @@ enum type UartFsmState {
     Stop  = 0b11
 }
 
-mod UartSender {
+pub mod UartSender {
     //> 48 MHz clock; one bit = 417 cycles (see the file comment).
     incoming clock      : Clock
     incoming data       : Word[8]
@@ -140,7 +140,7 @@ mod UartSender {
     }
 }
 
-mod UartReceiver {
+pub mod UartReceiver {
     incoming clock      : Clock
     incoming uart_rx    : Bit
     // At the end of each 417-cycle Data phase (each bit's center)

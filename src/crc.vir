@@ -11,7 +11,7 @@
 //> CRC5, poly x^5+x^2+1, seed 0x1F -- the token CRC over
 //> addr[6:0] + endp[3:0].  Used receive-side only: RxPacket advances
 //> it over the token bits and checks the residual.
-mod Crc5 {
+pub mod Crc5 {
     //> 48 MHz clock.
     incoming clock : Clock
     //> Synchronous reset: re-seed the LFSR to 0x1F (RxPacket asserts
@@ -44,7 +44,7 @@ mod Crc5 {
 
 //> CRC16, poly x^16+x^15+x^2+1, seed 0xFFFF -- the data-payload CRC:
 //> checker in RxPacket, generator for TX data packets in TxPhy.
-mod Crc16 {
+pub mod Crc16 {
     //> 48 MHz clock.
     incoming clock : Clock
     //> Synchronous reset: re-seed the LFSR to 0xFFFF.

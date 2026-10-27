@@ -2,7 +2,7 @@ import ice40
 import echo
 import usb
 
-export mod Top for ice40::Fomu {
+pub mod Top for ice40::Fomu {
     incoming clock : Clock
 
     outgoing usb_dp : Bit

@@ -1,24 +1,130 @@
 //! The USB physical layer ("PHY") mods: everything between the raw
 //! pad samples and the decoded / encoded bit streams.
 //!
-//! Receive side: usb::RxPhy synchronizes the raw D+/D- pads, decodes
+//! Receive side: RxPhy synchronizes the raw D+/D- pads, decodes
 //! the line states (SE0/SE1/J/K), recovers the bit clock (4x
 //! oversampling: 48 MHz core clock = 4 clock cycles per FS bit), and
 //! emits the decoded bit stream plus the SOP/EOP/error/bus_reset
 //! strobes.  The NRZI decode and bit destuffing it builds on live in
 //! their own mods (usb::NrziDecoder, usb::BitDestuffer).
 //!
-//! Transmit side: usb::TxPhy is the mirror image -- packet records
+//! Transmit side: TxPhy is the mirror image -- packet records
 //! (pid / len / byte stream) in, NRZI-encoded bit-stuffed pad drive
 //! out, with EOP/SE0 sequencing and the payload CRC16 from
 //! crc::Crc16.  It lives below, factored into usb::BitSource (framer)
 //! and usb::BitStuffer (bit stuffing) around the bit-time engine
 //! itself.
 //!
+//! The unified Phy mod bundles both chains behind the pad-facing
+//! UsbTxRx socket: consumers instantiate one mod and get the decoded
+//! RX bit stream / packet strobes and the packet-record TX interface
+//! side by side (see src/usb.vir's UsbUart).
+//!
 //! The bidirectional pad cells themselves stay vendored in
 //! ext/usb_pads.sv (UsbPads) -- see src/usb.vir.
 
 import crc
+import usb
+
+//> Phy is the unified USB physical layer: the pad-facing UsbTxRx
+//> socket plus the whole receive chain (RxPhy) and transmit chain
+//> (TxPhy) behind a single instantiation.  RxPhy and TxPhy remain the
+//> actual implementations (the PHY testbench drives them directly);
+//> this mod is the packaging the core instantiates.
+pub mod Phy {
+    //> 48 MHz clock: 4 clock cycles per USB FS bit.
+    incoming clock : Clock
+    //> Synchronous reset (core reset from UsbController).
+    //> Deliberately NOT asserted on bus reset: the bus-reset detector
+    //> lives in RxPhy.
+    incoming reset : Bit
+
+    //> The arm record: @Valid for the 1-clock arm strobe, payload =
+    //> the packet to launch (see TxRec / TxPhy).
+    incoming tx_arm : Valid[TxRec]
+    //> Producer payload byte: the core's fetch pipeline (registered
+    //> snapshot-RAM / descriptor-ROM read stages), re-timed inside
+    //> TxPhy's BitSource.
+    incoming tx_byte : Word[8]
+
+    // ---- pad-facing socket ---------------------------------------------
+    //> The bidirectional USB pad boundary, split into unidirectional
+    //> channels: the drive levels / tristate control out (cosi, driven
+    //> by TxPhy), the pad samples back (soci, feeding RxPhy).  The
+    //> electrical bidirectionality stays inside the UsbPads ext mod.
+    client socket usb of usb::UsbTxRx {
+        it.dp_tx := txphy.dp
+        it.dn_tx := txphy.dn
+        it.output_enable := txphy.output_enable
+    }
+
+    //> Decoded (NRZI-decoded) data bit, captured at every mid-bit
+    //> sample.  See RxPhy / NrziDecoder.
+    outgoing bit_o : Bit {
+        it := rxphy.bit_o
+    }
+    //> 1-clock strobe: bit_o is good this cycle (suppressed for the
+    //> dropped stuff bit).  See RxPhy / BitDestuffer.
+    outgoing bit_valid : Bit {
+        it := rxphy.bit_valid
+    }
+    //> 1-clock pulse: J->K seen from idle (start of packet).
+    outgoing sop : Bit {
+        it := rxphy.sop
+    }
+    //> 1-clock pulse: SE0 held ~1.75 bit times (end of packet).
+    outgoing eop : Bit {
+        it := rxphy.eop
+    }
+    //> Inside a packet (from sop until eop).
+    outgoing active : Bit {
+        it := rxphy.active
+    }
+    //> Sticky per-packet error: SE1 seen, or a bit-stuffing violation;
+    //> cleared at the next sop (or by reset).
+    outgoing error : Bit {
+        it := rxphy.error
+    }
+    //> Bus reset strobe (SE0 held >= 2.5 us): consumers flush state.
+    outgoing bus_reset : Bit {
+        it := rxphy.bus_reset
+    }
+
+    // ---- TX side -------------------------------------------------------
+    //> The payload bit index as a byte address: the byte the NEXT bit
+    //> time's encoding draws from (informational).
+    outgoing tx_addr : Word[7] {
+        it := txphy.tx_addr
+    }
+    //> Fetch preload hint: the payload byte one ahead of the byte
+    //> currently being consumed; the core's fetch pipeline registers
+    //> it and addresses the producer mux one byte ahead.
+    outgoing tx_addr_next : Word[7] {
+        it := txphy.tx_addr_next
+    }
+    //> A packet is in flight (any state but Idle).
+    outgoing tx_busy : Bit {
+        it := txphy.tx_busy
+    }
+    //> 1-clock pulse when the bus is released (end of the EOP).
+    outgoing tx_done : Bit {
+        it := txphy.tx_done
+    }
+
+    mod rxphy of RxPhy {
+        it.clock := clock
+        it.reset := reset
+        it.dp := usb.dp_rx
+        it.dn := usb.dn_rx
+    }
+
+    mod txphy of TxPhy {
+        it.clock := clock
+        it.reset := reset
+        it.tx_arm := tx_arm
+        it.tx_byte := tx_byte
+    }
+}
 
 //> RxPhy is the physical receiver ("PHY") for the USB.
 //> It is responsible for converting the raw D+ and D- USB signals (`dp` and `dn`).
@@ -248,11 +354,6 @@ mod NrziDecoder {
     //> Synchronized D- sample
     incoming dn_sync : Bit
 
-    // The NRZI decode of the line levels: current synchronized
-    // levels against the registered previous-sample reference.
-    wire decode : Bit {
-        it := (dp_sync == lev_d) && (dn_sync == lev_n)
-    }
     //> The NRZI decode of the line levels as they are right now.
     //> Only meaningful at sample instants -- between samples the
     //> line may be mid-transition and this is noise.  Exists so
@@ -278,6 +379,12 @@ mod NrziDecoder {
     //> value = J (D- low).
     reg lev_n : Bit on clock {
         initial it <= false
+    }
+
+    // The NRZI decode of the line levels: current synchronized
+    // levels against the registered previous-sample reference.
+    wire decode : Bit {
+        it := (dp_sync == lev_d) && (dn_sync == lev_n)
     }
 
     when {
@@ -372,6 +479,21 @@ mod BitDestuffer {
     }
 }
 
+//> The transmit packet record: the strobe+payload bundle that arms
+//> the TX engine, carried as Valid[TxRec] -- the @Valid tag is the
+//> 1-clock arm strobe, the payload is the packet to launch.  The
+//> TX-side mirror of the RX-side records (usb::TokenRec /
+//> usb::DataRec / usb::HsRec).
+//>
+//> `pid` -- the PID nibble (the upper complement is generated in
+//>   BitSource).
+//> `len` -- payload byte count, 0..64 (0 => zero-length packet; a
+//>   data PID still appends its 16 CRC wire bits).
+pub struct type TxRec {
+    pid : Word[4]
+    len : Word[7]
+}
+
 //> TxPhy is the physical transmitter ("PHY") for the USB: the mirror
 //> image of RxPhy above.  It takes a packet record (pid / len / byte
 //> stream) and drives a complete USB Full-Speed packet onto the
@@ -397,13 +519,9 @@ mod TxPhy {
     incoming clock : Clock
     //> Synchronous reset (core reset from UsbController).
     incoming reset : Bit
-    //> 1-clock pulse: latch tx_pid/tx_len and begin the packet.
-    incoming tx_start : Bit
-    //> PID nibble (the upper complement is generated in BitSource).
-    incoming tx_pid : Word[4]
-    //> Payload byte count, 0..64 (0 => zero-length packet; a data PID
-    //> still appends its 16 CRC wire bits).
-    incoming tx_len : Word[7]
+    //> The arm record: @Valid for the 1-clock arm strobe; the payload
+    //> (pid / len) is latched into the packet geometry at the arm.
+    incoming tx_arm : Valid[TxRec]
     //> Producer payload byte: the core top's mux over registered
     //> snapshot-RAM / descriptor-ROM read stages (addressed through
     //> tx_addr_next, see below).  BitSource's fetch pipeline
@@ -489,11 +607,35 @@ mod TxPhy {
 
     // ---- engine strobes: 1-clock decodes of the registered flags ------
 
-    //> The tx_start pulse decoded against the FSM (a packet arms only
+    //> The arm record's @Valid tag (the arm strobe, before the FSM
+    //> gate below).
+    wire tx_arm_valid : Bit {
+        it := match tx_arm {
+            case @Valid(dontcare) => true
+            case @Invalid()       => false
+        }
+    }
+    //> The armed packet's PID (don't-care off the arm; BitSource
+    //> consumes it only under arm).
+    wire tx_pid : Word[4] {
+        it := match tx_arm {
+            case @Valid(rec) => rec->pid
+            case @Invalid()  => 0w4
+        }
+    }
+    //> The armed packet's payload byte count (ditto).
+    wire tx_len : Word[7] {
+        it := match tx_arm {
+            case @Valid(rec) => rec->len
+            case @Invalid()  => 0w7
+        }
+    }
+
+    //> The arm strobe decoded against the FSM (a packet arms only
     //> while idle).  Used by every packet-geometry register in
     //> BitSource.
     wire arm : Bit {
-        it := (state == #Idle) && tx_start
+        it := (state == #Idle) && tx_arm_valid
     }
     //> The guard-to-data transition edge: the start of the packet on
     //> the wire (bit time 0's J->K sync transition).
@@ -576,7 +718,7 @@ mod TxPhy {
 
     // ---- the engine ----------------------------------------------------
 
-    //> FSM: Idle (bus released, waiting for tx_start) -> Guard (8 clks
+    //> FSM: Idle (bus released, waiting for the arm record) -> Guard (8 clks
     //> = 2 bit times inter-packet guard, bus still released) -> Data
     //> (the bit-time engine) -> Eop0 (SE0, 2 bit times) -> EopJ (J for
     //> the last bit time, then release) -> Idle.

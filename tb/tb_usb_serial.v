@@ -681,10 +681,13 @@ module tb_usb_serial;
     // Instrumentation: monitor the core's RX packet CRC and length
     // --------------------------------------------------------------
     always @(posedge clk) begin
-        if (dut.core.rxpkt.dt_valid) begin
+        // The data record is the pulsed Valid[DataRec] now (packed:
+        // tag[1:0], pid[5:2], len[12:6], crc_ok[13] -- same layout
+        // tb_usb_phy.v decodes); the old flat dt_* wires are gone.
+        if (dut.core.rxpkt.dt[1:0] == 2'b10) begin
             $display("[%0t] RX pkt: dt_len=%0d dt_crc_ok=%b",
-                     $time, dut.core.rxpkt.dt_len,
-                     dut.core.rxpkt.dt_crc_ok);
+                     $time, dut.core.rxpkt.dt[12:6],
+                     dut.core.rxpkt.dt[13]);
         end
     end
 

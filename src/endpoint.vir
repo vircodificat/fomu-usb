@@ -65,7 +65,7 @@ enum type Ep0State {
 //> two helpers is a priority chain -- load-bearing for the 48 MHz
 //> timing (see wiki/usb-ep0.md).
 
-mod Ep0 {
+pub mod Ep0 {
     //> 48 MHz clock: 4 clock cycles per USB FS bit.
     incoming clock : Clock
     //> Synchronous reset, active high (core reset from UsbController).
@@ -773,7 +773,7 @@ mod Ep0SendEngine {
 //> arm/retransmit bookkeeping (+ the tx toggle).  Every reg's
 //> next-state is a priority chain -- load-bearing for the 48 MHz
 //> timing (see wiki/usb-serial.md).
-mod Serial {
+pub mod Serial {
     //> 48 MHz clock: 4 clock cycles per USB FS bit.
     incoming clock : Clock
     //> Synchronous reset, active high (core reset from UsbController).
