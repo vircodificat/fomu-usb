@@ -41,7 +41,7 @@ pub mod Top for ice40::Fomu {
     // the UsbPads ext mod below.
     mod usb_controller of usb::UsbController {
         it.clock := clock
-        it.por_done := true
+        it.por_done := por.done
 
         // The LEDs to indicate the USB activity
         led_red   := !it.rxing
