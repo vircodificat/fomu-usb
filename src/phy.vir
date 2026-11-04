@@ -168,18 +168,18 @@ mod RxPhy {
     //> 1-clock pulse: J->K seen from idle (start of packet).
     outgoing reg sop : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset      => false
-            case sop_edge => true
+        it <= if {
+            when reset      => false
+            when sop_edge => true
             else          => false
         }
     }
     //> 1-clock pulse: SE0 held ~1.75 bit times (end of packet).
     outgoing reg eop : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset     => false
-            case eop_now   => true
+        it <= if {
+            when reset     => false
+            when eop_now   => true
             else           => false
         }
     }
@@ -187,11 +187,11 @@ mod RxPhy {
     //> dropped with the eop pulse or on an SE1 (illegal bus state).
     outgoing reg active : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset      => false
-            case sop_edge   => true
-            case abort      => false
-            case eop_now    => false
+        it <= if {
+            when reset      => false
+            when sop_edge   => true
+            when abort      => false
+            when eop_now    => false
             else            => it
         }
     }
@@ -200,11 +200,11 @@ mod RxPhy {
     //> (or by reset).
     outgoing reg error : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset                => false
-            case sop_edge             => false
-            case abort                => true
-            case destuffer.violation  => true
+        it <= if {
+            when reset                => false
+            when sop_edge             => false
+            when abort                => true
+            when destuffer.violation  => true
             else                      => it
         }
     }
@@ -212,9 +212,9 @@ mod RxPhy {
     //> see se0_count).
     outgoing reg bus_reset : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset              => false
-            case se0_count == 119w7 => true
+        it <= if {
+            when reset              => false
+            when se0_count == 119w7 => true
             else                    => false
         }
     }
@@ -233,16 +233,16 @@ mod RxPhy {
     //> Previous-cycle synchronized D+ sample
     reg dp_p : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
+        it <= if {
+            when reset => false
             else     => sync_dp.out
         }
     }
     //> Previous-cycle synchronized D- sample
     reg dn_p : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
+        it <= if {
+            when reset => false
             else     => sync_dn.out
         }
     }
@@ -307,10 +307,10 @@ mod RxPhy {
     //> the mid-bit sample (see the `sample` wire).
     reg phase : Word[2] on clock {
         initial it <= 0w2
-        it <= when {
-            case reset     => 0w2
-            case sop_edge  => 0w2
-            case jk        => mux(trans, 0w2, it + 1w2)
+        it <= if {
+            when reset     => 0w2
+            when sop_edge  => 0w2
+            when jk        => mux(trans, 0w2, it + 1w2)
             else           => it
         }
     }
@@ -322,9 +322,9 @@ mod RxPhy {
     //> 128 clks (the ep0 FSM treats each pulse identically).
     reg se0_count : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset => 0w7
-            case se0   => it + 1w7
+        it <= if {
+            when reset => 0w7
+            when se0   => it + 1w7
             else       => 0w7
         }
     }
@@ -359,7 +359,7 @@ mod NrziDecoder {
     //> line may be mid-transition and this is noise.  Exists so
     //> same-edge logic (the destuffer, `error`) can decide before
     //> the sample edge lands, instead of one bit late.
-    outgoing bit_live : Bit {
+    outgoing bit_live : Bit dependson dp_sync, dn_sync {
         it := decode
     }
     //> The decoded bit of the most recent sample: captured on the
@@ -387,13 +387,13 @@ mod NrziDecoder {
         it := (dp_sync == lev_d) && (dn_sync == lev_n)
     }
 
-    when {
-        case reset {
+    if {
+        when reset {
             bit_sampled <= false
             lev_d <= true
             lev_n <= false
         }
-        case sample {
+        when sample {
             bit_sampled <= decode
             lev_d <= dp_sync
             lev_n <= dn_sync
@@ -425,16 +425,16 @@ mod BitDestuffer {
     //> for the dropped stuff bit).
     outgoing reg bit_valid : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset                  => false
-            case sample && !drop_state  => true
+        it <= if {
+            when reset                  => false
+            when sample && !drop_state  => true
             else                        => false
         }
     }
     //> Stuffing violation at this sample: 6 consecutive ones armed
     //> the drop, and the sampled bit in that slot is a 1.  Sticky in
     //> the parent (`error` latches it until the next sop / reset).
-    outgoing violation : Bit {
+    outgoing violation : Bit dependson sample, bit_live {
         it := sample && drop_state && bit_live
     }
 
@@ -456,22 +456,22 @@ mod BitDestuffer {
     // and update together at the sample point (drop_state's two
     // sample sub-cases keep their priority: a held drop clears
     // before the arm-bits check can set it again).
-    when {
-        case reset {
+    if {
+        when reset {
             stuff_count  <= 0w3
             drop_state   <= false
         }
-        case !active {
+        when !active {
             stuff_count  <= 0w3
             drop_state   <= false
         }
-        case sample {
+        when sample {
             stuff_count <= mux(drop_state, 0w3, mux(bit_live, stuff_count + 1w3, 0w3))
-            when {
-                case drop_state {
+            if {
+                when drop_state {
                     drop_state <= false
                 }
-                case bit_live && (stuff_count == 5w3) {
+                when bit_live && (stuff_count == 5w3) {
                     drop_state <= true
                 }
             }
@@ -549,9 +549,9 @@ mod TxPhy {
     //> 1-clock pulse when the bus is released (end of the EOP).
     outgoing reg tx_done : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
-            case (state == #EopJ) && bit_end_r => true
+        it <= if {
+            when reset => false
+            when (state == #EopJ) && bit_end_r => true
             else => false
         }
     }
@@ -570,10 +570,10 @@ mod TxPhy {
     //> time (bus release).
     outgoing reg output_enable : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
-            case guard_last => true
-            case (state == #EopJ) && bit_end_r => false
+        it <= if {
+            when reset => false
+            when guard_last => true
+            when (state == #EopJ) && bit_end_r => false
             else => it
         }
     }
@@ -611,23 +611,23 @@ mod TxPhy {
     //> gate below).
     wire tx_arm_valid : Bit {
         it := match tx_arm {
-            case @Valid(dontcare) => true
-            case @Invalid()       => false
+            with @Valid(dontcare) => true
+            with @Invalid()       => false
         }
     }
     //> The armed packet's PID (don't-care off the arm; BitSource
     //> consumes it only under arm).
     wire tx_pid : Word[4] {
         it := match tx_arm {
-            case @Valid(rec) => rec->pid
-            case @Invalid()  => 0w4
+            with @Valid(rec) => rec->pid
+            with @Invalid()  => 0w4
         }
     }
     //> The armed packet's payload byte count (ditto).
     wire tx_len : Word[7] {
         it := match tx_arm {
-            case @Valid(rec) => rec->len
-            case @Invalid()  => 0w7
+            with @Valid(rec) => rec->len
+            with @Invalid()  => 0w7
         }
     }
 
@@ -689,8 +689,8 @@ mod TxPhy {
     //> cone ends at its own register.
     reg bits_remain_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
+        it <= if {
+            when reset => false
             else => bit_index < bit_source.total_bits
         }
     }
@@ -700,8 +700,8 @@ mod TxPhy {
     //> through 4 enable LUTs into bit_index's clock enable).
     reg guard_last_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
+        it <= if {
+            when reset => false
             else => (state == #Guard) && (guard_count == 6w3)
         }
     }
@@ -710,8 +710,8 @@ mod TxPhy {
     //> guard_last_r.
     reg bit_end_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
+        it <= if {
+            when reset => false
             else => in_bit_time && (bit_phase == 2w2)
         }
     }
@@ -724,13 +724,13 @@ mod TxPhy {
     //> the last bit time, then release) -> Idle.
     reg state : TxPhyState on clock {
         initial it <= #Idle
-        it <= when {
-            case reset      => #Idle
-            case arm        => #Guard
-            case guard_last => #Data
-            case packet_end => #Eop0
-            case (it == #Eop0) && bit_end_r && (eop_count == 1w3) => #EopJ
-            case (it == #EopJ) && bit_end_r => #Idle
+        it <= if {
+            when reset      => #Idle
+            when arm        => #Guard
+            when guard_last => #Data
+            when packet_end => #Eop0
+            when (it == #Eop0) && bit_end_r && (eop_count == 1w3) => #EopJ
+            when (it == #EopJ) && bit_end_r => #Idle
             else => it
         }
     }
@@ -738,11 +738,11 @@ mod TxPhy {
     //> Idle/Guard; zeroed at every bit-time boundary.
     reg bit_phase : Word[2] on clock {
         initial it <= 0w2
-        it <= when {
-            case reset => 0w2
-            case guard_last => 0w2
-            case in_bit_time && bit_end_r => 0w2
-            case in_bit_time => it + 1w2
+        it <= if {
+            when reset => 0w2
+            when guard_last => 0w2
+            when in_bit_time && bit_end_r => 0w2
+            when in_bit_time => it + 1w2
             else => it
         }
     }
@@ -750,10 +750,10 @@ mod TxPhy {
     //> between packets).
     reg guard_count : Word[3] on clock {
         initial it <= 0w3
-        it <= when {
-            case reset => 0w3
-            case arm => 0w3
-            case (state == #Guard) && !guard_last_r => it + 1w3
+        it <= if {
+            when reset => 0w3
+            when arm => 0w3
+            when (state == #Guard) && !guard_last_r => it + 1w3
             else => it
         }
     }
@@ -761,10 +761,10 @@ mod TxPhy {
     //> 1).
     reg eop_count : Word[3] on clock {
         initial it <= 0w3
-        it <= when {
-            case reset => 0w3
-            case packet_end => 0w3
-            case (state == #Eop0) && bit_end_r && (it != 1w3) => it + 1w3
+        it <= if {
+            when reset => 0w3
+            when packet_end => 0w3
+            when (state == #Eop0) && bit_end_r && (it != 1w3) => it + 1w3
             else => it
         }
     }
@@ -774,10 +774,10 @@ mod TxPhy {
     //> consume).
     reg bit_index : Word[10] on clock {
         initial it <= 0w10
-        it <= when {
-            case reset => 0w10
-            case guard_last => 1w10
-            case consume => it + 1w10
+        it <= if {
+            when reset => 0w10
+            when guard_last => 1w10
+            when consume => it + 1w10
             else => it
         }
     }
@@ -786,12 +786,12 @@ mod TxPhy {
     //> next bit time's start); forced low entering EopJ.
     reg level : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
-            case guard_last => !it
-            case (state == #Data) && bit_end_r && stuffer.stuff_next => !it
-            case consume => mux(bit_source.bit_o, it, !it)
-            case (state == #Eop0) && bit_end_r && (eop_count == 1w3) => false
+        it <= if {
+            when reset => false
+            when guard_last => !it
+            when (state == #Data) && bit_end_r && stuffer.stuff_next => !it
+            when consume => mux(bit_source.bit_o, it, !it)
+            when (state == #Eop0) && bit_end_r && (eop_count == 1w3) => false
             else => it
         }
     }
@@ -869,7 +869,7 @@ mod BitSource {
     //> The payload bit index as a byte address (see tx_addr in TxPhy
     //> for the meaning).  Informational only -- the core's fetch
     //> pipeline runs off tx_addr_next.
-    outgoing tx_addr : Word[7] {
+    outgoing tx_addr : Word[7] dependson bit_index {
         it := payload_bit[10..3]
     }
     //> Fetch preload hint: the payload byte one ahead of the byte
@@ -879,7 +879,7 @@ mod BitSource {
     //> Holds 0 through the PID bit times (preloading payload byte 0);
     //> for bit_index < 9 the subtraction wraps in Word[10] (landing
     //> on 126/127, never read).
-    outgoing tx_addr_next : Word[7] {
+    outgoing tx_addr_next : Word[7] dependson bit_index {
         it := preload_bit[10..3]
     }
 
@@ -922,14 +922,14 @@ mod BitSource {
     //> payload (LSB first), CRC16 wire bits shifted MSB-first out of
     //> crc_shift.
     wire raw_bit : Bit {
-        it := when {
-            case bit_index < 8w10 => bit_index == 7w10
-            case bit_index < 16w10 => mux(bit_in_byte < 4w3,
+        it := if {
+            when bit_index < 8w10 => bit_index == 7w10
+            when bit_index < 16w10 => mux(bit_in_byte < 4w3,
                 pid_r[dyn bit_in_byte[2..0]],
                 !pid_r[dyn pid_comp_index[2..0]])
-            case is_data && (bit_index < payload_end_r) =>
+            when is_data && (bit_index < payload_end_r) =>
                 tx_byte_r[dyn bit_in_byte]
-            case is_data => crc_shift[15]
+            when is_data => crc_shift[15]
             else => false
         }
     }
@@ -946,9 +946,9 @@ mod BitSource {
     //> f(16) .. f(payload_end_r - 1)).
     reg payload_end_r : Word[10] on clock {
         initial it <= 0w10
-        it <= when {
-            case reset => 0w10
-            case arm => word(tx_len, 0w3) + 16w10
+        it <= if {
+            when reset => 0w10
+            when arm => word(tx_len, 0w3) + 16w10
             else => it
         }
     }
@@ -956,9 +956,9 @@ mod BitSource {
     //> sit in the per-cycle compare against the CRC shift load).
     reg payload_end_m1_r : Word[10] on clock {
         initial it <= 0w10
-        it <= when {
-            case reset => 0w10
-            case arm => word(tx_len, 0w3) + 15w10
+        it <= if {
+            when reset => 0w10
+            when arm => word(tx_len, 0w3) + 15w10
             else => it
         }
     }
@@ -966,18 +966,18 @@ mod BitSource {
     //> PIDs, + 0 for everything else.
     reg total_bits_r : Word[10] on clock {
         initial it <= 0w10
-        it <= when {
-            case reset => 0w10
-            case arm => word(tx_len, 0w3) + mux(tx_pid_data, 32w10, 16w10)
+        it <= if {
+            when reset => 0w10
+            when arm => word(tx_len, 0w3) + mux(tx_pid_data, 32w10, 16w10)
             else => it
         }
     }
     //> Armed PID.
     reg pid_r : Word[4] on clock {
         initial it <= 0w4
-        it <= when {
-            case reset => 0w4
-            case arm => tx_pid
+        it <= if {
+            when reset => 0w4
+            when arm => tx_pid
             else => it
         }
     }
@@ -994,8 +994,8 @@ mod BitSource {
     //> byte.
     reg tx_byte_r : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case byte_load => tx_byte
+        it <= if {
+            when byte_load => tx_byte
             else => it
         }
     }
@@ -1019,10 +1019,10 @@ mod BitSource {
     //> payload (before the load) is harmless.
     reg crc_shift : Word[16] on clock {
         initial it <= 0w16
-        it <= when {
-            case reset => 0w16
-            case consume && (bit_index == payload_end_m1_r) => crc_wire
-            case consume => word(it[15..0], false)
+        it <= if {
+            when reset => 0w16
+            when consume && (bit_index == payload_end_m1_r) => crc_wire
+            when consume => word(it[15..0], false)
             else => it
         }
     }
@@ -1090,11 +1090,11 @@ mod BitStuffer {
     //> and re-arms the run counter.
     outgoing reg stuff_next : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
-            case clear => false
-            case tick && it => false
-            case tick && bits_remain && raw_bit && (ones_count == 5w3) => true
+        it <= if {
+            when reset => false
+            when clear => false
+            when tick && it => false
+            when tick && bits_remain && raw_bit && (ones_count == 5w3) => true
             else => it
         }
     }
@@ -1102,11 +1102,11 @@ mod BitStuffer {
     //> off for this bit time (a stuffed bit consumes no raw bit).
     outgoing reg stuffed : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
-            case clear => false
-            case tick && stuff_next => true
-            case tick => false
+        it <= if {
+            when reset => false
+            when clear => false
+            when tick && stuff_next => true
+            when tick => false
             else => it
         }
     }
@@ -1118,14 +1118,14 @@ mod BitStuffer {
     //> enough headroom: the count stops at 6 and never wraps.
     reg ones_count : Word[3] on clock {
         initial it <= 0w3
-        it <= when {
-            case reset => 0w3
-            case clear => 0w3
-            case tick && stuff_next => 0w3
-            case restart => 0w3
-            case tick && bits_remain && raw_bit && (it == 5w3) => 0w3
-            case tick && bits_remain && raw_bit => it + 1w3
-            case tick && bits_remain => 0w3
+        it <= if {
+            when reset => 0w3
+            when clear => 0w3
+            when tick && stuff_next => 0w3
+            when restart => 0w3
+            when tick && bits_remain && raw_bit && (it == 5w3) => 0w3
+            when tick && bits_remain && raw_bit => it + 1w3
+            when tick && bits_remain => 0w3
             else => it
         }
     }

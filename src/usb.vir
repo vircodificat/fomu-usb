@@ -77,8 +77,8 @@ pub mod PowerOnReset {
     //> registered once more (por_rst) to form the core-wide reset.
     outgoing reg done : Bit on clock {
         initial it <= false
-        it <= when {
-            case count >= 8_400_000 => true
+        it <= if {
+            when count >= 8_400_000 => true
             else                    => it
         }
     }
@@ -87,8 +87,8 @@ pub mod PowerOnReset {
     // while por_done_r is still low; holds at the terminal count.
     reg count : Word[24] on clock {
         initial it <= 0
-        it <= when {
-            case !done && (it < 8_400_000) => it + 1
+        it <= if {
+            when !done && (it < 8_400_000) => it + 1
             else                           => it
         }
     }
@@ -283,8 +283,8 @@ mod RxPacket {
     //> field serves the pre-split reset value (pid = 0).
     wire hs_p : HsRec {
         it := match core.hs_rec {
-            case @Valid(h) => h
-            case @Invalid() => ${
+            with @Valid(h) => h
+            with @Invalid() => ${
                 pid = 0w4,
             }
         }
@@ -295,10 +295,10 @@ mod RxPacket {
     //> as both the arrival strobe and the struct payload for consumers
     //> that register the fields themselves -- see UsbTokenRouter).
     outgoing tk : Valid[TokenRec] {
-        it := when {
-            case core.tk_strobe => @Valid(match core.tok_rec {
-                case @Valid(t) => t
-                case @Invalid() => ${
+        it := if {
+            when core.tk_strobe => @Valid(match core.tok_rec {
+                with @Valid(t) => t
+                with @Invalid() => ${
                     pid = 0w4,
                     crc_ok = false,
                     addr = 0w7,
@@ -314,10 +314,10 @@ mod RxPacket {
     //> as both the arrival strobe and the struct payload for
     //> consumers that register the fields themselves).
     outgoing dt : Valid[DataRec] {
-        it := when {
-            case core.dt_strobe => @Valid(match core.data_rec {
-                case @Valid(d) => d
-                case @Invalid() => ${
+        it := if {
+            when core.dt_strobe => @Valid(match core.data_rec {
+                with @Valid(d) => d
+                with @Invalid() => ${
                     pid = 0w4,
                     len = 0w7,
                     crc_ok = false,
@@ -439,8 +439,8 @@ mod RxPacketCore {
     //> 010 (66 = 0b1000010).
     reg bc_is_66_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => (bc[7..3] == 4w4) && (bc[3..0] == 2w3)
         }
     }
@@ -449,8 +449,8 @@ mod RxPacketCore {
     //> sets `bad`.
     reg pid_bad_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => bit_valid && (st == #Body) && !sec && (nb == 7w5)
                     && ((pid_new[4..0] ^ pid_new[8..4]) != 15w4)
         }
@@ -459,8 +459,8 @@ mod RxPacketCore {
     //> byte completing): feeds `bad`, +1 clock.
     reg bc66_hit_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => bit_valid && (st == #Body) && sec
                     && (n3 == 7w3) && (bc == 66w7)
         }
@@ -469,16 +469,16 @@ mod RxPacketCore {
     //> tree ends at its own flop instead of riding tk_crc_ok's cone.
     reg crc5_res_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => crc5.crc == 12w5
         }
     }
     //> CRC16 residual compare (16'h800D), registered likewise.
     reg crc16_res_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => crc16.crc == 0x800dw16
         }
     }
@@ -490,9 +490,9 @@ mod RxPacketCore {
     //> strobe ever fires.
     reg bad : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case sop              => false
+        it <= if {
+            when reset || bus_reset => false
+            when sop              => false
             else => it || (bit_valid && pkt_err) || pid_bad_r || bc66_hit_r
         }
     }
@@ -502,11 +502,11 @@ mod RxPacketCore {
     //> section, then token or data section) -> (eop) -> IDLE.
     reg st : RxPktState on clock {
         initial it <= #Idle
-        it <= when {
-            case reset || bus_reset => #Idle
-            case sop             => #Sync
-            case eop             => #Idle
-            case bit_valid && !pkt_err => mux(it == #Sync && nb == 7w5, #Body, it)
+        it <= if {
+            when reset || bus_reset => #Idle
+            when sop             => #Sync
+            when eop             => #Idle
+            when bit_valid && !pkt_err => mux(it == #Sync && nb == 7w5, #Body, it)
             else => it
         }
     }
@@ -516,18 +516,18 @@ mod RxPacketCore {
     //> the data section (and reached at EOP for a well-formed token).
     reg nb : Word[5] on clock {
         initial it <= 0w5
-        it <= when {
-            case reset || bus_reset => 0w5
-            case sop             => 0w5
-            case bit_valid && !pkt_err => match st {
-                case #Sync => mux(it == 7w5, 0w5, it + 1w5)
-                case #Body => when {
+        it <= if {
+            when reset || bus_reset => 0w5
+            when sop             => 0w5
+            when bit_valid && !pkt_err match st {
+                with #Sync => mux(it == 7w5, 0w5, it + 1w5)
+                with #Body if {
                     // data section: parked at 24
-                    case sec     => it
+                    when sec     => it
                     // last PID bit: classify the packet from the low 2
                     // PID bits (11 = data -> park at 24; else token/
                     // handshake bits start at 8)
-                    case it == 7w5 => mux(pid_new[2..0] == 3w2, 24w5, 8w5)
+                    when it == 7w5 => mux(pid_new[2..0] == 3w2, 24w5, 8w5)
                     else           => it + 1w5
                 }
                 else => it
@@ -539,12 +539,12 @@ mod RxPacketCore {
     //> Data-section bit-in-byte index (0..7, wraps mod 8).
     reg n3 : Word[3] on clock {
         initial it <= 0w3
-        it <= when {
-            case reset || bus_reset => 0w3
-            case sop             => 0w3
-            case bit_valid && !pkt_err => match st {
-                case #Sync => mux(nb == 7w5, 0w3, it)
-                case #Body => mux(sec,
+        it <= if {
+            when reset || bus_reset => 0w3
+            when sop             => 0w3
+            when bit_valid && !pkt_err match st {
+                with #Sync => mux(nb == 7w5, 0w3, it)
+                with #Body => mux(sec,
                     it + 1w3,
                     mux(nb == 7w5 && pid_new[2..0] == 3w2, 0w3, it))
                 else => it
@@ -557,10 +557,10 @@ mod RxPacketCore {
     //> packet at EOP; the token/crc bits never touch it).
     reg pid_r : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => 0w8
-            case sop             => 0w8
-            case bit_valid && !pkt_err
+        it <= if {
+            when reset || bus_reset => 0w8
+            when sop             => 0w8
+            when bit_valid && !pkt_err
                 && (st == #Body) && !sec && (nb < 8w5) => pid_new
             else => it
         }
@@ -570,10 +570,10 @@ mod RxPacketCore {
     //> addr = tk_sh[6:0], endp = tk_sh[10:7], frame = tk_sh[10:0].
     reg tk_sh : Word[11] on clock {
         initial it <= 0w11
-        it <= when {
-            case reset || bus_reset => 0w11
-            case sop             => 0w11
-            case bit_valid && !pkt_err
+        it <= if {
+            when reset || bus_reset => 0w11
+            when sop             => 0w11
+            when bit_valid && !pkt_err
                 && (st == #Body) && !sec
                 && (nb >= 8w5) && (nb < 19w5) => word(bit_i, it[11..1])
             else => it
@@ -583,10 +583,10 @@ mod RxPacketCore {
     //> Data-section byte assembly shifter (feeds dt_byte_new).
     reg bshift : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => 0w8
-            case sop             => 0w8
-            case bit_valid && !pkt_err
+        it <= if {
+            when reset || bus_reset => 0w8
+            when sop             => 0w8
+            when bit_valid && !pkt_err
                 && (st == #Body) && sec => word(bit_i, it[8..1])
             else => it
         }
@@ -596,10 +596,10 @@ mod RxPacketCore {
     //> trailing crc16 wire bytes (subtracted at EOP).
     reg bc : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case sop             => 0w7
-            case bit_valid && !pkt_err
+        it <= if {
+            when reset || bus_reset => 0w7
+            when sop             => 0w7
+            when bit_valid && !pkt_err
                 && (st == #Body) && sec && (n3 == 7w3) => it + 1w7
             else => it
         }
@@ -609,10 +609,10 @@ mod RxPacketCore {
     //> PID low bits say 11).
     reg sec : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case sop             => false
-            case bit_valid && !pkt_err
+        it <= if {
+            when reset || bus_reset => false
+            when sop             => false
+            when bit_valid && !pkt_err
                 && (st == #Body) && !it && (nb == 7w5)
                 => mux(pid_new[2..0] == 3w2, true, it)
             else => it
@@ -632,20 +632,20 @@ mod RxPacketCore {
     //> A same-cycle pkt_err is re-checked inline in every cap.
     reg q_pid_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case sop             => false
-            case bit_valid => !bad && !pkt_err && (st == #Body) && !sec
+        it <= if {
+            when reset || bus_reset => false
+            when sop             => false
+            when bit_valid => !bad && !pkt_err && (st == #Body) && !sec
             else => it
         }
     }
     //> Registered shared qualify for the data-section cap, ditto.
     reg q_dat_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case sop             => false
-            case bit_valid => !bad && !pkt_err && (st == #Body) && sec
+        it <= if {
+            when reset || bus_reset => false
+            when sop             => false
+            when bit_valid => !bad && !pkt_err && (st == #Body) && sec
             else => it
         }
     }
@@ -654,11 +654,11 @@ mod RxPacketCore {
     //> bits (01).
     reg tok_cap : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case sop             => false
-            case eop             => false
-            case bit_valid => q_pid_r && !pkt_err
+        it <= if {
+            when reset || bus_reset => false
+            when sop             => false
+            when eop             => false
+            when bit_valid => q_pid_r && !pkt_err
                 && (pid_r[2..0] == 1w2) && (nb == 23w5)
             else => it
         }
@@ -666,11 +666,11 @@ mod RxPacketCore {
     //> SOF cap: token cap plus PID value 5 (the frame number case).
     reg sof_cap : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case sop             => false
-            case eop             => false
-            case bit_valid => q_pid_r && !pkt_err
+        it <= if {
+            when reset || bus_reset => false
+            when sop             => false
+            when eop             => false
+            when bit_valid => q_pid_r && !pkt_err
                 && (pid_r[2..0] == 1w2) && (nb == 23w5)
                 && (pid_r[4..0] == 5w4)
             else => it
@@ -681,11 +681,11 @@ mod RxPacketCore {
     //> visible yet at this edge -- it comes via the +1-clock pid_bad_r).
     reg hs_cap : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case sop             => false
-            case eop             => false
-            case bit_valid => q_pid_r && !pkt_err
+        it <= if {
+            when reset || bus_reset => false
+            when sop             => false
+            when eop             => false
+            when bit_valid => q_pid_r && !pkt_err
                 && ((pid_r[2..0] == 0w2) || (pid_r[2..0] == 2w2))
                 && (nb == 7w5)
                 && ((pid_new[4..0] ^ pid_new[8..4]) == 15w4)
@@ -698,11 +698,11 @@ mod RxPacketCore {
     //> overflow is gated via the registered bc_is_66_r).
     reg dat_cap : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case sop             => false
-            case eop             => false
-            case bit_valid => q_dat_r && !pkt_err && (n3 == 7w3) && dat_bc_ok_r
+        it <= if {
+            when reset || bus_reset => false
+            when sop             => false
+            when eop             => false
+            when bit_valid => q_dat_r && !pkt_err && (n3 == 7w3) && dat_bc_ok_r
             else => it
         }
     }
@@ -712,10 +712,10 @@ mod RxPacketCore {
     //> path).
     reg dat_bc_ok_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case sop             => it
-            case bit_valid => (bc != 0w7) && !bc_is_66_r
+        it <= if {
+            when reset || bus_reset => false
+            when sop             => it
+            when bit_valid => (bc != 0w7) && !bc_is_66_r
             else => it
         }
     }
@@ -860,27 +860,27 @@ mod RxTokenRec {
     //> indented.
     wire held_addr : Word[7] {
         it := match rec {
-            case @Valid(t) => t->addr
-            case @Invalid() => 0w7
+            with @Valid(t) => t->addr
+            with @Invalid() => 0w7
         }
     }
     wire held_endp : Word[4] {
         it := match rec {
-            case @Valid(t) => t->endp
-            case @Invalid() => 0w4
+            with @Valid(t) => t->endp
+            with @Invalid() => 0w4
         }
     }
     wire held_frame : Word[11] {
         it := match rec {
-            case @Valid(t) => t->frame
-            case @Invalid() => 0w11
+            with @Valid(t) => t->frame
+            with @Invalid() => 0w11
         }
     }
     outgoing reg rec : Valid[TokenRec] on clock {
         initial it <= @Invalid()
-        it <= when {
-            case reset || bus_reset => @Invalid()
-            case eop && cap => @Valid(${
+        it <= if {
+            when reset || bus_reset => @Invalid()
+            when eop && cap => @Valid(${
                 pid = pid_r[4..0],
                 crc_ok = crc5_res,
                 addr = mux(sof_cap, held_addr, sh[7..0]),
@@ -893,8 +893,8 @@ mod RxTokenRec {
     //> 1-clock pulse: a token record was latched this edge.
     outgoing reg strobe : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => eop && cap
         }
     }
@@ -925,17 +925,17 @@ mod RxHandshakeRec {
     //> @Invalid).
     outgoing reg rec : Valid[HsRec] on clock {
         initial it <= @Invalid()
-        it <= when {
-            case reset || bus_reset => @Invalid()
-            case eop && cap => @Valid(${ pid = pid_r[4..0] })
+        it <= if {
+            when reset || bus_reset => @Invalid()
+            when eop && cap => @Valid(${ pid = pid_r[4..0] })
             else => it
         }
     }
     //> 1-clock pulse: a handshake record was latched this edge.
     outgoing reg strobe : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => eop && cap
         }
     }
@@ -982,9 +982,9 @@ mod RxDataRec {
     //> @Invalid).
     outgoing reg rec : Valid[DataRec] on clock {
         initial it <= @Invalid()
-        it <= when {
-            case reset || bus_reset => @Invalid()
-            case eop && cap => @Valid(${
+        it <= if {
+            when reset || bus_reset => @Invalid()
+            when eop && cap => @Valid(${
                 pid = pid_r[4..0],
                 len = mux(bc >= 2w7, bc - 2w7, 0w7),
                 crc_ok = crc16_res,
@@ -995,8 +995,8 @@ mod RxDataRec {
     //> 1-clock pulse: a data record was latched this edge.
     outgoing reg strobe : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => eop && cap
         }
     }
@@ -1010,72 +1010,72 @@ mod RxDataRec {
     //> the record just never fires for it.
     outgoing reg head0 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => 0w8
-            case dat_wr && (bc == 0w7) => byte_new
+        it <= if {
+            when reset || bus_reset => 0w8
+            when dat_wr && (bc == 0w7) => byte_new
             else => it
         }
     }
     //> Packet byte 1.
     outgoing reg head1 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => 0w8
-            case dat_wr && (bc == 1w7) => byte_new
+        it <= if {
+            when reset || bus_reset => 0w8
+            when dat_wr && (bc == 1w7) => byte_new
             else => it
         }
     }
     //> Packet byte 2.
     outgoing reg head2 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => 0w8
-            case dat_wr && (bc == 2w7) => byte_new
+        it <= if {
+            when reset || bus_reset => 0w8
+            when dat_wr && (bc == 2w7) => byte_new
             else => it
         }
     }
     //> Packet byte 3.
     outgoing reg head3 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => 0w8
-            case dat_wr && (bc == 3w7) => byte_new
+        it <= if {
+            when reset || bus_reset => 0w8
+            when dat_wr && (bc == 3w7) => byte_new
             else => it
         }
     }
     //> Packet byte 4.
     outgoing reg head4 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => 0w8
-            case dat_wr && (bc == 4w7) => byte_new
+        it <= if {
+            when reset || bus_reset => 0w8
+            when dat_wr && (bc == 4w7) => byte_new
             else => it
         }
     }
     //> Packet byte 5.
     outgoing reg head5 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => 0w8
-            case dat_wr && (bc == 5w7) => byte_new
+        it <= if {
+            when reset || bus_reset => 0w8
+            when dat_wr && (bc == 5w7) => byte_new
             else => it
         }
     }
     //> Packet byte 6.
     outgoing reg head6 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => 0w8
-            case dat_wr && (bc == 6w7) => byte_new
+        it <= if {
+            when reset || bus_reset => 0w8
+            when dat_wr && (bc == 6w7) => byte_new
             else => it
         }
     }
     //> Packet byte 7.
     outgoing reg head7 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => 0w8
-            case dat_wr && (bc == 7w7) => byte_new
+        it <= if {
+            when reset || bus_reset => 0w8
+            when dat_wr && (bc == 7w7) => byte_new
             else => it
         }
     }
@@ -1311,21 +1311,21 @@ mod UsbTokenRouter {
     reg tk_pid_r : Word[4] on clock {
         initial it <= 0w4
         it <= match tk {
-            case @Valid(t) => t->pid
-            case @Invalid() => it
+            with @Valid(t) => t->pid
+            with @Invalid() => it
         }
     }
     reg tk_endp_r : Word[4] on clock {
         initial it <= 0w4
         it <= match tk {
-            case @Valid(t) => t->endp
-            case @Invalid() => it
+            with @Valid(t) => t->endp
+            with @Invalid() => it
         }
     }
     wire hs_pid : Word[4] {
         it := match hs {
-            case @Valid(h) => h->pid
-            case @Invalid() => 0w4
+            with @Valid(h) => h->pid
+            with @Invalid() => 0w4
         }
     }
 
@@ -1342,11 +1342,11 @@ mod UsbTokenRouter {
     //> one clock later read from flip-flops.
     reg tok_v_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => match tk {
-                case @Valid(t) => t->crc_ok && (t->addr == dev_addr)
-                case @Invalid() => false
+                with @Valid(t) => t->crc_ok && (t->addr == dev_addr)
+                with @Invalid() => false
             }
         }
     }
@@ -1360,24 +1360,24 @@ mod UsbTokenRouter {
     //> serial; IN/OUT at endp 2w4 only feed ep2's NAK.
     outgoing reg ep0_tk_setup_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => tok_v_r && (tk_pid_r == 13w4) && (tk_endp_r == 0w4)
         }
     }
     //> 1-clock strobe: a valid IN token reached EP0 (endp 0).
     outgoing reg ep0_tk_in_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => tok_v_r && (tk_pid_r == 9w4) && (tk_endp_r == 0w4)
         }
     }
     //> 1-clock strobe: a valid OUT token reached EP0 (endp 0).
     outgoing reg ep0_tk_out_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => tok_v_r && (tk_pid_r == 1w4) && (tk_endp_r == 0w4)
         }
     }
@@ -1385,8 +1385,8 @@ mod UsbTokenRouter {
     //> (endp 1).
     outgoing reg ser_tk_in_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => tok_v_r && (tk_pid_r == 9w4) && (tk_endp_r == 1w4)
         }
     }
@@ -1394,8 +1394,8 @@ mod UsbTokenRouter {
     //> (endp 1).
     outgoing reg ser_tk_out_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => tok_v_r && (tk_pid_r == 1w4) && (tk_endp_r == 1w4)
         }
     }
@@ -1403,8 +1403,8 @@ mod UsbTokenRouter {
     //> (endp 2; the arbiter NAKs it).
     outgoing reg ep2_tk_in_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => tok_v_r && (tk_pid_r == 9w4) && (tk_endp_r == 2w4)
         }
     }
@@ -1412,8 +1412,8 @@ mod UsbTokenRouter {
     //> (endp 2; the arbiter NAKs it).
     outgoing reg ep2_tk_out_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => tok_v_r && (tk_pid_r == 1w4) && (tk_endp_r == 2w4)
         }
     }
@@ -1427,9 +1427,9 @@ mod UsbTokenRouter {
     //> re-evaluates it.
     reg last_out_ep0 : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case tok_v_r => (tk_pid_r == 1w4) && (tk_endp_r == 0w4)
+        it <= if {
+            when reset || bus_reset => false
+            when tok_v_r => (tk_pid_r == 1w4) && (tk_endp_r == 0w4)
             else => it
         }
     }
@@ -1449,8 +1449,8 @@ mod UsbTokenRouter {
     }
     wire ep0_dt_gate : Bit {
         it := match dt {
-            case @Valid(dontcare) => ep0_data_take
-            case @Invalid() => false
+            with @Valid(dontcare) => ep0_data_take
+            with @Invalid() => false
         }
     }
     //> 1-clock strobe: a data packet was routed to EP0 (registered
@@ -1458,29 +1458,29 @@ mod UsbTokenRouter {
     //> the delayed read is bit-identical).
     outgoing reg ep0_dt_valid_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => ep0_dt_gate
         }
     }
     //> Arrival-cycle strobe: a data packet was routed to the serial
     //> endpoint (its accept decision registers one clock later, so
     //> this stays unregistered).
-    outgoing ser_dt_valid : Bit {
+    outgoing ser_dt_valid : Bit dependson dt, ep0_busy, ep0_stalling, ser_busy {
         it := match dt {
-            case @Valid(dontcare) => ser_busy && !ep0_data_take
-            case @Invalid() => false
+            with @Valid(dontcare) => ser_busy && !ep0_data_take
+            with @Invalid() => false
         }
     }
 
     //> Handshake router: the module with a response in flight owns
     //> it.
-    outgoing ep0_hs_ack : Bit {
+    outgoing ep0_hs_ack : Bit dependson hs_valid, hs, ep0_wait_ack {
         it := hs_valid && (hs_pid == 2w4) && ep0_wait_ack
     }
     //> 1-clock pulse: an ACK handshake was routed to the serial
     //> endpoint.
-    outgoing ser_hs_ack : Bit {
+    outgoing ser_hs_ack : Bit dependson hs_valid, hs, ep0_wait_ack, ser_ack_wait {
         it := hs_valid && (hs_pid == 2w4) && !ep0_wait_ack && ser_ack_wait
     }
 }
@@ -1524,8 +1524,8 @@ mod UsbArbiter {
     //> every token gets a NAK.
     reg ep2_nak_req : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
+        it <= if {
+            when reset => false
             else => ep2_tk_in || ep2_tk_out
         }
     }
@@ -1540,31 +1540,31 @@ mod UsbArbiter {
     //> (ep2 is the registered NAK, the else arm of the start mux).
     outgoing reg tx_owner : Word[2] on clock {
         initial it <= 0w2
-        it <= when {
-            case reset => 0w2
-            case tx_start => when {
-                case ep0_req => 1w2
-                case ser_req => 2w2
+        it <= if {
+            when reset => 0w2
+            when tx_start if {
+                when ep0_req => 1w2
+                when ser_req => 2w2
                 else         => 3w2
             }
-            case tx_done => 0w2
+            when tx_done => 0w2
             else => it
         }
     }
     //> The tx arm record: the strobe (@Valid) plus the response the
     //> tx engine launches (EP2 always NAKs: pid 10w4, len 0).  The
     //> same strobe+payload idiom as the RX-side tk/dt records.
-    outgoing tx_arm : Valid[phy::TxRec] {
-        it := when {
-            case tx_start => @Valid(${
-                pid = when {
-                    case ep0_req => ep0_pid
-                    case ser_req => ser_pid
+    outgoing tx_arm : Valid[phy::TxRec] dependson ep0_req, ep0_pid, ep0_len, ser_req, ser_pid, ser_len {
+        it := if {
+            when tx_start => @Valid(${
+                pid = if {
+                    when ep0_req => ep0_pid
+                    when ser_req => ser_pid
                     else         => 10w4
                 },
-                len = when {
-                    case ep0_req => ep0_len
-                    case ser_req => ser_len
+                len = if {
+                    when ep0_req => ep0_len
+                    when ser_req => ser_len
                     else         => 0w7
                 },
             })
@@ -1611,16 +1611,16 @@ mod UsbSnapshotLoader {
     //> The arm record's @Valid tag (the strobe).
     wire tx_arm_valid : Bit {
         it := match tx_arm {
-            case @Valid(dontcare) => true
-            case @Invalid()       => false
+            with @Valid(dontcare) => true
+            with @Invalid()       => false
         }
     }
     //> The armed packet's length (don't-care off the arm; consumed
     //> only under arm_fresh).
     wire tx_len : Word[7] {
         it := match tx_arm {
-            case @Valid(rec) => rec->len
-            case @Invalid()  => 0w7
+            with @Valid(rec) => rec->len
+            with @Invalid()  => 0w7
         }
     }
 
@@ -1633,20 +1633,20 @@ mod UsbSnapshotLoader {
     //> the tx FIFO banner for why the pop decision is registered).
     outgoing reg load_run : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case arm_fresh => tx_len != 0w7
-            case it        => any(rem[7..1])
+        it <= if {
+            when reset || bus_reset => false
+            when arm_fresh => tx_len != 0w7
+            when it        => any(rem[7..1])
             else => it
         }
     }
     //> The snapshot write index.
     reg li : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case arm_fresh => 0w7
-            case load_run => it + 1w7
+        it <= if {
+            when reset || bus_reset => 0w7
+            when arm_fresh => 0w7
+            when load_run => it + 1w7
             else => it
         }
     }
@@ -1654,10 +1654,10 @@ mod UsbSnapshotLoader {
     //> load_run's D).
     reg rem : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case arm_fresh => tx_len
-            case load_run => it - 1w7
+        it <= if {
+            when reset || bus_reset => 0w7
+            when arm_fresh => tx_len
+            when load_run => it - 1w7
             else => it
         }
     }
@@ -1722,8 +1722,8 @@ mod UsbByteStream {
     //> flat dt_len port's reset value 0).
     wire dt : DataRec {
         it := match dat {
-            case @Valid(d) => d
-            case @Invalid() => ${
+            with @Valid(d) => d
+            with @Invalid() => ${
                 pid = 0w4,
                 len = 0w7,
                 crc_ok = false,
@@ -1787,15 +1787,15 @@ mod UsbByteStream {
     //> strobe).
     wire tx_push : Bit {
         it := match tx.data {
-            case @Valid(dontcare) => true
-            case @Invalid()       => false
+            with @Valid(dontcare) => true
+            with @Invalid()       => false
         }
     }
     //> The payload byte (only read on a push cycle).
     wire tx_byte : Word[8] {
         it := match tx.data {
-            case @Valid(b) => b
-            case @Invalid() => 0w8
+            with @Valid(b) => b
+            with @Invalid() => 0w8
         }
     }
     //> The REGISTERED txfifo write gate (see the banner).
@@ -1809,8 +1809,8 @@ mod UsbByteStream {
     //> payload's bits are not held past the push cycle).
     reg tx_byte_d : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case tx_push => tx_byte
+        it <= if {
+            when tx_push => tx_byte
             else         => it
         }
     }
@@ -1844,8 +1844,8 @@ mod UsbByteStream {
     //> empty/full decode off the single-cycle paths.
     reg rx_pop_d : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             // Pop while the rx FIFO has a byte, the tx FIFO keeps
             // 3-stage-pipe headroom (cnt <= 12: 16 deep - 3 in flight
             // - 1 margin, so a landing push never meets a full txfifo
@@ -1863,8 +1863,8 @@ mod UsbByteStream {
     }
     reg rx_valid_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => rx_pop_d
         }
     }
@@ -1872,8 +1872,8 @@ mod UsbByteStream {
     //> rx_pop_d).  NO reset: holds.
     reg rx_data : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset || bus_reset => it
+        it <= if {
+            when reset || bus_reset => it
             else => rxfifo.rd_data
         }
     }
@@ -1881,16 +1881,16 @@ mod UsbByteStream {
     //> consumer latches the byte on it.
     reg rx_valid : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => rx_valid_r
         }
     }
     //> The client socket's payload: the popped byte rides @Valid for
     //> exactly the rx_valid strobe cycle.
     wire rx_payload : Valid[Word[8]] {
-        it := when {
-            case rx_valid => @Valid(rx_data)
+        it := if {
+            when rx_valid => @Valid(rx_data)
             else          => @Invalid()
         }
     }
@@ -1914,17 +1914,17 @@ mod UsbByteStream {
     //> cycle; that read is discarded -- run_d is 0 by then).
     reg rx_push_run : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case ser_accept => (dt_len != 0w7) && !rxfifo.full
-            case it         => any(push_rem[7..1])
+        it <= if {
+            when reset || bus_reset => false
+            when ser_accept => (dt_len != 0w7) && !rxfifo.full
+            when it         => any(push_rem[7..1])
             else => it
         }
     }
     reg rx_push_run_d : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => rx_push_run
         }
     }
@@ -1932,19 +1932,19 @@ mod UsbByteStream {
     //> accepted payload out through the RAM's registered read port.
     outgoing reg push_i : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case ser_accept => 0w7
-            case rx_push_run => it + 1w7
+        it <= if {
+            when reset || bus_reset => 0w7
+            when ser_accept => 0w7
+            when rx_push_run => it + 1w7
             else => it
         }
     }
     reg push_rem : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case ser_accept => dt_len
-            case rx_push_run => it - 1w7
+        it <= if {
+            when reset || bus_reset => 0w7
+            when ser_accept => dt_len
+            when rx_push_run => it - 1w7
             else => it
         }
     }
@@ -1958,7 +1958,7 @@ mod UsbByteStream {
     //> True when the accepted packet's payload (dt_len) fits the rx
     //> FIFO's free slots (combinational; serial registers the accept
     //> decision off this).
-    outgoing rx_room_ok : Bit {
+    outgoing rx_room_ok : Bit dependson dat {
         it := rx_sum <= 64w8
     }
 
@@ -1969,17 +1969,17 @@ mod UsbByteStream {
     //> USB engine path, NO reset (power-on zero, count down to rest).
     reg rx_led_count : Word[23] on clock {
         initial it <= 0w23
-        it <= when {
-            case rx_valid    => 0x7f_ffffw23
-            case it != 0w23  => it - 1w23
+        it <= if {
+            when rx_valid    => 0x7f_ffffw23
+            when it != 0w23  => it - 1w23
             else => it
         }
     }
     reg tx_led_count : Word[23] on clock {
         initial it <= 0w23
-        it <= when {
-            case tx_push     => 0x7f_ffffw23
-            case it != 0w23  => it - 1w23
+        it <= if {
+            when tx_push     => 0x7f_ffffw23
+            when it != 0w23  => it - 1w23
             else => it
         }
     }
@@ -2180,8 +2180,8 @@ mod UsbUart {
     //> reconfigured).
     reg configured_d : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset => false
+        it <= if {
+            when reset => false
             else => ep0.configured
         }
     }
@@ -2203,11 +2203,11 @@ mod UsbUart {
     //> EP0 ROM page start by descriptor select.
     wire rom_page : Word[8] {
         it := match ep0.resp_sel {
-            case 0w3 => 0w8
-            case 1w3 => 18w8
-            case 2w3 => 93w8
-            case 3w3 => 97w8
-            case 4w3 => 107w8
+            with 0w3 => 0w8
+            with 1w3 => 18w8
+            with 2w3 => 93w8
+            with 3w3 => 97w8
+            with 4w3 => 107w8
             else => 0w8
         }
     }
@@ -2215,9 +2215,9 @@ mod UsbUart {
     //> latched at arm.  Reset by reset ONLY, not usbphy.bus_reset.
     reg rom_base_r : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case reset => 0w8
-            case ep0.resp_req => rom_page + ep0.resp_base[8..0]
+        it <= if {
+            when reset => 0w8
+            when ep0.resp_req => rom_page + ep0.resp_base[8..0]
             else => it
         }
     }
@@ -2235,9 +2235,9 @@ mod UsbUart {
     //> comes from the snapshot RAM; GET_STATUS (sel 6) reads as zero
     //> bytes; everything else reads the descriptor ROM.
     wire tx_byte : Word[8] {
-        it := when {
-            case arbiter.tx_owner == 2w2 => loader.snap_rd
-            case ep0.resp_sel == 6w3 => 0w8
+        it := if {
+            when arbiter.tx_owner == 2w2 => loader.snap_rd
+            when ep0.resp_sel == 6w3 => 0w8
             else => descrom.rd
         }
     }

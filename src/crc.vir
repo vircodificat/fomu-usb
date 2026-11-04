@@ -28,9 +28,9 @@ pub mod Crc5 {
     //> seeds to 0x1F.
     outgoing reg crc : Word[5] on clock {
         initial it <= 31w5
-        it <= when {
-            case reset => 31w5
-            case advance => word(it[4..0], inv) ^ word(0w2, inv, 0w2)
+        it <= if {
+            when reset => 31w5
+            when advance => word(it[4..0], inv) ^ word(0w2, inv, 0w2)
             else     => it
         }
     }
@@ -66,9 +66,9 @@ pub mod Crc16 {
     //> seeds to 0xFFFF.
     outgoing reg crc : Word[16] on clock {
         initial it <= 65535w16
-        it <= when {
-            case reset => 65535w16
-            case adv => word(it[15..0], inv) ^ word(inv, 0w12, inv, 0w2)
+        it <= if {
+            when reset => 65535w16
+            when adv => word(it[15..0], inv) ^ word(inv, 0w12, inv, 0w2)
             else     => it
         }
     }

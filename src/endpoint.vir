@@ -134,38 +134,38 @@ pub mod Ep0 {
     //> sel / base are consumed while the packet streams).
     outgoing reg resp_req : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case tk_setup => false
-            case (st == #RcvReq) && decode.req_acc_r => true
-            case (st == #Send) && tk_in => true
-            case (st == #StatusI) && tk_in => true
-            case (st == #StatusO) && decode.sto_acc_r => true
-            case (st == #Stall) && (dt_valid || tk_in) => true
+        it <= if {
+            when reset || bus_reset => false
+            when tk_setup => false
+            when (st == #RcvReq) && decode.req_acc_r => true
+            when (st == #Send) && tk_in => true
+            when (st == #StatusI) && tk_in => true
+            when (st == #StatusO) && decode.sto_acc_r => true
+            when (st == #Stall) && (dt_valid || tk_in) => true
             else => false
         }
     }
     //> Response PID: ACK 2, DATA0 3, DATA1 B, STALL E.
     outgoing reg resp_pid : Word[4] on clock {
         initial it <= 0w4
-        it <= when {
-            case (st == #RcvReq) && decode.req_acc_r => 2w4
-            case (st == #Send) && tk_in => mux(send.tog, 11w4, 3w4)
-            case (st == #StatusI) && tk_in => 11w4
-            case (st == #StatusO) && decode.sto_acc_r => 2w4
-            case (st == #Stall) && (dt_valid || tk_in) => 14w4
+        it <= if {
+            when (st == #RcvReq) && decode.req_acc_r => 2w4
+            when (st == #Send) && tk_in => mux(send.tog, 11w4, 3w4)
+            when (st == #StatusI) && tk_in => 11w4
+            when (st == #StatusO) && decode.sto_acc_r => 2w4
+            when (st == #Stall) && (dt_valid || tk_in) => 14w4
             else => it
         }
     }
     //> Response payload byte count (0 for ACK / STALL / ZLP).
     outgoing reg resp_len : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case (st == #RcvReq) && decode.req_acc_r => 0w7
-            case (st == #Send) && tk_in => mux(send.remain > 64w7, 64w7, send.remain)
-            case (st == #StatusI) && tk_in => 0w7
-            case (st == #StatusO) && decode.sto_acc_r => 0w7
-            case (st == #Stall) && (dt_valid || tk_in) => 0w7
+        it <= if {
+            when (st == #RcvReq) && decode.req_acc_r => 0w7
+            when (st == #Send) && tk_in => mux(send.remain > 64w7, 64w7, send.remain)
+            when (st == #StatusI) && tk_in => 0w7
+            when (st == #StatusO) && decode.sto_acc_r => 0w7
+            when (st == #Stall) && (dt_valid || tk_in) => 0w7
             else => it
         }
     }
@@ -173,20 +173,20 @@ pub mod Ep0 {
     //> 2/3/4 strings, 6 status).
     outgoing reg resp_sel : Word[3] on clock {
         initial it <= 0w3
-        it <= when {
-            case (st == #RcvReq) && decode.req_acc_r => 0w3
-            case (st == #Send) && tk_in => send.sel
-            case (st == #StatusI) && tk_in => 0w3
+        it <= if {
+            when (st == #RcvReq) && decode.req_acc_r => 0w3
+            when (st == #Send) && tk_in => send.sel
+            when (st == #StatusI) && tk_in => 0w3
             else => it
         }
     }
     //> Descriptor byte offset the response starts at.
     outgoing reg resp_base : Word[10] on clock {
         initial it <= 0w10
-        it <= when {
-            case (st == #RcvReq) && decode.req_acc_r => 0w10
-            case (st == #Send) && tk_in => send.base
-            case (st == #StatusI) && tk_in => 0w10
+        it <= if {
+            when (st == #RcvReq) && decode.req_acc_r => 0w10
+            when (st == #Send) && tk_in => send.base
+            when (st == #StatusI) && tk_in => 0w10
             else => it
         }
     }
@@ -197,22 +197,22 @@ pub mod Ep0 {
     //> transfer's status completion (pend_addr / pend_cfg tags).
     outgoing reg dev_addr : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case (st == #WaitAck) && hs_ack && send.send_zlp_r && decode.pend_addr
+        it <= if {
+            when reset || bus_reset => 0w7
+            when (st == #WaitAck) && hs_ack && send.send_zlp_r && decode.pend_addr
                 => decode.addr_pending
-            case (st == #StatusO) && decode.sto_acc_r && decode.pend_addr => decode.addr_pending
+            when (st == #StatusO) && decode.sto_acc_r && decode.pend_addr => decode.addr_pending
             else => it
         }
     }
     //> Configuration state (SET_CONFIGURATION(1) status completion).
     outgoing reg configured : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case (st == #WaitAck) && hs_ack && send.send_zlp_r && decode.pend_cfg
+        it <= if {
+            when reset || bus_reset => false
+            when (st == #WaitAck) && hs_ack && send.send_zlp_r && decode.pend_cfg
                 => decode.cfg_pending
-            case (st == #StatusO) && decode.sto_acc_r && decode.pend_cfg => decode.cfg_pending
+            when (st == #StatusO) && decode.sto_acc_r && decode.pend_cfg => decode.cfg_pending
             else => it
         }
     }
@@ -241,34 +241,34 @@ pub mod Ep0 {
     //> re-initializing the toggle), then the state cases.
     reg st : Ep0State on clock {
         initial it <= #Idle
-        it <= when {
-            case reset || bus_reset => #Idle
-            case tk_setup => #RcvReq
-            case it == #RcvReq => mux(decode.req_acc_r, #Parse, it)
-            case it == #Parse  => #Setup
-            case it == #Setup  => #Arm
-            case it == #Arm => when {
+        it <= if {
+            when reset || bus_reset => #Idle
+            when tk_setup => #RcvReq
+            when it == #RcvReq => mux(decode.req_acc_r, #Parse, it)
+            when it == #Parse  => #Setup
+            when it == #Setup  => #Arm
+            when it == #Arm if {
                 // no-data control write: straight to the status IN
-                case decode.p_action == 1w3 => #StatusI
+                when decode.p_action == 1w3 => #StatusI
                 // GET_STATUS: wLength 0 is a read whose status stage
                 // is OUT; else a (<= 2 byte) data stage
-                case decode.p_action == 2w3 => mux(decode.p_wlen0, #StatusO, #Send)
+                when decode.p_action == 2w3 => mux(decode.p_wlen0, #StatusO, #Send)
                 // GET_DESCRIPTOR: ditto, direction-dependent
-                case decode.p_action == 3w3 => mux(decode.p_wlen0,
+                when decode.p_action == 3w3 => mux(decode.p_wlen0,
                     mux(decode.p_desc_in, #StatusO, #StatusI), #Send)
                 else => #Stall
             }
-            case it == #Send => mux(tk_in, #WaitAck, it)
-            case it == #WaitAck => when {
-                case hs_ack => mux(send.send_zlp_r, #Idle,
+            when it == #Send => mux(tk_in, #WaitAck, it)
+            when it == #WaitAck if {
+                when hs_ack => mux(send.send_zlp_r, #Idle,
                     mux(send.last_r, #StatusO, #Send))
                 // host retried the IN token (no ACK seen): re-arm the
                 // same packet (base/remain/tog unchanged)
-                case tk_in => mux(send.send_zlp_r, #StatusI, #Send)
+                when tk_in => mux(send.send_zlp_r, #StatusI, #Send)
                 else => it
             }
-            case it == #StatusI => mux(tk_in, #WaitAck, it)
-            case it == #StatusO => mux(decode.sto_acc_r, #Idle, it)
+            when it == #StatusI => mux(tk_in, #WaitAck, it)
+            when it == #StatusO => mux(decode.sto_acc_r, #Idle, it)
             else => it
         }
     }
@@ -312,8 +312,8 @@ mod Ep0ReqDecode {
     //> reproduces the flat-port reset values).
     wire dt : usb::DataRec {
         it := match dat {
-            case @Valid(d) => d
-            case @Invalid() => ${
+            with @Valid(d) => d
+            with @Invalid() => ${
                 pid = 0w4,
                 len = 0w7,
                 crc_ok = false,
@@ -343,12 +343,12 @@ mod Ep0ReqDecode {
     //> off the REGISTERED request bytes.
     wire new_sel : Word[3] {
         it := match rq3 {
-            case 0x01w8 => 0w3
-            case 0x02w8 => 1w3
-            case 0x03w8 => match rq2 {
-                case 0x00w8 => 2w3
-                case 0x01w8 => 3w3
-                case 0x02w8 => 4w3
+            with 0x01w8 => 0w3
+            with 0x02w8 => 1w3
+            with 0x03w8 match rq2 {
+                with 0x00w8 => 2w3
+                with 0x01w8 => 3w3
+                with 0x02w8 => 4w3
                 else        => 7w3
             }
             else => 7w3
@@ -358,11 +358,11 @@ mod Ep0ReqDecode {
     //> sel 0=device 1=config 2=str0 3=str1 4=str2 6=status.
     wire dlen : Word[7] {
         it := match p_sel {
-            case 0w3 => 18w7
-            case 1w3 => 75w7
-            case 2w3 => 4w7
-            case 3w3 => 10w7
-            case 4w3 => 32w7
+            with 0w3 => 18w7
+            with 1w3 => 75w7
+            with 2w3 => 4w7
+            with 3w3 => 10w7
+            with 4w3 => 32w7
             else     => 2w7
         }
     }
@@ -378,8 +378,8 @@ mod Ep0ReqDecode {
     //> SETUP request packet accepted (DATA0, 8 bytes, good CRC).
     outgoing reg req_acc_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => (st == #RcvReq) && dt_valid
                 && (dt_pid == 3w4) && dt_crc_ok && (dt_len == 8w7)
         }
@@ -388,8 +388,8 @@ mod Ep0ReqDecode {
     //> sending DATA0 here are taken).
     outgoing reg sto_acc_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
+        it <= if {
+            when reset || bus_reset => false
             else => (st == #StatusO) && dt_valid
                 && (dt_len == 0w7) && dt_crc_ok
         }
@@ -399,16 +399,16 @@ mod Ep0ReqDecode {
     //> bmRequestType.
     reg rq0 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case (st == #RcvReq) && req_acc_r => dt_head[8..0]
+        it <= if {
+            when (st == #RcvReq) && req_acc_r => dt_head[8..0]
             else => it
         }
     }
     //> bRequest.
     reg rq1 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case (st == #RcvReq) && req_acc_r => dt_head[16..8]
+        it <= if {
+            when (st == #RcvReq) && req_acc_r => dt_head[16..8]
             else => it
         }
     }
@@ -416,32 +416,32 @@ mod Ep0ReqDecode {
     //> GET_DESCRIPTOR string index).
     reg rq2 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case (st == #RcvReq) && req_acc_r => dt_head[24..16]
+        it <= if {
+            when (st == #RcvReq) && req_acc_r => dt_head[24..16]
             else => it
         }
     }
     //> wValue high (descriptor type: 1 device, 2 config, 3 string).
     reg rq3 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case (st == #RcvReq) && req_acc_r => dt_head[32..24]
+        it <= if {
+            when (st == #RcvReq) && req_acc_r => dt_head[32..24]
             else => it
         }
     }
     //> wLength high.  (rq4/rq5 = wIndex are never needed and not kept.)
     reg rq6 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case (st == #RcvReq) && req_acc_r => dt_head[56..48]
+        it <= if {
+            when (st == #RcvReq) && req_acc_r => dt_head[56..48]
             else => it
         }
     }
     //> wLength low.
     reg rq7 : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case (st == #RcvReq) && req_acc_r => dt_head[64..56]
+        it <= if {
+            when (st == #RcvReq) && req_acc_r => dt_head[64..56]
             else => it
         }
     }
@@ -455,16 +455,16 @@ mod Ep0ReqDecode {
     //> Decoded descriptor select.
     outgoing reg p_sel : Word[3] on clock {
         initial it <= 0w3
-        it <= when {
-            case st == #Parse => new_sel
+        it <= if {
+            when st == #Parse => new_sel
             else => it
         }
     }
     //> Raw wLength as parsed.
     outgoing reg p_wlen : Word[16] on clock {
         initial it <= 0w16
-        it <= when {
-            case st == #Parse => word(rq7, rq6)
+        it <= if {
+            when st == #Parse => word(rq7, rq6)
             else => it
         }
     }
@@ -473,32 +473,32 @@ mod Ep0ReqDecode {
     //> action).
     reg p_is_desc : Bit on clock {
         initial it <= false
-        it <= when {
-            case st == #Parse => (rq1 == 0x06w8) && (new_sel != 7w3)
+        it <= if {
+            when st == #Parse => (rq1 == 0x06w8) && (new_sel != 7w3)
             else => it
         }
     }
     //> GET_STATUS (device).
     reg p_is_get_status : Bit on clock {
         initial it <= false
-        it <= when {
-            case st == #Parse => (rq1 == 0w8) && (rq0 == 0x80w8)
+        it <= if {
+            when st == #Parse => (rq1 == 0w8) && (rq0 == 0x80w8)
             else => it
         }
     }
     //> SET_ADDRESS.
     reg p_is_set_addr : Bit on clock {
         initial it <= false
-        it <= when {
-            case st == #Parse => rq1 == 0x05w8
+        it <= if {
+            when st == #Parse => rq1 == 0x05w8
             else => it
         }
     }
     //> SET_CONFIGURATION (value 0 or 1).
     reg p_is_set_cfg : Bit on clock {
         initial it <= false
-        it <= when {
-            case st == #Parse => (rq1 == 0x09w8)
+        it <= if {
+            when st == #Parse => (rq1 == 0x09w8)
                 && ((rq2 == 0x01w8) || (rq2 == 0w8))
             else => it
         }
@@ -506,16 +506,16 @@ mod Ep0ReqDecode {
     //> SET_CONTROL_LINE_STATE.
     reg p_is_cls : Bit on clock {
         initial it <= false
-        it <= when {
-            case st == #Parse => (rq1 == 0x22w8) && (rq0 == 0x21w8)
+        it <= if {
+            when st == #Parse => (rq1 == 0x22w8) && (rq0 == 0x21w8)
             else => it
         }
     }
     //> Decoded request is supported at all.
     reg p_valid : Bit on clock {
         initial it <= false
-        it <= when {
-            case st == #Parse => ((rq1 == 0x06w8) && (new_sel != 7w3))
+        it <= if {
+            when st == #Parse => ((rq1 == 0x06w8) && (new_sel != 7w3))
                 || ((rq1 == 0w8) && (rq0 == 0x80w8))
                 || (rq1 == 0x05w8)
                 || ((rq1 == 0x09w8) && ((rq2 == 0x01w8) || (rq2 == 0w8)))
@@ -532,36 +532,36 @@ mod Ep0ReqDecode {
     //> SET_ADDRESS value, applied at this transfer's status completion.
     outgoing reg addr_pending : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case st == #Parse => rq2[7..0]
+        it <= if {
+            when reset || bus_reset => 0w7
+            when st == #Parse => rq2[7..0]
             else => it
         }
     }
     //> SET_CONFIGURATION value.
     outgoing reg cfg_pending : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case st == #Parse => rq2 == 0x01w8
+        it <= if {
+            when reset || bus_reset => false
+            when st == #Parse => rq2 == 0x01w8
             else => it
         }
     }
     //> This transfer IS a SET_ADDRESS.
     outgoing reg pend_addr : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case st == #Parse => rq1 == 0x05w8
+        it <= if {
+            when reset || bus_reset => false
+            when st == #Parse => rq1 == 0x05w8
             else => it
         }
     }
     //> This transfer IS a SET_CONFIGURATION.
     outgoing reg pend_cfg : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case st == #Parse => (rq1 == 0x09w8)
+        it <= if {
+            when reset || bus_reset => false
+            when st == #Parse => (rq1 == 0x09w8)
                 && ((rq2 == 0x01w8) || (rq2 == 0w8))
             else => it
         }
@@ -575,12 +575,12 @@ mod Ep0ReqDecode {
     //> clock enables.
     outgoing reg p_action : Word[3] on clock {
         initial it <= 0w3
-        it <= when {
-            case reset || bus_reset => 0w3
-            case st == #Setup => when {
-                case !p_valid => 0w3
-                case p_is_set_addr || p_is_set_cfg || p_is_cls => 1w3
-                case p_is_get_status => 2w3
+        it <= if {
+            when reset || bus_reset => 0w3
+            when st == #Setup if {
+                when !p_valid => 0w3
+                when p_is_set_addr || p_is_set_cfg || p_is_cls => 1w3
+                when p_is_get_status => 2w3
                 else => 3w3
             }
             else => it
@@ -589,9 +589,9 @@ mod Ep0ReqDecode {
     //> Request wLength == 0.
     outgoing reg p_wlen0 : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case st == #Setup => w_length == 0w16
+        it <= if {
+            when reset || bus_reset => false
+            when st == #Setup => w_length == 0w16
             else => it
         }
     }
@@ -599,9 +599,9 @@ mod Ep0ReqDecode {
     //> versa) -- rq0[7].
     outgoing reg p_desc_in : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case st == #Setup => rq0[7]
+        it <= if {
+            when reset || bus_reset => false
+            when st == #Setup => rq0[7]
             else => it
         }
     }
@@ -612,10 +612,10 @@ mod Ep0ReqDecode {
     //> length wins outright.
     outgoing reg p_dremain_r : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case st == #Setup => when {
-                case any(p_wlen[15..7]) => dlen
-                case p_wlen[7..0] < dlen => p_wlen[7..0]
+        it <= if {
+            when st == #Setup if {
+                when any(p_wlen[15..7]) => dlen
+                when p_wlen[7..0] < dlen => p_wlen[7..0]
                 else => dlen
             }
             else => it
@@ -660,14 +660,14 @@ mod Ep0SendEngine {
     //> stage of a control read, toggled per accepted data packet.
     outgoing reg tog : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case tk_setup => false
+        it <= if {
+            when reset || bus_reset => false
+            when tk_setup => false
             // data stage armed (GET_STATUS / GET_DESCRIPTOR): the
             // first device data packet is DATA1
-            case (st == #Arm) && ((p_action == 2w3) || (p_action == 3w3)) => true
+            when (st == #Arm) && ((p_action == 2w3) || (p_action == 3w3)) => true
             // data packet accepted: advance the toggle
-            case (st == #WaitAck) && hs_ack && !send_zlp_r => !it
+            when (st == #WaitAck) && hs_ack && !send_zlp_r => !it
             else => it
         }
     }
@@ -675,16 +675,16 @@ mod Ep0SendEngine {
     //> Data stage bytes left to send.
     outgoing reg remain : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
+        it <= if {
+            when reset || bus_reset => 0w7
             // GET_STATUS: at most 2 bytes
-            case (st == #Arm) && (p_action == 2w3) && !p_wlen0
+            when (st == #Arm) && (p_action == 2w3) && !p_wlen0
                 => mux(p_wlen[7..0] > 2w7, 2w7, p_wlen[7..0])
             // GET_DESCRIPTOR: the precomputed min(wLength, dlen)
-            case (st == #Arm) && (p_action == 3w3) && !p_wlen0
+            when (st == #Arm) && (p_action == 3w3) && !p_wlen0
                 => p_dremain_r
             // data packet accepted: consume its bytes
-            case (st == #WaitAck) && hs_ack && !send_zlp_r => it - send_len
+            when (st == #WaitAck) && hs_ack && !send_zlp_r => it - send_len
             else => it
         }
     }
@@ -692,10 +692,10 @@ mod Ep0SendEngine {
     //> Bytes in the in-flight packet.
     outgoing reg send_len : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset || bus_reset => 0w7
-            case (st == #Send) && tk_in => mux(remain > 64w7, 64w7, remain)
-            case (st == #StatusI) && tk_in => 0w7
+        it <= if {
+            when reset || bus_reset => 0w7
+            when (st == #Send) && tk_in => mux(remain > 64w7, 64w7, remain)
+            when (st == #StatusI) && tk_in => 0w7
             else => it
         }
     }
@@ -704,13 +704,13 @@ mod Ep0SendEngine {
     //> ROM byte usb::TxPhy pulls).
     outgoing reg base : Word[10] on clock {
         initial it <= 0w10
-        it <= when {
-            case reset || bus_reset => 0w10
-            case tk_setup => 0w10
-            case (st == #Arm) && ((p_action == 2w3) || (p_action == 3w3))
+        it <= if {
+            when reset || bus_reset => 0w10
+            when tk_setup => 0w10
+            when (st == #Arm) && ((p_action == 2w3) || (p_action == 3w3))
                 && !p_wlen0 => 0w10
             // data packet accepted: advance by the accepted length
-            case (st == #WaitAck) && hs_ack && !send_zlp_r
+            when (st == #WaitAck) && hs_ack && !send_zlp_r
                 => it + word(0w3, send_len)
             else => it
         }
@@ -719,10 +719,10 @@ mod Ep0SendEngine {
     //> Current descriptor select.
     outgoing reg sel : Word[3] on clock {
         initial it <= 0w3
-        it <= when {
-            case reset || bus_reset => 0w3
-            case (st == #Arm) && (p_action == 2w3) => 6w3
-            case (st == #Arm) && (p_action == 3w3) => p_sel
+        it <= if {
+            when reset || bus_reset => 0w3
+            when (st == #Arm) && (p_action == 2w3) => 6w3
+            when (st == #Arm) && (p_action == 3w3) => p_sel
             else => it
         }
     }
@@ -733,19 +733,19 @@ mod Ep0SendEngine {
     //> (len 0).  last_r: armed packet completes the data stage.
     outgoing reg send_zlp_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case (st == #Send) && tk_in => remain == 0w7
-            case (st == #StatusI) && tk_in => true
+        it <= if {
+            when reset || bus_reset => false
+            when (st == #Send) && tk_in => remain == 0w7
+            when (st == #StatusI) && tk_in => true
             else => it
         }
     }
     outgoing reg last_r : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset => false
-            case (st == #Send) && tk_in => remain < 65w7
-            case (st == #StatusI) && tk_in => false
+        it <= if {
+            when reset || bus_reset => false
+            when (st == #Send) && tk_in => remain < 65w7
+            when (st == #StatusI) && tk_in => false
             else => it
         }
     }
@@ -846,25 +846,25 @@ pub mod Serial {
     //> token arm.
     outgoing reg resp_req : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset || set_cfg => false
-            case outdata.dt_acc => true
-            case outdata.dt_rej => true
-            case tk_in  => true
+        it <= if {
+            when reset || bus_reset || set_cfg => false
+            when outdata.dt_acc => true
+            when outdata.dt_rej => true
+            when tk_in  => true
             else => false
         }
     }
     //> Response PID: DATA0 3 / DATA1 B / ACK 2 / NAK A.
     outgoing reg resp_pid : Word[4] on clock {
         initial it <= 0w4
-        it <= when {
-            case outdata.dt_acc => 2w4
-            case outdata.dt_rej => 10w4
-            case tk_in => when {
+        it <= if {
+            when outdata.dt_acc => 2w4
+            when outdata.dt_rej => 10w4
+            when tk_in if {
                 // retransmit the unacknowledged packet, same pid
-                case indata.ser_ack_wait   => mux(indata.tog_tx, 11w4, 3w4)
+                when indata.ser_ack_wait   => mux(indata.tog_tx, 11w4, 3w4)
                 // arm a new packet from the tx FIFO
-                case !txfifo_empty => mux(indata.tog_tx, 11w4, 3w4)
+                when !txfifo_empty => mux(indata.tog_tx, 11w4, 3w4)
                 // nothing to send
                 else => 10w4
             }
@@ -876,12 +876,12 @@ pub mod Serial {
     //> retransmit, min(count,64) on a fresh arm, 0 for ACK/NAK.
     outgoing reg resp_len : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case outdata.dt_acc => 0w7
-            case outdata.dt_rej => 0w7
-            case tk_in => when {
-                case indata.ser_ack_wait   => indata.pkt_len
-                case !txfifo_empty => indata.load_len
+        it <= if {
+            when outdata.dt_acc => 0w7
+            when outdata.dt_rej => 0w7
+            when tk_in if {
+                when indata.ser_ack_wait   => indata.pkt_len
+                when !txfifo_empty => indata.load_len
                 else => 0w7
             }
             else => it
@@ -895,9 +895,9 @@ pub mod Serial {
     //> alongside a resp_req pulse.
     outgoing reg resp_fresh : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset || set_cfg => it
-            case indata.arm_new => true
+        it <= if {
+            when reset || bus_reset || set_cfg => it
+            when indata.arm_new => true
             else => false
         }
     }
@@ -907,10 +907,10 @@ pub mod Serial {
     //> (dt_acc/dt_rej).
     outgoing reg ser_busy : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset || set_cfg => false
-            case it && dt_valid => false
-            case tk_out => true
+        it <= if {
+            when reset || bus_reset || set_cfg => false
+            when it && dt_valid => false
+            when tk_out => true
             else => it
         }
     }
@@ -966,8 +966,8 @@ mod SerialOutData {
     //> reproduces the flat-port reset values).
     wire dt : usb::DataRec {
         it := match dat {
-            case @Valid(d) => d
-            case @Invalid() => ${
+            with @Valid(d) => d
+            with @Invalid() => ${
                 pid = 0w4,
                 len = 0w7,
                 crc_ok = false,
@@ -988,9 +988,9 @@ mod SerialOutData {
     //> Toggled per accepted OUT packet.
     reg tog_rx : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset || set_cfg => false
-            case dt_acc => !it
+        it <= if {
+            when reset || bus_reset || set_cfg => false
+            when dt_acc => !it
             else => it
         }
     }
@@ -998,8 +998,8 @@ mod SerialOutData {
     //> FIFO (one clock after the data packet strobe).
     outgoing reg dt_acc : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset || set_cfg => false
+        it <= if {
+            when reset || bus_reset || set_cfg => false
             else => ser_busy && dt_valid && dt_crc_ok
                 && (dt_pid == exp_pid) && rx_room
         }
@@ -1007,8 +1007,8 @@ mod SerialOutData {
     //> Registered reject: anything else that arrives armed.
     outgoing reg dt_rej : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset || set_cfg => false
+        it <= if {
+            when reset || bus_reset || set_cfg => false
             else => ser_busy && dt_valid
                 && !(dt_crc_ok && (dt_pid == exp_pid) && rx_room)
         }
@@ -1053,11 +1053,11 @@ mod SerialInData {
         it := mux(txfifo_count > 64w7, 64w7, txfifo_count)
     }
     //> Forwarded to the response registers in endpoint::Serial.
-    outgoing arm_new : Bit {
+    outgoing arm_new : Bit dependson tk_in, txfifo_empty {
         it := arm_new_i
     }
     //> Forwarded to the response registers in endpoint::Serial.
-    outgoing load_len : Word[7] {
+    outgoing load_len : Word[7] dependson txfifo_count {
         it := load_len_i
     }
 
@@ -1065,18 +1065,18 @@ mod SerialInData {
     //> Toggled by the ACK of our in-flight packet.
     outgoing reg tog_tx : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset || set_cfg => false
-            case hs_ack && ser_ack_wait => !it
+        it <= if {
+            when reset || bus_reset || set_cfg => false
+            when hs_ack && ser_ack_wait => !it
             else => it
         }
     }
     //> The snapshotted packet's byte count.
     outgoing reg pkt_len : Word[7] on clock {
         initial it <= 0w7
-        it <= when {
-            case reset || bus_reset || set_cfg => 0w7
-            case arm_new_i => load_len_i
+        it <= if {
+            when reset || bus_reset || set_cfg => 0w7
+            when arm_new_i => load_len_i
             else => it
         }
     }
@@ -1085,10 +1085,10 @@ mod SerialInData {
     //> (retransmit on retry, same pid; forgotten at the ACK).
     outgoing reg ser_ack_wait : Bit on clock {
         initial it <= false
-        it <= when {
-            case reset || bus_reset || set_cfg => false
-            case hs_ack && it => false
-            case arm_new_i => true
+        it <= if {
+            when reset || bus_reset || set_cfg => false
+            when hs_ack && it => false
+            when arm_new_i => true
             else => it
         }
     }

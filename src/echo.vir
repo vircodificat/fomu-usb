@@ -85,14 +85,14 @@ pub mod EchoServer {
     //> The rx pipe's payload, unpacked for the EchoFifo push.
     wire rx_strobe : Bit {
         it := match usb_rx.data {
-            case @Valid(dontcare) => true
-            case @Invalid()       => false
+            with @Valid(dontcare) => true
+            with @Invalid()       => false
         }
     }
     wire rx_byte : Word[8] {
         it := match usb_rx.data {
-            case @Valid(b)  => b
-            case @Invalid() => 0w8
+            with @Valid(b)  => b
+            with @Invalid() => 0w8
         }
     }
 
@@ -146,9 +146,9 @@ pub mod EchoServer {
 
     reg hold_valid : Bit on clock {
         initial it <= false
-        it <= when {
-            case receiver.data_valid => true
-            case do_push             => false
+        it <= if {
+            when receiver.data_valid => true
+            when do_push             => false
             else                     => it
         }
     }
@@ -160,8 +160,8 @@ pub mod EchoServer {
     // coincide).
     reg tx_data : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case receiver.data_valid => receiver.data
+        it <= if {
+            when receiver.data_valid => receiver.data
             else                     => it
         }
     }
@@ -174,8 +174,8 @@ pub mod EchoServer {
     // @Valid for exactly the 1-clock push strobe.  The core
     // registers the write and re-checks !txfifo.full at the write
     // edge (txfifo_wr_d in src/usb.vir).
-    usb_tx.data := when {
-        case do_push => @Valid(tx_data)
+    usb_tx.data := if {
+        when do_push => @Valid(tx_data)
         else         => @Invalid()
     }
 

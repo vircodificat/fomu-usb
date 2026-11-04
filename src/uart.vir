@@ -72,10 +72,10 @@ pub mod UartSender {
     }
     outgoing tx         : Bit {
         it := match state {
-            case #Idle  => true
-            case #Start => false
-            case #Data  => data_buf[dyn bit_idx]
-            case #Stop  => true
+            with #Idle  => true
+            with #Start => false
+            with #Data  => data_buf[dyn bit_idx]
+            with #Stop  => true
         }
     }
 
@@ -93,9 +93,9 @@ pub mod UartSender {
 
     reg baud_counter : Word[10] on clock {
         initial it <= 0w10
-        it <= when {
-            case state == #Idle => 0w10
-            case bit_time_done  => 0w10
+        it <= if {
+            when state == #Idle => 0w10
+            when bit_time_done  => 0w10
             else                => it + 1w10
         }
     }
@@ -106,34 +106,34 @@ pub mod UartSender {
 
     reg data_buf : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case data_valid && sender_idle => data
+        it <= if {
+            when data_valid && sender_idle => data
             else                     => it
         }
     }
 
     // Load + start: on a strobe while idle, latch `data` and move to
     // Start (tx drops to the start bit on the next cycle).
-    when {
-        case data_valid && sender_idle match state {
-            case #Idle {
+    if {
+        when data_valid && sender_idle match state {
+            with #Idle {
                 state <= #Start
             }
         }
-        case bit_time_done match state {
-            case #Start {
+        when bit_time_done match state {
+            with #Start {
                 bit_idx <= 0w3
                 state   <= #Data
             }
-            case #Data {
+            with #Data {
                 bit_idx <= bit_idx + 1w3
-                when {
-                    case bit_idx == 7w3 {
+                if {
+                    when bit_idx == 7w3 {
                         state <= #Stop
                     }
                 }
             }
-            case #Stop {
+            with #Stop {
                 state <= #Idle
             }
         }
@@ -151,8 +151,8 @@ pub mod UartReceiver {
     // holds through the Stop phase, which is when data_valid pulses.
     outgoing reg data : Word[8] on clock {
         initial it <= 0w8
-        it <= when {
-            case state == #Data && bit_time_done => word(uart_rx, it[8..1])
+        it <= if {
+            when state == #Data && bit_time_done => word(uart_rx, it[8..1])
             else                                 => it
         }
     }
@@ -174,30 +174,30 @@ pub mod UartReceiver {
 
     reg state : UartFsmState on clock {
         initial it <= #Idle
-        it <= when {
+        it <= if {
             else match it {
-                case #Idle when {
-                    case uart_rx == false => #Start
+                with #Idle if {
+                    when uart_rx == false => #Start
                     else                  => it
                 }
-                case #Start when {
-                    case bit_time_done when {
+                with #Start if {
+                    when bit_time_done if {
                         // 209 cycles after the falling edge moved
                         // Idle->Start (half of a 417-cycle bit, the
                         // middle of the start bit), the line must still
                         // be low; a level that has bounced back high is
                         // a glitch and the frame is aborted to Idle.
-                        case uart_rx == false => #Data
+                        when uart_rx == false => #Data
                         else                  => #Idle
                     }
                     else => it
                 }
-                case #Data when {
-                    case bit_time_done && bit_idx == 7w3 => #Stop
+                with #Data if {
+                    when bit_time_done && bit_idx == 7w3 => #Stop
                     else                                 => it
                 }
-                case #Stop when {
-                    case bit_time_done => #Idle
+                with #Stop if {
+                    when bit_time_done => #Idle
                     else               => it
                 }
             }
@@ -217,22 +217,22 @@ pub mod UartReceiver {
     // no resynchronization for an external source.
     reg baud_counter : Word[10] on clock {
         initial it <= 0w10
-        it <= when {
+        it <= if {
             else match state {
-                case #Idle when {
-                    case uart_rx == false => 208w10
+                with #Idle if {
+                    when uart_rx == false => 208w10
                     else                  => 0w10
                 }
-                case #Start when {
-                    case bit_time_done => 416w10
+                with #Start if {
+                    when bit_time_done => 416w10
                     else               => it - 1w10
                 }
-                case #Data when {
-                    case bit_time_done => 416w10
+                with #Data if {
+                    when bit_time_done => 416w10
                     else               => it - 1w10
                 }
-                case #Stop when {
-                    case bit_time_done => 0w10
+                with #Stop if {
+                    when bit_time_done => 0w10
                     else               => it - 1w10
                 }
             }
@@ -241,9 +241,9 @@ pub mod UartReceiver {
 
     reg bit_idx : Word[3] on clock {
         initial it <= 0w3
-        it <= when {
-            case state == #Start && bit_time_done => 0w3
-            case state == #Data && bit_time_done   => it + 1w3
+        it <= if {
+            when state == #Start && bit_time_done => 0w3
+            when state == #Data && bit_time_done   => it + 1w3
             else                                   => it
         }
     }
