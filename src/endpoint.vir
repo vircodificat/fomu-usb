@@ -795,8 +795,15 @@ pub mod Serial {
     //> Router-gated handshake strobe: our in-flight packet was ACKed.
     incoming hs_ack : Bit
 
-    //> Tx FIFO status: nothing queued for the host.
-    incoming txfifo_empty : Bit
+    //> Tx FIFO status: something is queued for the host.  REGISTERED
+    //> (+1 clock stale -- see UsbByteStream's tx_nonempty_r): one
+    //> LUT of registers in the arm enable and resp_* decodes
+    //> instead of the FIFO's combinational empty decode.  Stale
+    //> "empty" (flag low while a byte just landed) costs a
+    //> NAK-and-retry; stale "not empty" cannot happen while another
+    //> arm could fire (the count only falls when the snapshot loader
+    //> pops, which runs only while ser_ack_wait blocks a new arm).
+    incoming tx_nonempty : Bit
     //> Tx FIFO fill (for arm sizing: min(count, 64) bytes).
     incoming txfifo_count : Word[7]
     //> 1: the whole OUT packet fits the rx FIFO (core-side add+compare;
@@ -830,7 +837,7 @@ pub mod Serial {
         it.set_cfg := set_cfg
         it.tk_in := tk_in
         it.hs_ack := hs_ack
-        it.txfifo_empty := txfifo_empty
+        it.tx_nonempty := tx_nonempty
         it.txfifo_count := txfifo_count
     }
 
@@ -861,7 +868,7 @@ pub mod Serial {
                 // retransmit the unacknowledged packet, same pid
                 when indata.ser_ack_wait   => mux(indata.tog_tx, 11w4, 3w4)
                 // arm a new packet from the tx FIFO
-                when !txfifo_empty => mux(indata.tog_tx, 11w4, 3w4)
+                when tx_nonempty => mux(indata.tog_tx, 11w4, 3w4)
                 // nothing to send
                 else => 10w4
             }
@@ -878,7 +885,7 @@ pub mod Serial {
             when outdata.dt_rej => 0w7
             when tk_in if {
                 when indata.ser_ack_wait   => indata.pkt_len
-                when !txfifo_empty => indata.load_len
+                when tx_nonempty => indata.load_len
                 else => 0w7
             }
             else => it
@@ -1034,23 +1041,33 @@ mod SerialInData {
     incoming tk_in : Bit
     //> Our in-flight packet was ACKed.
     incoming hs_ack : Bit
-    //> Tx FIFO status: nothing queued for the host.
-    incoming txfifo_empty : Bit
+    //> Tx FIFO status: something is queued for the host.  REGISTERED
+    //> (+1 clock stale -- see UsbByteStream's tx_nonempty_r): the
+    //> arm enable becomes one LUT of registers.
+    incoming tx_nonempty : Bit
     //> Tx FIFO fill (for arm sizing: min(count, 64) bytes).
     incoming txfifo_count : Word[7]
 
     // ---- arm/retransmit bookkeeping ---------------------------------------
     //> Arm-a-new-packet condition: IN token, no unacknowledged packet,
-    //> and something to send.
+    //> and something to send.  All three terms are registers (tk_in is
+    //> a registered router strobe): one LUT in the enable cone.
     wire arm_new_i : Bit {
-        it := tk_in && !ser_ack_wait && !txfifo_empty
+        it := tk_in && !ser_ack_wait && tx_nonempty
     }
-    //> min(count, 64): the fresh-arm payload length.
+    //> The fresh-arm payload length.
+    //> The min(count, 64) clamp is GONE: TxFifo is 16 deep (the
+    //> `memory mem[16]` in usb::TxFifo), so txfifo_count <= 16 < 64
+    //> always and the > 64 test was dead logic (a four-level serial
+    //> chain in load_len's data path and, via pkt_len, in the response
+    //> registers' enables).  INVARIANT: if the tx FIFO ever grows past
+    //> 64, the clamp must return as a REGISTERED flag (min(count,64)
+    //> decided at push time), never as a live compare here.
     wire load_len_i : Word[7] {
-        it := mux(txfifo_count > 64w7, 64w7, txfifo_count)
+        it := txfifo_count
     }
     //> Forwarded to the response registers in endpoint::Serial.
-    outgoing arm_new : Bit dependson tk_in, txfifo_empty {
+    outgoing arm_new : Bit dependson tk_in, tx_nonempty {
         it := arm_new_i
     }
     //> Forwarded to the response registers in endpoint::Serial.

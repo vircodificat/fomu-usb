@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#
+# Connect to the iCEstick UART echo server with picocom.
+#
+# The echo server runs at 115200 baud, 8 data bits, no parity, one
+# stop bit, with no flow control.  Type characters and the board
+# echoes them straight back.  Press Ctrl-A then Ctrl-H for picocom's
+# help; Ctrl-A then Ctrl-X to quit.
+#
+# Usage:
+#   ./connect                     # auto-detect the FTDI as /dev/ttyUSB*
+#   ./connect /dev/ttyX           # use a specific device
+set -euo pipefail
+
+BAUD=115200
+DEVICE="${1:-}"
+
+# Find the first /dev/ttyUSB* if no device was given.  The iCEstick's
+# FTDI enumerates as a ttyUSB device; if several are present, pass the
+# right one explicitly.
+if [[ -z "$DEVICE" ]]; then
+    DEVICE="$(ls /dev/ttyUSB* 2>/dev/null | head -n1 || true)"
+    if [[ -z "$DEVICE" ]]; then
+        echo "No /dev/ttyUSB* found. Plug in the iCEstick or pass a device:" >&2
+        echo "  $0 /dev/ttyUSB0" >&2
+        exit 1
+    fi
+fi
+
+if [[ ! -e "$DEVICE" ]]; then
+    echo "Device $DEVICE does not exist." >&2
+    exit 1
+fi
+
+# Make sure the current user can open the serial port.  Members of
+# the `dialout` group normally can; if not, retry with sudo.
+if [[ ! -r "$DEVICE" || ! -w "$DEVICE" ]]; then
+    echo "No read/write access to $DEVICE; retrying with sudo." >&2
+    exec sudo picocom -b "$BAUD" "$DEVICE"
+fi
+
+exec picocom -b "$BAUD" "$DEVICE"

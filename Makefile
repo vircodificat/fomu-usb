@@ -19,20 +19,20 @@ WIKI_CSS := wiki/style.css
 
 SHELL := /bin/bash
 
-# Vendored plain-Verilog USB core + the ext bodies of the Virdant/Verilog
-# split (src/usb.vir): the SB_IO pad pair (the only `inout` in the
-# design) and the USB core itself.  The POR is a plain Virdant mod now
-# (usb::UsbPor in src/usb.vir); the old ext/usb_por.sv is gone -- keep it
-# out of any compile or iverilog rejects the duplicate module.
-USB_SRVS := ext/usb_uart.sv
+# The one remaining ext body of the Virdant/Verilog split (src/usb.vir):
+# the SB_IO pad pair (the only `inout` in the design).  The POR and the
+# indexed memories (the two FIFOs and the descriptor ROM) are plain
+# Virdant mods now (usb::UsbPor; usb::TxFifo / usb::RxFifo / usb::DescRom
+# over the `memory` construct, DescRom's image in mem/desc_rom.hex); the
+# old ext/usb_uart.sv and ext/echo_fifo.sv are gone -- keep them out of
+# any compile or iverilog rejects the duplicate module.
 PADS_SV  := ext/usb_pads.sv
-ECHO_SV  := ext/echo_fifo.sv
-EXT_SRVS := $(USB_SRVS) $(PADS_SV) $(ECHO_SV)
+EXT_SRVS := $(PADS_SV)
 # crc.sv / endpoint.sv / phy.sv come from src/crc.vir / src/endpoint.vir /
 # src/phy.vir (see also the import lines at the top of src/usb.vir).
 # Core = everything a TB that doesn't drive the echo path can elaborate
-# without ext/echo_fifo.sv (EchoServer's EchoFifo ext body); USB_BUILD
-# adds echo/uart on top for the serial TB and synth.
+# without build/echo.sv; USB_BUILD adds echo/uart on top for the serial
+# TB and synth.
 USB_BUILD_CORE := build/builtin.sv build/crc.sv build/endpoint.sv build/usb.sv build/phy.sv
 USB_BUILD := $(USB_BUILD_CORE) build/echo.sv build/uart.sv
 
@@ -97,17 +97,17 @@ build:
 test: build test-crc test-usb-phy test-usb-serial
 
 # The crc and usb-phy TBs need only the modules they drive directly +
-# the ones instantiated inside usb.sv -- NOT echo/uart (echo::EchoFifo's
-# ext body ext/echo_fifo.sv isn't on these compile lines, so
-# build/echo.sv would fail on 'Unknown module type: echo::EchoFifo').
+# the ones instantiated inside usb.sv -- NOT echo/uart (build/echo.sv
+# instantiates the uart::UartSender/UartReceiver mods, which only land
+# in build/uart.sv).
 test-crc: tools
-	$(IVERILOG) -g2012 -gspecify -o build/tb_crc.vvp $(USB_SRVS) $(SB_RAM_SIM) \
+	$(IVERILOG) -g2012 -gspecify -o build/tb_crc.vvp $(SB_RAM_SIM) \
 	    $(USB_BUILD_CORE) tb/tb_crc.v
 	$(VVP) build/tb_crc.vvp
 
 test-usb-phy: tools
 	$(IVERILOG) -g2012 -gspecify -o build/tb_usb_phy.vvp \
-	    $(USB_SRVS) $(SB_RAM_SIM) $(USB_BUILD_CORE) tb/usb_host_bfm.v tb/tb_usb_phy.v
+	    $(SB_RAM_SIM) $(USB_BUILD_CORE) tb/usb_host_bfm.v tb/tb_usb_phy.v
 	$(VVP) build/tb_usb_phy.vvp
 
 test-usb-serial: tools
@@ -118,13 +118,13 @@ test-usb-serial: tools
 	$(VVP) build/tb_usb_serial.vvp
 
 ## synth — yosys synth_ice40 + nextpnr UP5K at 48 MHz on the same design
-## `vir upload` would flash: the platform wrapper (build/top.sv) + the
-## ext core + the descriptor/FIFO BRAMs.  Plain tool flow for timing
+## `vir upload` would flash: the platform wrapper (build/top.sv) + the SB_IO
+## pads + the descriptor/FIFO memories.  Plain tool flow for timing
 ## measurement; still NO upload target (see header).
 synth: build tools
 	mkdir -p build
 	set -o pipefail; \
-	$(YOSYS) -p "read_verilog $(EXT_SRVS) $(USB_BUILD) build/top.sv; synth_ice40 -top Top -json build/top.json" \
+	$(YOSYS) -p "read_verilog $(EXT_SRVS) $(USB_BUILD) build/top.sv; synth_ice40 -top top::Top -json build/top.json" \
 	    | tee build/yosys.log
 	set -o pipefail; \
 	$(NEXTPNR) --up5k --package uwg30 --json build/top.json \

@@ -28,11 +28,11 @@ pub socket UsbTxRx {
 //> stream as two Pipe[Word[8]] handshake sockets; UsbController
 //> forwards those sockets unchanged to the ext-world boundary).  The physical-layer mods (NrziDecoder,
 //> BitDestuffer, RxPhy, TxPhy) live in src/phy.vir; the serial CRC
-//> LFSRs (Crc5/Crc16) in src/crc.vir.  Only what Virdant cannot express
-//> stays vendored in
-//> ext/usb_uart.sv and ext/usb_pads.sv: the indexed memories
-//> (\usb::TxFifo / \usb::RxFifo / \usb::DescRom) and the bidirectional
-//> USB pads (UsbPads, the only `inout` in the design).
+//> LFSRs (Crc5/Crc16) in src/crc.vir.  The indexed memories (TxFifo /
+//> RxFifo / DescRom) are plain Virdant mods over the `memory`
+//> construct (DescRom's contents: mem/desc_rom.bin via @image);
+//> only the bidirectional USB pads (UsbPads, the only `inout` in the
+//> design) stay vendored in ext/usb_pads.sv.
 //>
 //> Topology (wired by export mod Top in src/top.vir):
 //>
@@ -1122,10 +1122,7 @@ mod RxDataRec {
 }
 
 
-//> The two sync FIFOs over usb_fifo16x8 (ext/usb_uart.sv): thin
-//> fixed-parameter wrappers so the Virdant side can instantiate them
-//> as ext mods (Virdant ext mods cannot carry parameters).
-//> Port/behavior contract (the usb_fifo16x8 header): the FIFO has NO
+//> The two sync FIFOs.  Port/behavior contract: the FIFO has NO
 //> internal protection -- wr_en must be pre-gated with !full and
 //> rd_en with !empty by the caller; the enables carry no count
 //> terms, so the count compares never sit in a write/read
@@ -1139,9 +1136,14 @@ mod RxDataRec {
 //> mid-load.  Simultaneous push+pop is supported; count is 7 bits
 //> wide regardless of depth.
 //>
-//> The 16-deep x 8-bit tx FIFO (usb_fifo16x8 defaults: DEPTH=16,
-//> AW=4, RAM=0 -- flop storage, combinational head).
-ext mod TxFifo {
+//> The 16-deep x 8-bit tx FIFO: `memory` storage with a
+//> combinational head -- rd_data is mem[rd_ptr], valid the whole
+//> cycle, so the snapshot loader captures it into SnapRam on the
+//> same edge it pops (rd_en and snapram.we fire together).  A read
+//> of the address written in the same cycle sees the old value
+//> (read-before-write), matching the old ext body's non-blocking
+//> write + combinational read.
+mod TxFifo {
     //> 48 MHz clock.
     incoming clock : Clock
     //> Synchronous reset: clears both pointers and the count (the
@@ -1160,24 +1162,71 @@ ext mod TxFifo {
     //> The head byte, combinational -- valid the whole cycle, so the
     //> snapshot loader captures it into SnapRam on the same edge it
     //> pops (rd_en and snapram.we fire together).
-    outgoing rd_data : Word[8]
+    outgoing rd_data : Word[8] {
+        it := mem[dyn rd_ptr]
+    }
     //> Bytes stored (0..16).
-    outgoing count : Word[7]
+    outgoing count : Word[7] {
+        it := cnt
+    }
     //> Full (count == 16).
-    outgoing full : Bit
+    outgoing full : Bit {
+        it := cnt == 16w7
+    }
     //> Empty (count == 0).
-    outgoing empty : Bit
+    outgoing empty : Bit {
+        it := cnt == 0w7
+    }
+
+    reg wr_ptr : Word[4] {
+        initial it <= 0w4
+        it <= if {
+            when reset => 0w4
+            when wr_en => it + 1w4
+            else       => it
+        }
+    }
+
+    reg rd_ptr : Word[4] {
+        initial it <= 0w4
+        it <= if {
+            when reset => 0w4
+            when rd_en => it + 1w4
+            else       => it
+        }
+    }
+
+    reg cnt : Word[7] {
+        initial it <= 0w7
+        it <= if {
+            when reset           => 0w7
+            when wr_en && !rd_en => it + 1w7
+            when rd_en && !wr_en => it - 1w7
+            else                 => it
+        }
+    }
+
+    //> 16 slots of 8 bits.  One write site, guarded by wr_en only
+    //> (no cnt terms in the enable cone).  The memory itself has no
+    //> reset: the caller never pops an empty queue, so unwritten
+    //> slots are never read.
+    memory mem[16] : Word[8] {
+        if {
+            when wr_en {
+                it[dyn wr_ptr] <= wr_data
+            }
+        }
+    }
 }
 
-//> The 64-deep x 8-bit bulk-OUT rx FIFO (DEPTH=64, AW=6, RAM=1):
-//> block-RAM storage with the registered free-running read port
-//> (keeps 512 flops and their per-byte write-decode cones off the
-//> fabric, at the cost of a one-clock-delayed rd_data).  DEPTH=64,
-//> not a generic 16: a max-size (64 B) bulk-OUT packet must be
+//> The 64-deep x 8-bit bulk-OUT rx FIFO: `memory` storage with the
+//> registered free-running read port (keeps the per-byte write-decode
+//> cones off the fabric, at the cost of a one-clock-delayed rd_data).
+//> 64 deep, not 16: a max-size (64 B) bulk-OUT packet must be
 //> absorbed atomically under the whole-packet-must-fit admission
 //> rule (endpoint::Serial NAKs an OUT that does not fit whole), which a
 //> 16-deep FIFO could never accept.
-ext mod RxFifo {
+mod RxFifo {
     //> 48 MHz clock.
     incoming clock : Clock
     //> Synchronous reset: clears both pointers and the count (the
@@ -1202,13 +1251,63 @@ ext mod RxFifo {
     //> the new head appears one clock later.  (The caller pairs the
     //> popped byte with the delayed valid strobe -- rx_valid /
     //> rx_data.)
-    outgoing rd_data : Word[8]
+    outgoing reg rd_data : Word[8] {
+        it <= mem[dyn rd_ptr]
+    }
     //> Bytes stored (0..64).
-    outgoing count : Word[7]
+    outgoing count : Word[7] {
+        it := cnt
+    }
     //> Full (count == 64).
-    outgoing full : Bit
+    outgoing full : Bit {
+        it := cnt == 64w7
+    }
     //> Empty (count == 0).
-    outgoing empty : Bit
+    outgoing empty : Bit {
+        it := cnt == 0w7
+    }
+
+    reg wr_ptr : Word[6] {
+        initial it <= 0w6
+        it <= if {
+            when reset => 0w6
+            when wr_en => it + 1w6
+            else       => it
+        }
+    }
+
+    reg rd_ptr : Word[6] {
+        initial it <= 0w6
+        it <= if {
+            when reset => 0w6
+            when rd_en => it + 1w6
+            else       => it
+        }
+    }
+
+    reg cnt : Word[7] {
+        initial it <= 0w7
+        it <= if {
+            when reset           => 0w7
+            when wr_en && !rd_en => it + 1w7
+            when rd_en && !wr_en => it - 1w7
+            else                 => it
+        }
+    }
+
+    //> 64 slots of 8 bits.  One write site, guarded by wr_en only
+    //> (no cnt terms in the enable cone).  The memory itself has no
+    //> reset: the caller never pops an empty queue, so unwritten
+    //> slots are never read.  A read of the address written in the
+    //> same cycle sees the old value (read-before-write), matching
+    //> the old ext body's non-blocking write + registered read.
+    memory mem[64] : Word[8] {
+        if {
+            when wr_en {
+                it[dyn wr_ptr] <= wr_data
+            }
+        }
+    }
 }
 
 //> The bulk-IN snapshot RAM (64x8 over one iCE40 SB_RAM40_4K cell):
@@ -1268,19 +1367,27 @@ mod SnapRam {
 //> producer mux in usb::UsbUart returns zero bytes for sel6 -- and
 //> sel5 does not exist (endpoint::Ep0 implements no line-coding request;
 //> an invalid GET_DESCRIPTOR select STALLs instead of arming).
-//> The 256-byte initial block lives in the ext body
-//> (ext/usb_uart.sv) -- a plain mod over an ice40::SbRam40_4k cell
-//> would need an INIT_FILE hex image instead -- and reads are
-//> registered: present ra this clock, the byte is on rd the next clock.
-ext mod DescRom {
+//> Contents come from mem/desc_rom.bin (@image, resolved
+//> relative to the project root; one raw byte per Word[8] slot in
+//> declaration order); reads are registered: present ra
+//> this clock, the byte is on rd the next clock.
+mod DescRom {
     //> 48 MHz clock.
     incoming clock : Clock
     //> Read address: the latched response base (EP0 page start +
     //> transfer offset, see rom_addr_r in usb::UsbUart) plus the
     //> in-flight byte fetch index.
     incoming ra : Word[8]
-    //> Registered read data: desc_rom[ra] as of the previous posedge.
-    outgoing rd : Word[8]
+    //> Registered read data: mem[ra] as of the previous posedge.
+    outgoing reg rd : Word[8] {
+        it <= mem[dyn ra]
+    }
+
+    //> 256 bytes of descriptors (raw binary image, one byte per slot).  The
+    //> Word[8] slots pack one byte each, so the file is the descriptor
+    //> table verbatim.
+    @image("mem/desc_rom.bin")
+    memory mem[256] : Word[8]
 }
 
 //> usb_uart -- the core top: descriptor ROM plumbing, token router,
@@ -1859,10 +1966,25 @@ mod UsbByteStream {
     outgoing tx_head : Word[8] {
         it := txfifo.rd_data
     }
-    //> Tx FIFO status for serial's arm decisions.
-    outgoing tx_empty : Bit {
-        it := txfifo.empty
+    //> Tx FIFO status for serial's arm decisions -- now the
+    //> REGISTERED tx_nonempty_r (see its comment): one clock stale
+    //> vs txfifo.empty, keeping the FIFO's empty-decode LUT out of
+    //> serial's enable cones (the tx count never falls except when
+    //> the snapshot loader pops, which only runs while
+    //> ser_ack_wait blocks another arm).
+    reg tx_nonempty_r : Bit {
+        initial it <= false
+        it <= if {
+            when reset || bus_reset => false
+            else => !txfifo.empty
+        }
     }
+    outgoing tx_nonempty : Bit {
+        it := tx_nonempty_r
+    }
+    //> Raw (combinational) tx FIFO empty: no live consumers left
+    //> (serial reads the registered tx_nonempty flag; the FIFO's
+    //> empty decode stays out of every enable cone).
     //> Bytes currently in the tx FIFO (for serial's arm sizing).
     outgoing tx_count : Word[7] {
         it := txfifo.count
@@ -2133,7 +2255,12 @@ mod UsbUart {
         it.dt_valid  := router.ser_dt_valid
         it.dat       := rxpkt.data_rec
         it.hs_ack    := router.ser_hs_ack
-        it.txfifo_empty := bytestream.tx_empty
+        // REGISTERED (+1 clock stale) not-empty flag from the
+        // byte stream: one LUT of registers in serial's arm enables,
+        // instead of the FIFO's combinational empty decode.  NOTE
+        // THE POLARITY: the flag is active-high NOT-EMPTY; the
+        // endpoint ports are named tx_nonempty to match.
+        it.tx_nonempty := bytestream.tx_nonempty
         it.txfifo_count := bytestream.tx_count
         it.rx_room      := bytestream.rx_room_ok
         it.tx_room      := bytestream.tx_room

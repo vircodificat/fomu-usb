@@ -623,6 +623,50 @@ module tb_usb_serial;
         ctrl_no_data(7'd42);
 
         // ---------------------------------------------------------------
+        // 6. keystroke cadence: single-byte OUTs at human typing speed,
+        // each followed by CONTINUOUS IN polling (the way a real host
+        // driver polls bulk-IN while the echo is still relaying the byte
+        // through the UART loop).  Regression target: the board used to
+        // drop every other keystroke; 64-byte-packet loopback (S4) never
+        // reproduced it.
+        // ---------------------------------------------------------------
+        $display("--- S6: keystroke cadence (8 single-byte transfers)");
+        begin : s6_keystrokes
+            reg acked;
+            reg d;
+            integer k;
+            integer polls;
+            integer base;
+            // toggles CONTINUE from S5b (the device never resets them
+            // outside bus_reset); resetting them here would desync the
+            // host from the device's data-toggle phase.
+            base = got_n;
+            for (k = 0; k < 8; k = k + 1) begin
+                out_buf[0] = 8'h61 + k;   // 'a'..'h'
+                bulk_out_try(7'd42, 1, acked);
+                check(acked, "S6: keystroke OUT accepted");
+                // poll IN until this byte comes back; the early polls
+                // NAK (the echo is still relaying through the UART)
+                polls = 0;
+                while ((got_n - base) < (k + 1) && polls < 64) begin
+                    bulk_in_try(7'd42, d);
+                    polls = polls + 1;
+                end
+                if ((got_n - base) !== (k + 1)) begin
+                    errors = errors + 1;
+                    $display("FAIL: S6: keystroke %0d never echoed (%0d polls)",
+                             k, polls);
+                end else if (got[base + k] !== (8'h61 + k)) begin
+                    errors = errors + 1;
+                    $display("FAIL: S6: keystroke %0d echoed %h expected %h",
+                             k, got[base + k], 8'h61 + k);
+                end
+                host.host_idle(20000);   // ~0.4 ms human-type gap
+            end
+            check((got_n - base) === 8, "S6: all 8 keystrokes echoed");
+        end
+
+        // ---------------------------------------------------------------
         // 7. bus reset mid-stream -> re-enumerate -> echo still works
         // ---------------------------------------------------------------
         $display("--- S7: bus reset (10 ms SE0)");

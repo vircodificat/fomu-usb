@@ -27,17 +27,16 @@ import uart
 //>   slot can never be overwritten by a later received byte.
 //> - Bytes are only pushed into the USB core's tx FIFO when it has
 //>   room (`usb_tx.ready`).
-ext mod EchoFifo {
-    //> A 16x8 circular FIFO (storage in ext/echo_fifo.sv -- Virdant
-    //> cannot express indexed memories inside a plain `mod`, so the
-    //> storage primitive is Verilog while the echo server stays
-    //> Virdant).  Interface contract:
+mod EchoFifo {
+    //> A 16x8 circular FIFO over the `memory` construct (the storage
+    //> is a plain Virdant `memory`; the echo server stays the same
+    //> mod that instantiates it).  Interface contract:
     //>
     //> - `push_valid` pushes `push_data` onto the tail on that clk
     //>   edge.  There is no push-side backpressure; the `room` throttle
     //>   below is what keeps the queue from overflowing.
     //> - `pop_en` consumes the head byte on that clk edge.  `pop_data`
-    //>   is a registered read: the head mux is captured on every clk
+    //>   is a registered read: mem[rd_ptr] is captured on every clk
     //>   edge, so the byte consumed at cycle N appears on `pop_data`
     //>   during cycle N+1 (and pop_data tracks the new head again from
     //>   cycle N+2 on).  The echo server pairs its registered sender
@@ -54,9 +53,55 @@ ext mod EchoFifo {
     incoming push_data  : Word[8]
     incoming push_valid : Bit
     incoming pop_en     : Bit
-    outgoing pop_data   : Word[8]
-    outgoing count      : Word[5]
-    outgoing room       : Bit
+    outgoing reg pop_data : Word[8] {
+        it <= mem[dyn rd_ptr]
+    }
+    outgoing count : Word[5] {
+        it := cnt
+    }
+    outgoing room : Bit {
+        it := cnt < 12w5
+    }
+
+    reg wr_ptr : Word[4] {
+        initial it <= 0w4
+        it <= if {
+            when push_valid => it + 1w4
+            else            => it
+        }
+    }
+
+    reg rd_ptr : Word[4] {
+        initial it <= 0w4
+        it <= if {
+            when pop_en => it + 1w4
+            else        => it
+        }
+    }
+
+    //> Saturating count: a simultaneous push and pop is a no-op; the
+    //> count never leaves 0..16.
+    reg cnt : Word[5] {
+        initial it <= 0w5
+        it <= if {
+            when push_valid && !pop_en && (it != 16w5) => it + 1w5
+            when pop_en && !push_valid && (it != 0w5)  => it - 1w5
+            else                                       => it
+        }
+    }
+
+    //> 16 slots of 8 bits.  One write site, guarded by push_valid.
+    //> The memory has no reset (the ext body's reg array didn't
+    //> either): the server never pops an empty queue, so unwritten
+    //> slots are never read.  A read of the address written in the
+    //> same cycle sees the old value (read-before-write).
+    memory mem[16] : Word[8] {
+        if {
+            when push_valid {
+                it[dyn wr_ptr] <= push_data
+            }
+        }
+    }
 }
 
 pub mod EchoServer {
