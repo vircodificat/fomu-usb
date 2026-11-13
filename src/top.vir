@@ -63,5 +63,5 @@ pub mod Top for ice40::Fomu {
     }
 
     // used for latency relaxation
-    reg uart_rx_reg : Bit on clock
+    reg uart_rx_reg : Bit
 }

@@ -13,7 +13,7 @@ import usb
 //> latch + decode) and Ep0SendEngine (data-stage datapath); Serial
 //> into SerialOutData (accept/reject) and SerialInData
 //> (arm/retransmit).
-
+//>
 //> usb_ep0 -- control transfer state machine (USB 2.0 §8.5.5) + CDC
 //> requests.  Every reg's next-state below is a priority chain,
 //> including the registered-accept pipeline (req_acc_r / sto_acc_r,
@@ -64,7 +64,6 @@ enum type Ep0State {
 //> data-stage send datapath.  Every reg's next-state below and in the
 //> two helpers is a priority chain -- load-bearing for the 48 MHz
 //> timing (see wiki/usb-ep0.md).
-
 pub mod Ep0 {
     //> 48 MHz clock: 4 clock cycles per USB FS bit.
     incoming clock : Clock
@@ -132,7 +131,7 @@ pub mod Ep0 {
     //> resp_req is default low, pulsed by each arm; the params hold
     //> between pulses (the tx PHY latches pid / len at the pulse,
     //> sel / base are consumed while the packet streams).
-    outgoing reg resp_req : Bit on clock {
+    outgoing reg resp_req : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -146,7 +145,7 @@ pub mod Ep0 {
         }
     }
     //> Response PID: ACK 2, DATA0 3, DATA1 B, STALL E.
-    outgoing reg resp_pid : Word[4] on clock {
+    outgoing reg resp_pid : Word[4] {
         initial it <= 0w4
         it <= if {
             when (st == #RcvReq) && decode.req_acc_r => 2w4
@@ -158,7 +157,7 @@ pub mod Ep0 {
         }
     }
     //> Response payload byte count (0 for ACK / STALL / ZLP).
-    outgoing reg resp_len : Word[7] on clock {
+    outgoing reg resp_len : Word[7] {
         initial it <= 0w7
         it <= if {
             when (st == #RcvReq) && decode.req_acc_r => 0w7
@@ -171,7 +170,7 @@ pub mod Ep0 {
     }
     //> Descriptor select (the core ROM's bank: 0 device, 1 config,
     //> 2/3/4 strings, 6 status).
-    outgoing reg resp_sel : Word[3] on clock {
+    outgoing reg resp_sel : Word[3] {
         initial it <= 0w3
         it <= if {
             when (st == #RcvReq) && decode.req_acc_r => 0w3
@@ -181,7 +180,7 @@ pub mod Ep0 {
         }
     }
     //> Descriptor byte offset the response starts at.
-    outgoing reg resp_base : Word[10] on clock {
+    outgoing reg resp_base : Word[10] {
         initial it <= 0w10
         it <= if {
             when (st == #RcvReq) && decode.req_acc_r => 0w10
@@ -195,7 +194,7 @@ pub mod Ep0 {
     //> completion; 0 until enumerated).
     //> Device address / configuration, applied at the OWNING
     //> transfer's status completion (pend_addr / pend_cfg tags).
-    outgoing reg dev_addr : Word[7] on clock {
+    outgoing reg dev_addr : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset || bus_reset => 0w7
@@ -206,7 +205,7 @@ pub mod Ep0 {
         }
     }
     //> Configuration state (SET_CONFIGURATION(1) status completion).
-    outgoing reg configured : Bit on clock {
+    outgoing reg configured : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -239,7 +238,7 @@ pub mod Ep0 {
     //> Transfer state.  Next-state is one priority chain: reset,
     //> then tk_setup (SETUP aborts any transfer in progress,
     //> re-initializing the toggle), then the state cases.
-    reg st : Ep0State on clock {
+    reg st : Ep0State {
         initial it <= #Idle
         it <= if {
             when reset || bus_reset => #Idle
@@ -288,7 +287,6 @@ pub mod Ep0 {
 //> (see wiki/usb-ep0.md).  Read by the FSM and the send engine
 //> (endpoint::Ep0 / endpoint::Ep0SendEngine); writes nothing of
 //> theirs.
-
 mod Ep0ReqDecode {
     //> 48 MHz clock.
     incoming clock : Clock
@@ -374,9 +372,9 @@ mod Ep0ReqDecode {
     //> dt_len / dt_crc_ok) holds between packets, so the delayed
     //> reaction is bit-identical, and the +1 clock is free against the
     //> ~30-50 clock turnaround budget.
-
+    //>
     //> SETUP request packet accepted (DATA0, 8 bytes, good CRC).
-    outgoing reg req_acc_r : Bit on clock {
+    outgoing reg req_acc_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -386,7 +384,7 @@ mod Ep0ReqDecode {
     }
     //> Status-stage ZLP accepted (lenient on the data pid: hosts
     //> sending DATA0 here are taken).
-    outgoing reg sto_acc_r : Bit on clock {
+    outgoing reg sto_acc_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -397,7 +395,7 @@ mod Ep0ReqDecode {
 
     // ---- request bytes (latched at the registered accept) -------------
     //> bmRequestType.
-    reg rq0 : Word[8] on clock {
+    reg rq0 : Word[8] {
         initial it <= 0w8
         it <= if {
             when (st == #RcvReq) && req_acc_r => dt_head[8..0]
@@ -405,7 +403,7 @@ mod Ep0ReqDecode {
         }
     }
     //> bRequest.
-    reg rq1 : Word[8] on clock {
+    reg rq1 : Word[8] {
         initial it <= 0w8
         it <= if {
             when (st == #RcvReq) && req_acc_r => dt_head[16..8]
@@ -414,7 +412,7 @@ mod Ep0ReqDecode {
     }
     //> wValue low (SET_ADDRESS address / SET_CONFIGURATION value /
     //> GET_DESCRIPTOR string index).
-    reg rq2 : Word[8] on clock {
+    reg rq2 : Word[8] {
         initial it <= 0w8
         it <= if {
             when (st == #RcvReq) && req_acc_r => dt_head[24..16]
@@ -422,7 +420,7 @@ mod Ep0ReqDecode {
         }
     }
     //> wValue high (descriptor type: 1 device, 2 config, 3 string).
-    reg rq3 : Word[8] on clock {
+    reg rq3 : Word[8] {
         initial it <= 0w8
         it <= if {
             when (st == #RcvReq) && req_acc_r => dt_head[32..24]
@@ -430,7 +428,7 @@ mod Ep0ReqDecode {
         }
     }
     //> wLength high.  (rq4/rq5 = wIndex are never needed and not kept.)
-    reg rq6 : Word[8] on clock {
+    reg rq6 : Word[8] {
         initial it <= 0w8
         it <= if {
             when (st == #RcvReq) && req_acc_r => dt_head[56..48]
@@ -438,7 +436,7 @@ mod Ep0ReqDecode {
         }
     }
     //> wLength low.
-    reg rq7 : Word[8] on clock {
+    reg rq7 : Word[8] {
         initial it <= 0w8
         it <= if {
             when (st == #RcvReq) && req_acc_r => dt_head[64..56]
@@ -451,9 +449,9 @@ mod Ep0ReqDecode {
     //> decode is split across two: PARSE computes these flags, SETUP
     //> routes them, ARM applies.  Deliberately unreset: every flag is
     //> rewritten in PARSE before any reader (SETUP) looks at it.
-
+    //>
     //> Decoded descriptor select.
-    outgoing reg p_sel : Word[3] on clock {
+    outgoing reg p_sel : Word[3] {
         initial it <= 0w3
         it <= if {
             when st == #Parse => new_sel
@@ -461,7 +459,7 @@ mod Ep0ReqDecode {
         }
     }
     //> Raw wLength as parsed.
-    outgoing reg p_wlen : Word[16] on clock {
+    outgoing reg p_wlen : Word[16] {
         initial it <= 0w16
         it <= if {
             when st == #Parse => word(rq7, rq6)
@@ -471,7 +469,7 @@ mod Ep0ReqDecode {
     //> GET_DESCRIPTOR with a valid select (computed but not read:
     //> the Arm action tree treats GET_DESCRIPTOR as the fall-through
     //> action).
-    reg p_is_desc : Bit on clock {
+    reg p_is_desc : Bit {
         initial it <= false
         it <= if {
             when st == #Parse => (rq1 == 0x06w8) && (new_sel != 7w3)
@@ -479,7 +477,7 @@ mod Ep0ReqDecode {
         }
     }
     //> GET_STATUS (device).
-    reg p_is_get_status : Bit on clock {
+    reg p_is_get_status : Bit {
         initial it <= false
         it <= if {
             when st == #Parse => (rq1 == 0w8) && (rq0 == 0x80w8)
@@ -487,7 +485,7 @@ mod Ep0ReqDecode {
         }
     }
     //> SET_ADDRESS.
-    reg p_is_set_addr : Bit on clock {
+    reg p_is_set_addr : Bit {
         initial it <= false
         it <= if {
             when st == #Parse => rq1 == 0x05w8
@@ -495,7 +493,7 @@ mod Ep0ReqDecode {
         }
     }
     //> SET_CONFIGURATION (value 0 or 1).
-    reg p_is_set_cfg : Bit on clock {
+    reg p_is_set_cfg : Bit {
         initial it <= false
         it <= if {
             when st == #Parse => (rq1 == 0x09w8)
@@ -504,7 +502,7 @@ mod Ep0ReqDecode {
         }
     }
     //> SET_CONTROL_LINE_STATE.
-    reg p_is_cls : Bit on clock {
+    reg p_is_cls : Bit {
         initial it <= false
         it <= if {
             when st == #Parse => (rq1 == 0x22w8) && (rq0 == 0x21w8)
@@ -512,7 +510,7 @@ mod Ep0ReqDecode {
         }
     }
     //> Decoded request is supported at all.
-    reg p_valid : Bit on clock {
+    reg p_valid : Bit {
         initial it <= false
         it <= if {
             when st == #Parse => ((rq1 == 0x06w8) && (new_sel != 7w3))
@@ -528,9 +526,9 @@ mod Ep0ReqDecode {
     //> OWNING transfer's status stage applies them (without the tags,
     //> any control read's status stage would latch addr_pending = 0
     //> and wipe dev_addr at completion).
-
+    //>
     //> SET_ADDRESS value, applied at this transfer's status completion.
-    outgoing reg addr_pending : Word[7] on clock {
+    outgoing reg addr_pending : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset || bus_reset => 0w7
@@ -539,7 +537,7 @@ mod Ep0ReqDecode {
         }
     }
     //> SET_CONFIGURATION value.
-    outgoing reg cfg_pending : Bit on clock {
+    outgoing reg cfg_pending : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -548,7 +546,7 @@ mod Ep0ReqDecode {
         }
     }
     //> This transfer IS a SET_ADDRESS.
-    outgoing reg pend_addr : Bit on clock {
+    outgoing reg pend_addr : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -557,7 +555,7 @@ mod Ep0ReqDecode {
         }
     }
     //> This transfer IS a SET_CONFIGURATION.
-    outgoing reg pend_cfg : Bit on clock {
+    outgoing reg pend_cfg : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -573,7 +571,7 @@ mod Ep0ReqDecode {
     //> (GET_DESCRIPTOR data stage).  The only place the request
     //> routing tree runs, landing on ONE register -- not on datapath
     //> clock enables.
-    outgoing reg p_action : Word[3] on clock {
+    outgoing reg p_action : Word[3] {
         initial it <= 0w3
         it <= if {
             when reset || bus_reset => 0w3
@@ -587,7 +585,7 @@ mod Ep0ReqDecode {
         }
     }
     //> Request wLength == 0.
-    outgoing reg p_wlen0 : Bit on clock {
+    outgoing reg p_wlen0 : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -597,7 +595,7 @@ mod Ep0ReqDecode {
     }
     //> GET_DESCRIPTOR direction (IN -> status stage is OUT, and vice
     //> versa) -- rq0[7].
-    outgoing reg p_desc_in : Bit on clock {
+    outgoing reg p_desc_in : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -610,7 +608,7 @@ mod Ep0ReqDecode {
     //> register-to-register.  dlen <= 75 < 128, so the compare only
     //> needs the low bits: wLength >= 128 means the descriptor
     //> length wins outright.
-    outgoing reg p_dremain_r : Word[7] on clock {
+    outgoing reg p_dremain_r : Word[7] {
         initial it <= 0w7
         it <= if {
             when st == #Setup if {
@@ -632,7 +630,6 @@ mod Ep0ReqDecode {
 //> send_len/remain.  Consumes the decoded request facts from
 //> endpoint::Ep0ReqDecode and the transfer state from endpoint::Ep0;
 //> it makes no protocol decisions of its own.
-
 mod Ep0SendEngine {
     //> 48 MHz clock.
     incoming clock : Clock
@@ -658,7 +655,7 @@ mod Ep0SendEngine {
     //> 1 => the next device data PID is DATA1.  Re-initialized to 0
     //> by SETUP (the SETUP data stage is DATA0), set for the data
     //> stage of a control read, toggled per accepted data packet.
-    outgoing reg tog : Bit on clock {
+    outgoing reg tog : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -673,7 +670,7 @@ mod Ep0SendEngine {
     }
 
     //> Data stage bytes left to send.
-    outgoing reg remain : Word[7] on clock {
+    outgoing reg remain : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset || bus_reset => 0w7
@@ -690,7 +687,7 @@ mod Ep0SendEngine {
     }
 
     //> Bytes in the in-flight packet.
-    outgoing reg send_len : Word[7] on clock {
+    outgoing reg send_len : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset || bus_reset => 0w7
@@ -702,7 +699,7 @@ mod Ep0SendEngine {
 
     //> Current send offset into the descriptor (base + tx_addr is the
     //> ROM byte usb::TxPhy pulls).
-    outgoing reg base : Word[10] on clock {
+    outgoing reg base : Word[10] {
         initial it <= 0w10
         it <= if {
             when reset || bus_reset => 0w10
@@ -717,7 +714,7 @@ mod Ep0SendEngine {
     }
 
     //> Current descriptor select.
-    outgoing reg sel : Word[3] on clock {
+    outgoing reg sel : Word[3] {
         initial it <= 0w3
         it <= if {
             when reset || bus_reset => 0w3
@@ -731,7 +728,7 @@ mod Ep0SendEngine {
     //> read these 1-bit registers instead of comparing
     //> send_len/remain.  send_zlp_r: armed packet is the status ZLP
     //> (len 0).  last_r: armed packet completes the data stage.
-    outgoing reg send_zlp_r : Bit on clock {
+    outgoing reg send_zlp_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -740,7 +737,7 @@ mod Ep0SendEngine {
             else => it
         }
     }
-    outgoing reg last_r : Bit on clock {
+    outgoing reg last_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -844,7 +841,7 @@ pub mod Serial {
     //> params are held per-branch (the core's arbiter latches them on
     //> the pulse).  The accept/reject branches take priority over the
     //> token arm.
-    outgoing reg resp_req : Bit on clock {
+    outgoing reg resp_req : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset || set_cfg => false
@@ -855,7 +852,7 @@ pub mod Serial {
         }
     }
     //> Response PID: DATA0 3 / DATA1 B / ACK 2 / NAK A.
-    outgoing reg resp_pid : Word[4] on clock {
+    outgoing reg resp_pid : Word[4] {
         initial it <= 0w4
         it <= if {
             when outdata.dt_acc => 2w4
@@ -874,7 +871,7 @@ pub mod Serial {
     //> Response byte count.
     //> Held response length: the pending packet's pkt_len on a
     //> retransmit, min(count,64) on a fresh arm, 0 for ACK/NAK.
-    outgoing reg resp_len : Word[7] on clock {
+    outgoing reg resp_len : Word[7] {
         initial it <= 0w7
         it <= if {
             when outdata.dt_acc => 0w7
@@ -893,7 +890,7 @@ pub mod Serial {
     //> The fresh-arm strobe: NOT reset (holds through reset/bus_reset/
     //> set_cfg); harmless because the core only ever consumes it
     //> alongside a resp_req pulse.
-    outgoing reg resp_fresh : Bit on clock {
+    outgoing reg resp_fresh : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset || set_cfg => it
@@ -905,7 +902,7 @@ pub mod Serial {
     //> here).  Cleared at the data packet's arrival edge; the
     //> accept/reject decision is registered one clock later
     //> (dt_acc/dt_rej).
-    outgoing reg ser_busy : Bit on clock {
+    outgoing reg ser_busy : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset || set_cfg => false
@@ -986,7 +983,7 @@ mod SerialOutData {
     }
     //> RX data toggle: 0 => the next host data pid is DATA0.
     //> Toggled per accepted OUT packet.
-    reg tog_rx : Bit on clock {
+    reg tog_rx : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset || set_cfg => false
@@ -996,7 +993,7 @@ mod SerialOutData {
     }
     //> Registered accept: good CRC, expected pid, room in the rx
     //> FIFO (one clock after the data packet strobe).
-    outgoing reg dt_acc : Bit on clock {
+    outgoing reg dt_acc : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset || set_cfg => false
@@ -1005,7 +1002,7 @@ mod SerialOutData {
         }
     }
     //> Registered reject: anything else that arrives armed.
-    outgoing reg dt_rej : Bit on clock {
+    outgoing reg dt_rej : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset || set_cfg => false
@@ -1063,7 +1060,7 @@ mod SerialInData {
 
     //> TX data toggle: 0 => the next device data pid is DATA0.
     //> Toggled by the ACK of our in-flight packet.
-    outgoing reg tog_tx : Bit on clock {
+    outgoing reg tog_tx : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset || set_cfg => false
@@ -1072,7 +1069,7 @@ mod SerialInData {
         }
     }
     //> The snapshotted packet's byte count.
-    outgoing reg pkt_len : Word[7] on clock {
+    outgoing reg pkt_len : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset || bus_reset || set_cfg => 0w7
@@ -1083,7 +1080,7 @@ mod SerialInData {
     //> Router hint: our data packet is in flight (route the ACK
     //> here) -- the snapshot holds an unacknowledged IN packet
     //> (retransmit on retry, same pid; forgotten at the ACK).
-    outgoing reg ser_ack_wait : Bit on clock {
+    outgoing reg ser_ack_wait : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset || set_cfg => false

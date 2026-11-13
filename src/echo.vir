@@ -27,7 +27,6 @@ import uart
 //>   slot can never be overwritten by a later received byte.
 //> - Bytes are only pushed into the USB core's tx FIFO when it has
 //>   room (`usb_tx.ready`).
-
 ext mod EchoFifo {
     //> A 16x8 circular FIFO (storage in ext/echo_fifo.sv -- Virdant
     //> cannot express indexed memories inside a plain `mod`, so the
@@ -130,7 +129,7 @@ pub mod EchoServer {
         it := (fifo.count != 0w5) && sender.ready && tx_drained && !pop_r
     }
 
-    reg pop_r : Bit on clock {
+    reg pop_r : Bit {
         initial it <= false
         it <= fifo_pop
     }
@@ -144,7 +143,7 @@ pub mod EchoServer {
         it.uart_rx := rxd
     }
 
-    reg hold_valid : Bit on clock {
+    reg hold_valid : Bit {
         initial it <= false
         it <= if {
             when receiver.data_valid => true
@@ -158,7 +157,7 @@ pub mod EchoServer {
     // starts the next byte, so an incoming byte can never overwrite an
     // untransmitted one (the two events below can therefore never
     // coincide).
-    reg tx_data : Word[8] on clock {
+    reg tx_data : Word[8] {
         initial it <= 0w8
         it <= if {
             when receiver.data_valid => receiver.data
@@ -166,12 +165,23 @@ pub mod EchoServer {
         }
     }
 
-    wire do_push : Bit {
-        it := hold_valid && usb_tx.ready
+    // Registered one-shot push strobe (fires exactly one clk, one clk
+    // after hold_valid && usb_tx.ready): keeps usb_tx.data free of any
+    // combinational dependence on the pipe's ready.  The !do_push term
+    // is the one-shot: hold_valid only clears on the strobe cycle, so
+    // without it the strobe would re-fire on the next edge (hold_valid
+    // still high) and the core's registered write gate would store the
+    // byte twice.  Safe against the slot being overwritten: the only
+    // writer (receiver.data_valid) completes bytes at least one byte
+    // time (~4170 clks) apart, while the strobe fires one clk after
+    // hold_valid rises.
+    reg do_push : Bit {
+        initial it <= false
+        it <= hold_valid && usb_tx.ready && !it
     }
 
     // The tx pipe's payload: the hold slot's registered byte rides
-    // @Valid for exactly the 1-clock push strobe.  The core
+    // @Valid for exactly the 1-clock registered push strobe.  The core
     // registers the write and re-checks !txfifo.full at the write
     // edge (txfifo_wr_d in src/usb.vir).
     usb_tx.data := if {

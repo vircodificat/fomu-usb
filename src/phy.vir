@@ -166,7 +166,7 @@ mod RxPhy {
         it := destuffer.bit_valid
     }
     //> 1-clock pulse: J->K seen from idle (start of packet).
-    outgoing reg sop : Bit on clock {
+    outgoing reg sop : Bit {
         initial it <= false
         it <= if {
             when reset      => false
@@ -175,7 +175,7 @@ mod RxPhy {
         }
     }
     //> 1-clock pulse: SE0 held ~1.75 bit times (end of packet).
-    outgoing reg eop : Bit on clock {
+    outgoing reg eop : Bit {
         initial it <= false
         it <= if {
             when reset     => false
@@ -185,7 +185,7 @@ mod RxPhy {
     }
     //> Inside a packet (from sop until eop): armed at the sop edge,
     //> dropped with the eop pulse or on an SE1 (illegal bus state).
-    outgoing reg active : Bit on clock {
+    outgoing reg active : Bit {
         initial it <= false
         it <= if {
             when reset      => false
@@ -198,7 +198,7 @@ mod RxPhy {
     //> Sticky per-packet error: SE1 seen (illegal bus state), or 6
     //> ones then a 1 (stuffing violation); cleared at the next sop
     //> (or by reset).
-    outgoing reg error : Bit on clock {
+    outgoing reg error : Bit {
         initial it <= false
         it <= if {
             when reset                => false
@@ -210,7 +210,7 @@ mod RxPhy {
     }
     //> 1-clock pulse: SE0 held >= 2.5 us (host-issued bus reset;
     //> see se0_count).
-    outgoing reg bus_reset : Bit on clock {
+    outgoing reg bus_reset : Bit {
         initial it <= false
         it <= if {
             when reset              => false
@@ -231,7 +231,7 @@ mod RxPhy {
     }
 
     //> Previous-cycle synchronized D+ sample
-    reg dp_p : Bit on clock {
+    reg dp_p : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -239,7 +239,7 @@ mod RxPhy {
         }
     }
     //> Previous-cycle synchronized D- sample
-    reg dn_p : Bit on clock {
+    reg dn_p : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -305,7 +305,7 @@ mod RxPhy {
     //> Bit-phase counter (0..3 clks into the current bit).  Clock
     //> recovery: re-aligned to 0 on every line transition; phase 1 is
     //> the mid-bit sample (see the `sample` wire).
-    reg phase : Word[2] on clock {
+    reg phase : Word[2] {
         initial it <= 0w2
         it <= if {
             when reset     => 0w2
@@ -320,7 +320,7 @@ mod RxPhy {
     //> count reaches 119, i.e. after 120 SE0 clks = 2.5 us.  The
     //> 7-bit counter wraps, so sustained reset SE0 re-pulses every
     //> 128 clks (the ep0 FSM treats each pulse identically).
-    reg se0_count : Word[7] on clock {
+    reg se0_count : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset => 0w7
@@ -366,18 +366,18 @@ mod NrziDecoder {
     //> sample edge, then held stable for the whole bit time.  This
     //> is the deliverable -- downstream logic reads this (with
     //> `bit_valid`) and never sees the line wiggle.
-    outgoing reg bit_sampled : Bit on clock {
+    outgoing reg bit_sampled : Bit {
         initial it <= false
     }
 
     //> Previous bit sample on D+ (NRZI decode reference).  Reset/idle
     //> value = J (D+ high).
-    reg lev_d : Bit on clock {
+    reg lev_d : Bit {
         initial it <= true
     }
     //> Previous bit sample on D- (NRZI decode reference).  Reset/idle
     //> value = J (D- low).
-    reg lev_n : Bit on clock {
+    reg lev_n : Bit {
         initial it <= false
     }
 
@@ -423,7 +423,7 @@ mod BitDestuffer {
 
     //> 1-clock strobe: `bit_sampled` is good this cycle (suppressed
     //> for the dropped stuff bit).
-    outgoing reg bit_valid : Bit on clock {
+    outgoing reg bit_valid : Bit {
         initial it <= false
         it <= if {
             when reset                  => false
@@ -442,13 +442,13 @@ mod BitDestuffer {
     //> consecutive decoded 1 arms drop_state, so the next (stuffed 0)
     //> bit is dropped.  3 bits is enough headroom: the drop sample
     //> resets the count to 0, so it stops at 6 and never wraps.
-    reg stuff_count : Word[3] on clock {
+    reg stuff_count : Word[3] {
         initial it <= 0w3
     }
     //> Armed after 6 consecutive ones: the next decoded bit is the
     //> stuffed 0 and is dropped (bit_valid suppressed); a 1 in that
     //> slot is a stuffing violation (error).
-    reg drop_state : Bit on clock {
+    reg drop_state : Bit {
         initial it <= false
     }
 
@@ -547,7 +547,7 @@ mod TxPhy {
         it := state != #Idle
     }
     //> 1-clock pulse when the bus is released (end of the EOP).
-    outgoing reg tx_done : Bit on clock {
+    outgoing reg tx_done : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -568,7 +568,7 @@ mod TxPhy {
     //> Output enable: drive the pads (SB_IO OUTPUT_ENABLE via
     //> UsbPads).  Raised entering Data, dropped at the EOP's last bit
     //> time (bus release).
-    outgoing reg output_enable : Bit on clock {
+    outgoing reg output_enable : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -687,7 +687,7 @@ mod TxPhy {
     //> at bit-time edges, so the flag captured the previous cycle is
     //> exact at the decision edge -- +0 clock latency, the compare
     //> cone ends at its own register.
-    reg bits_remain_r : Bit on clock {
+    reg bits_remain_r : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -698,7 +698,7 @@ mod TxPhy {
     //> ahead: the bit-time phase decisions read a 1-bit register
     //> instead of a compare cone (the raw compares would chain
     //> through 4 enable LUTs into bit_index's clock enable).
-    reg guard_last_r : Bit on clock {
+    reg guard_last_r : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -708,7 +708,7 @@ mod TxPhy {
     //> Last clock of a bit time (Data/Eop0/EopJ), REGISTERED one
     //> clock ahead from bit_phase == 2 -- same de-coning as
     //> guard_last_r.
-    reg bit_end_r : Bit on clock {
+    reg bit_end_r : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -722,7 +722,7 @@ mod TxPhy {
     //> = 2 bit times inter-packet guard, bus still released) -> Data
     //> (the bit-time engine) -> Eop0 (SE0, 2 bit times) -> EopJ (J for
     //> the last bit time, then release) -> Idle.
-    reg state : TxPhyState on clock {
+    reg state : TxPhyState {
         initial it <= #Idle
         it <= if {
             when reset      => #Idle
@@ -736,7 +736,7 @@ mod TxPhy {
     }
     //> Clock phase within the current bit time (0..3).  Holds during
     //> Idle/Guard; zeroed at every bit-time boundary.
-    reg bit_phase : Word[2] on clock {
+    reg bit_phase : Word[2] {
         initial it <= 0w2
         it <= if {
             when reset => 0w2
@@ -748,7 +748,7 @@ mod TxPhy {
     }
     //> Guard clock counter (8 clks = 2 bit times of released bus
     //> between packets).
-    reg guard_count : Word[3] on clock {
+    reg guard_count : Word[3] {
         initial it <= 0w3
         it <= if {
             when reset => 0w3
@@ -759,7 +759,7 @@ mod TxPhy {
     }
     //> EOP bit-time counter: Eop0 lasts 2 bit times (eop_count 0 and
     //> 1).
-    reg eop_count : Word[3] on clock {
+    reg eop_count : Word[3] {
         initial it <= 0w3
         it <= if {
             when reset => 0w3
@@ -772,7 +772,7 @@ mod TxPhy {
     //> 0's encoding -- the J->K sync transition -- is computed at the
     //> guard->data edge); advances only on raw bit times (see
     //> consume).
-    reg bit_index : Word[10] on clock {
+    reg bit_index : Word[10] {
         initial it <= 0w10
         it <= if {
             when reset => 0w10
@@ -784,7 +784,7 @@ mod TxPhy {
     //> Current drive level: 0 = J, 1 = K.  Toggled for a 0 raw bit at
     //> the edge that consumes it (NRZI: the transition appears at the
     //> next bit time's start); forced low entering EopJ.
-    reg level : Bit on clock {
+    reg level : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -944,7 +944,7 @@ mod BitSource {
 
     //> Payload raw-bit end index: 16 + 8*tx_len (payload raw bits are
     //> f(16) .. f(payload_end_r - 1)).
-    reg payload_end_r : Word[10] on clock {
+    reg payload_end_r : Word[10] {
         initial it <= 0w10
         it <= if {
             when reset => 0w10
@@ -954,7 +954,7 @@ mod BitSource {
     }
     //> payload_end_r - 1, precomputed at arm (the -1 would otherwise
     //> sit in the per-cycle compare against the CRC shift load).
-    reg payload_end_m1_r : Word[10] on clock {
+    reg payload_end_m1_r : Word[10] {
         initial it <= 0w10
         it <= if {
             when reset => 0w10
@@ -964,7 +964,7 @@ mod BitSource {
     }
     //> Total raw-bit count: payload_end_r + 16 CRC wire bits for data
     //> PIDs, + 0 for everything else.
-    reg total_bits_r : Word[10] on clock {
+    reg total_bits_r : Word[10] {
         initial it <= 0w10
         it <= if {
             when reset => 0w10
@@ -973,7 +973,7 @@ mod BitSource {
         }
     }
     //> Armed PID.
-    reg pid_r : Word[4] on clock {
+    reg pid_r : Word[4] {
         initial it <= 0w4
         it <= if {
             when reset => 0w4
@@ -992,7 +992,7 @@ mod BitSource {
     //> payload byte when the parent's byte_load strobe opens the byte
     //> window, and held stable through all eight bit times of its
     //> byte.
-    reg tx_byte_r : Word[8] on clock {
+    reg tx_byte_r : Word[8] {
         initial it <= 0w8
         it <= if {
             when byte_load => tx_byte
@@ -1000,9 +1000,22 @@ mod BitSource {
         }
     }
     //> raw_bit pipelined one clock (see bit_o).
-    reg raw_bit_r : Bit on clock {
+    reg raw_bit_r : Bit {
         initial it <= false
         it <= raw_bit
+    }
+    //> bit_index names a data-PID payload raw bit (16 <= bit_index <
+    //> payload_end_r), REGISTERED one clock ahead: the two 10-bit
+    //> compares are carry chains, and they used to run on into the
+    //> clock enable of all 16 CRC16 flops (the tx-engine critical
+    //> path).  Same de-coning as TxPhy's bits_remain_r: bit_index
+    //> changes only at bit-time edges, so the flag is exact from the
+    //> 2nd clock of every bit time, and the CRC advance (its only
+    //> reader) fires on the 3rd -- +0 clock latency.  Free-running;
+    //> a stale value outside that window is never read.
+    reg payload_window_r : Bit {
+        initial it <= false
+        it <= is_data && (bit_index >= 16w10) && (bit_index < payload_end_r)
     }
     //> The CRC16 wire bits are SHIFTED out of this register instead
     //> of muxed live from the LFSR: the raw-bit CRC branch would
@@ -1017,7 +1030,7 @@ mod BitSource {
     //> than to a registered arm flag, a stuffed bit time after the
     //> payload cannot spuriously re-load it; shifting 0s during the
     //> payload (before the load) is harmless.
-    reg crc_shift : Word[16] on clock {
+    reg crc_shift : Word[16] {
         initial it <= 0w16
         it <= if {
             when reset => 0w16
@@ -1030,15 +1043,14 @@ mod BitSource {
     //> Payload CRC16 (crc::Crc16).  Re-seeded by arm; advances one
     //> serial bit when the parent pulses advance (the 3rd clock of
     //> every non-stuffed bit time), gated here to data-PID payload
-    //> raw-bit indices (16 <= bit_index < payload_end_r); din is
+    //> raw-bit indices (the registered payload_window_r); din is
     //> raw_bit_r = f(bit_index), the raw bit whose NRZI level
     //> decision fires at this bit time's end -- one ahead of the bit
     //> the current level encodes.
     mod crc16 of crc::Crc16 {
         it.clock := clock
         it.reset := arm
-        it.adv := advance && is_data && (bit_index >= 16w10)
-            && (bit_index < payload_end_r)
+        it.adv := advance && payload_window_r
         it.din := raw_bit_r
     }
 }
@@ -1088,7 +1100,7 @@ mod BitStuffer {
     //> edge: that edge toggles the level (the stuffed 0's
     //> transition), advances neither the raw bit index nor the CRC,
     //> and re-arms the run counter.
-    outgoing reg stuff_next : Bit on clock {
+    outgoing reg stuff_next : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -1100,7 +1112,7 @@ mod BitStuffer {
     }
     //> The CURRENT bit time is a stuffed 0: gates the CRC16 advance
     //> off for this bit time (a stuffed bit consumes no raw bit).
-    outgoing reg stuffed : Bit on clock {
+    outgoing reg stuffed : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -1116,7 +1128,7 @@ mod BitStuffer {
     //> the count; a 0 clears it.  A stuffed-bit tick re-arms it (so
     //> the stuffed 0 does not count as a run bit).  3 bits is
     //> enough headroom: the count stops at 6 and never wraps.
-    reg ones_count : Word[3] on clock {
+    reg ones_count : Word[3] {
         initial it <= 0w3
         it <= if {
             when reset => 0w3

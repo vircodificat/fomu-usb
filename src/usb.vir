@@ -41,8 +41,7 @@ pub socket UsbTxRx {
 //>
 //> The pad-facing side is deliberately UNIDIRECTIONAL: the only
 //> bidirectional nets in the whole design live inside UsbPads.
-
-
+//>
 //> The two USB D+/D- tristate pad cells (iCE40 SB_IO, PIN_TYPE
 //> 6'b101001) -- the one ext mod that touches a bidirectional net.
 //> Body in ext/usb_pads.sv: two SB_IO instances, one per line, sharing
@@ -75,7 +74,7 @@ pub mod PowerOnReset {
     //> top (src/top.vir): wired directly to the usb_dp_pu pad (the D+
     //> pull-up = attach), and into UsbController, where it is
     //> registered once more (por_rst) to form the core-wide reset.
-    outgoing reg done : Bit on clock {
+    outgoing reg done : Bit {
         initial it <= false
         it <= if {
             when count >= 8_400_000 => true
@@ -85,7 +84,7 @@ pub mod PowerOnReset {
 
     // 24 bits suffice: 8_400_000 < 2^24 = 16_777_216.  Counts up
     // while por_done_r is still low; holds at the terminal count.
-    reg count : Word[24] on clock {
+    reg count : Word[24] {
         initial it <= 0
         it <= if {
             when !done && (it < 8_400_000) => it + 1
@@ -179,7 +178,7 @@ mod RxRam {
     //> 48 MHz clock.
     incoming clock : Clock
     //> Write enable: byte-complete strobe, pre-gated with !(bc >= 64)
-    //> by the caller usb::RxPacket (we = dt_wr && !bc[6]; writes
+    //> by the caller usb::RxPacketCore (its registered ram_write_r; writes
     //> beyond byte 63 are dropped -- over-length packets go bad and
     //> dt_valid never fires, so no consumer ever sees a dropped
     //> byte).
@@ -395,16 +394,55 @@ mod RxPacketCore {
     wire pid_new : Word[8] {
         it := word(bit_i, pid_r[8..1])
     }
-    //> Byte completing on this bit clock (bit_i = the byte MSB,
-    //> bshift[7:1] = the earlier 7 bits, LSB first).
-    wire dt_byte_new : Word[8] {
-        it := word(bit_i, bshift[8..1])
-    }
     //> Byte-complete write strobe (registered inputs only: n3/st/sec
     //> are regs; bit_valid/pkt_err are registered upstream in
     //> usb::RxPhy).
     wire dt_wr : Bit {
         it := bit_valid && !pkt_err && (st == #Body) && sec && (n3 == 7w3)
+    }
+
+    // ---- byte-write pipeline stage --------------------------------------
+    // The byte write is REGISTERED before it reaches the payload RAM
+    // and the head window (48 MHz timing: the dt_wr cone used to run
+    // on through the RAM write enable into the head-window clock
+    // enables, a chain stretched between the bit engine, the block
+    // RAM site and the EP0 decoder).  The write lands one clock after
+    // the byte completes.  That is free:
+    //
+    // - the data needs no register: on the dt_wr edge bshift takes the
+    //   completed byte, and it holds until the next bit (bit_valid
+    //   never fires on consecutive clocks; sop cannot coincide with
+    //   it), so bshift IS the write data in the write cycle;
+    // - every reader waits for EOP (>= 7 clks of SE0 after the last
+    //   bit), so the late write is long done before anything reads.
+    //
+    //> Registered payload RAM write enable.  Writes beyond byte 63
+    //> are dropped (bc[6]).
+    reg ram_write_r : Bit {
+        initial it <= false
+        it <= if {
+            when reset || bus_reset => false
+            else => dt_wr && !bc[6]
+        }
+    }
+    //> Payload RAM write address for the registered write: bc as of
+    //> the byte-complete cycle (bc itself increments on that edge).
+    //> Free-running; only read in the write cycle.
+    reg ram_write_addr_r : Word[6] {
+        initial it <= 0w6
+        it <= bc[6..0]
+    }
+    //> Registered one-hot head-window enables: bit k is high for the
+    //> one clock after packet byte k (k < 8) completed.
+    reg head_write_r : Word[8] {
+        initial it <= 0w8
+        it <= if {
+            when reset || bus_reset => 0w8
+            else => word(dt_wr && (bc == 7w7), dt_wr && (bc == 6w7),
+                dt_wr && (bc == 5w7), dt_wr && (bc == 4w7),
+                dt_wr && (bc == 3w7), dt_wr && (bc == 2w7),
+                dt_wr && (bc == 1w7), dt_wr && (bc == 0w7))
+        }
     }
 
     // ---- CRC LFSRs ----------------------------------------------------
@@ -433,11 +471,11 @@ mod RxPacketCore {
     //> consumed only at EOP, >= 8 clks after the last bit, so the +1
     //> clock on each is free).  Computed every cycle from registered
     //> inputs; mid-packet values are harmless (only read at EOP).
-
+    //>
     //> bc == 66 registered (the over-length hit), split so no 7-bit
     //> compare rides bc's D-cone: bits 6..3 == 0100 and bits 2..0 ==
     //> 010 (66 = 0b1000010).
-    reg bc_is_66_r : Bit on clock {
+    reg bc_is_66_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -447,7 +485,7 @@ mod RxPacketCore {
     //> PID check failure ({~pid, pid}: low nibble != ~high nibble,
     //> i.e. the nibbles XOR != 1111), registered one clock before it
     //> sets `bad`.
-    reg pid_bad_r : Bit on clock {
+    reg pid_bad_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -457,7 +495,7 @@ mod RxPacketCore {
     }
     //> Over-length data hit registered (67th byte = bc == 66 with a
     //> byte completing): feeds `bad`, +1 clock.
-    reg bc66_hit_r : Bit on clock {
+    reg bc66_hit_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -467,7 +505,7 @@ mod RxPacketCore {
     }
     //> CRC5 residual compare (5'h0C), registered: the 5-bit equality
     //> tree ends at its own flop instead of riding tk_crc_ok's cone.
-    reg crc5_res_r : Bit on clock {
+    reg crc5_res_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -475,7 +513,7 @@ mod RxPacketCore {
         }
     }
     //> CRC16 residual compare (16'h800D), registered likewise.
-    reg crc16_res_r : Bit on clock {
+    reg crc16_res_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -488,7 +526,7 @@ mod RxPacketCore {
     //> registered hits above, +1 clock); cleared at sop and by reset.
     //> A bad packet is silent: every cap is qualified by !bad, so no
     //> strobe ever fires.
-    reg bad : Bit on clock {
+    reg bad : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -500,7 +538,7 @@ mod RxPacketCore {
     // ---- FSM ------------------------------------------------------------
     //> IDLE -> (sop) -> SYNC (skip the 8 sync bits) -> BODY (PID
     //> section, then token or data section) -> (eop) -> IDLE.
-    reg st : RxPktState on clock {
+    reg st : RxPktState {
         initial it <= #Idle
         it <= if {
             when reset || bus_reset => #Idle
@@ -514,7 +552,7 @@ mod RxPacketCore {
     //> PID/token-section bit index: sync 0..7 (ignored), PID byte
     //> 0..7, token data 8..18, crc5 wire bits 19..23; parked at 24 in
     //> the data section (and reached at EOP for a well-formed token).
-    reg nb : Word[5] on clock {
+    reg nb : Word[5] {
         initial it <= 0w5
         it <= if {
             when reset || bus_reset => 0w5
@@ -537,7 +575,7 @@ mod RxPacketCore {
     }
 
     //> Data-section bit-in-byte index (0..7, wraps mod 8).
-    reg n3 : Word[3] on clock {
+    reg n3 : Word[3] {
         initial it <= 0w3
         it <= if {
             when reset || bus_reset => 0w3
@@ -555,7 +593,7 @@ mod RxPacketCore {
 
     //> The PID byte, FROZEN after the PID section (it classifies the
     //> packet at EOP; the token/crc bits never touch it).
-    reg pid_r : Word[8] on clock {
+    reg pid_r : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => 0w8
@@ -568,7 +606,7 @@ mod RxPacketCore {
 
     //> The 11 token bits, shift-up capture (LSB first): at EOP,
     //> addr = tk_sh[6:0], endp = tk_sh[10:7], frame = tk_sh[10:0].
-    reg tk_sh : Word[11] on clock {
+    reg tk_sh : Word[11] {
         initial it <= 0w11
         it <= if {
             when reset || bus_reset => 0w11
@@ -580,8 +618,9 @@ mod RxPacketCore {
         }
     }
 
-    //> Data-section byte assembly shifter (feeds dt_byte_new).
-    reg bshift : Word[8] on clock {
+    //> Data-section byte assembly shifter: holds the completed byte in
+    //> the clock after dt_wr (the registered write's data).
+    reg bshift : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => 0w8
@@ -594,7 +633,7 @@ mod RxPacketCore {
 
     //> Byte count in the data section: payload bytes + the 2
     //> trailing crc16 wire bytes (subtracted at EOP).
-    reg bc : Word[7] on clock {
+    reg bc : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset || bus_reset => 0w7
@@ -607,7 +646,7 @@ mod RxPacketCore {
 
     //> Section flag: 0 = PID section, 1 = data section (set when the
     //> PID low bits say 11).
-    reg sec : Bit on clock {
+    reg sec : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -626,11 +665,11 @@ mod RxPacketCore {
     //> clears them, so over-long packets stay silent).  The EOP-edge
     //> strobes then close over 2-3 shallow inputs instead of the whole
     //> bit-counting tree.
-
+    //>
     //> Registered shared qualify for the PID-section caps (+1 clock: the
     //> caps are consumed only at EOP >= 8 clks later, so it is free).
     //> A same-cycle pkt_err is re-checked inline in every cap.
-    reg q_pid_r : Bit on clock {
+    reg q_pid_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -640,7 +679,7 @@ mod RxPacketCore {
         }
     }
     //> Registered shared qualify for the data-section cap, ditto.
-    reg q_dat_r : Bit on clock {
+    reg q_dat_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -652,7 +691,7 @@ mod RxPacketCore {
 
     //> Token cap: last token bit (nb == 23) with token-class PID low
     //> bits (01).
-    reg tok_cap : Bit on clock {
+    reg tok_cap : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -664,7 +703,7 @@ mod RxPacketCore {
         }
     }
     //> SOF cap: token cap plus PID value 5 (the frame number case).
-    reg sof_cap : Bit on clock {
+    reg sof_cap : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -679,7 +718,7 @@ mod RxPacketCore {
     //> Handshake cap: last PID bit (nb == 7) with handshake-class low
     //> bits (00 or 10) and the {~pid, pid} check inline (bad is not
     //> visible yet at this edge -- it comes via the +1-clock pid_bad_r).
-    reg hs_cap : Bit on clock {
+    reg hs_cap : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -696,7 +735,7 @@ mod RxPacketCore {
     //> (bc in 1..65: at least 2 bytes total at EOP, and one more byte
     //> would still fit the 64-byte payload RAM -- the bc == 66
     //> overflow is gated via the registered bc_is_66_r).
-    reg dat_cap : Bit on clock {
+    reg dat_cap : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -710,7 +749,7 @@ mod RxPacketCore {
     //> the last bit); NOT cleared at sop (holds through, since a
     //> sop-edge recompute would drag bc's D-cone into the strobe
     //> path).
-    reg dat_bc_ok_r : Bit on clock {
+    reg dat_bc_ok_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -722,15 +761,16 @@ mod RxPacketCore {
 
     // ---- payload storage -----------------------------------------------
     //> The payload RAM instance (block RAM, off the fabric: one write
-    //> port + one registered read -- see usb::RxRam above).  Writes
-    //> beyond byte 63 are dropped (bc[6]: over-length packets set bad
-    //> via bc66_hit_r, so dt_valid never fires and no consumer ever
-    //> sees a truncated payload).
+    //> port + one registered read -- see usb::RxRam above).  The write
+    //> is the registered stage above (one clock after the byte
+    //> completes).  Writes beyond byte 63 are dropped (bc[6]:
+    //> over-length packets set bad via bc66_hit_r, so dt_valid never
+    //> fires and no consumer ever sees a truncated payload).
     mod ram of RxRam {
         it.clock := clock
-        it.we  := dt_wr && !bc[6]
-        it.wa  := bc[6..0]
-        it.wd  := dt_byte_new
+        it.we  := ram_write_r
+        it.wa  := ram_write_addr_r
+        it.wd  := bshift
         it.ra  := dt_rd_addr
     }
 
@@ -761,8 +801,8 @@ mod RxPacketCore {
     // ---- data record -------------------------------------------------
     //> The data record + head window live in usb::RxDataRec; this
     //> instance feeds them the shared packet state (the frozen PID,
-    //> the data-section byte count, the byte-complete write strobe,
-    //> the completing byte and the CRC16 verdict).
+    //> the data-section byte count, the registered head-window
+    //> enables, the completed byte and the CRC16 verdict).
     mod datarec of RxDataRec {
         it.clock := clock
         it.reset := reset
@@ -771,8 +811,8 @@ mod RxPacketCore {
         it.cap := dat_cap
         it.pid_r := pid_r
         it.bc := bc
-        it.dat_wr := dt_wr
-        it.byte_new := dt_byte_new
+        it.head_write := head_write_r
+        it.completed_byte := bshift
         it.crc16_res := crc16_res_r
     }
     //> The held data record (until the next data packet) + its
@@ -876,7 +916,7 @@ mod RxTokenRec {
             with @Invalid() => 0w11
         }
     }
-    outgoing reg rec : Valid[TokenRec] on clock {
+    outgoing reg rec : Valid[TokenRec] {
         initial it <= @Invalid()
         it <= if {
             when reset || bus_reset => @Invalid()
@@ -891,7 +931,7 @@ mod RxTokenRec {
         }
     }
     //> 1-clock pulse: a token record was latched this edge.
-    outgoing reg strobe : Bit on clock {
+    outgoing reg strobe : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -923,7 +963,7 @@ mod RxHandshakeRec {
     //> The latched record: @Valid from the handshake's EOP until the
     //> next handshake latches over it (reset / bus_reset ->
     //> @Invalid).
-    outgoing reg rec : Valid[HsRec] on clock {
+    outgoing reg rec : Valid[HsRec] {
         initial it <= @Invalid()
         it <= if {
             when reset || bus_reset => @Invalid()
@@ -932,7 +972,7 @@ mod RxHandshakeRec {
         }
     }
     //> 1-clock pulse: a handshake record was latched this edge.
-    outgoing reg strobe : Bit on clock {
+    outgoing reg strobe : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -947,12 +987,11 @@ mod RxHandshakeRec {
 //> crc16 wire bytes drop out) and the CRC16 verdict as a
 //> Valid[DataRec]; the record HOLDS until the next data packet, and
 //> `strobe` is the 1-clock arrival pulse.  Also owns the flopped payload head window (bytes 0..7 -- eight
-//> SEPARATE byte-regs: each byte's enable is its own shallow decode
-//> (dat_wr && bc == k -- k < 8, so the equality subsumes the
-//> head-window test) and its D is byte_new directly; the bc compare
-//> runs in PARALLEL with the dat_wr cone instead of serially behind
-//> it).  A bad packet's payload is still written; the record just
-//> never fires for it.
+//> SEPARATE byte-regs: each byte's enable is its own REGISTERED
+//> one-hot bit from usb::RxPacketCore (head_write, one clock after
+//> the byte completes) and its D is completed_byte directly, so no
+//> decode sits in the clock-enable path).  A bad packet's payload is
+//> still written; the record just never fires for it.
 mod RxDataRec {
     //> 48 MHz clock: 4 clock cycles per USB FS bit.
     incoming clock : Clock
@@ -970,17 +1009,20 @@ mod RxDataRec {
     //> Data-section byte count (payload bytes + the 2 trailing crc16
     //> wire bytes; the length subtracts them back out at EOP).
     incoming bc : Word[7]
-    //> Byte-complete write strobe (usb::RxPacketCore's dt_wr).
-    incoming dat_wr : Bit
-    //> The data-section byte completing on this bit clock.
-    incoming byte_new : Word[8]
+    //> Registered one-hot head-window enables (usb::RxPacketCore's
+    //> head_write_r): bit k is high for the one clock after packet
+    //> byte k completed.
+    incoming head_write : Word[8]
+    //> The data-section byte that just completed (valid in the
+    //> head_write cycle).
+    incoming completed_byte : Word[8]
     //> Registered CRC16 residual verdict.
     incoming crc16_res : Bit
 
     //> The latched record: @Valid from the data packet's EOP until
     //> the next data packet latches over it (reset / bus_reset ->
     //> @Invalid).
-    outgoing reg rec : Valid[DataRec] on clock {
+    outgoing reg rec : Valid[DataRec] {
         initial it <= @Invalid()
         it <= if {
             when reset || bus_reset => @Invalid()
@@ -993,7 +1035,7 @@ mod RxDataRec {
         }
     }
     //> 1-clock pulse: a data record was latched this edge.
-    outgoing reg strobe : Bit on clock {
+    outgoing reg strobe : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1002,80 +1044,78 @@ mod RxDataRec {
     }
 
     // ---- flopped payload head window ------------------------------------
-    //> Packet bytes 0..7 (bc < 8): each byte's enable is its own
-    //> shallow decode (dat_wr && bc == k -- k < 8, so the equality
-    //> subsumes the head-window test) and its D is byte_new directly;
-    //> the bc compare runs in PARALLEL with the dat_wr cone instead of
-    //> serially behind it.  A bad packet's payload is still written;
-    //> the record just never fires for it.
-    outgoing reg head0 : Word[8] on clock {
+    //> Packet bytes 0..7: each byte's enable is its own registered
+    //> head_write bit and its D is completed_byte directly.  A bad
+    //> packet's payload is still written; the record just never
+    //> fires for it.
+    outgoing reg head0 : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => 0w8
-            when dat_wr && (bc == 0w7) => byte_new
+            when head_write[0] => completed_byte
             else => it
         }
     }
     //> Packet byte 1.
-    outgoing reg head1 : Word[8] on clock {
+    outgoing reg head1 : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => 0w8
-            when dat_wr && (bc == 1w7) => byte_new
+            when head_write[1] => completed_byte
             else => it
         }
     }
     //> Packet byte 2.
-    outgoing reg head2 : Word[8] on clock {
+    outgoing reg head2 : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => 0w8
-            when dat_wr && (bc == 2w7) => byte_new
+            when head_write[2] => completed_byte
             else => it
         }
     }
     //> Packet byte 3.
-    outgoing reg head3 : Word[8] on clock {
+    outgoing reg head3 : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => 0w8
-            when dat_wr && (bc == 3w7) => byte_new
+            when head_write[3] => completed_byte
             else => it
         }
     }
     //> Packet byte 4.
-    outgoing reg head4 : Word[8] on clock {
+    outgoing reg head4 : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => 0w8
-            when dat_wr && (bc == 4w7) => byte_new
+            when head_write[4] => completed_byte
             else => it
         }
     }
     //> Packet byte 5.
-    outgoing reg head5 : Word[8] on clock {
+    outgoing reg head5 : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => 0w8
-            when dat_wr && (bc == 5w7) => byte_new
+            when head_write[5] => completed_byte
             else => it
         }
     }
     //> Packet byte 6.
-    outgoing reg head6 : Word[8] on clock {
+    outgoing reg head6 : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => 0w8
-            when dat_wr && (bc == 6w7) => byte_new
+            when head_write[6] => completed_byte
             else => it
         }
     }
     //> Packet byte 7.
-    outgoing reg head7 : Word[8] on clock {
+    outgoing reg head7 : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => 0w8
-            when dat_wr && (bc == 7w7) => byte_new
+            when head_write[7] => completed_byte
             else => it
         }
     }
@@ -1098,7 +1138,7 @@ mod RxDataRec {
 //> exactly the arm-time min(count,64), so it can never meet empty
 //> mid-load.  Simultaneous push+pop is supported; count is 7 bits
 //> wide regardless of depth.
-
+//>
 //> The 16-deep x 8-bit tx FIFO (usb_fifo16x8 defaults: DEPTH=16,
 //> AW=4, RAM=0 -- flop storage, combinational head).
 ext mod TxFifo {
@@ -1308,14 +1348,14 @@ mod UsbTokenRouter {
     //> later.  This replaces the combinational field extraction from
     //> the held struct, keeping the pid/endp decode in flip-flops
     //> instead of one combinational path.
-    reg tk_pid_r : Word[4] on clock {
+    reg tk_pid_r : Word[4] {
         initial it <= 0w4
         it <= match tk {
             with @Valid(t) => t->pid
             with @Invalid() => it
         }
     }
-    reg tk_endp_r : Word[4] on clock {
+    reg tk_endp_r : Word[4] {
         initial it <= 0w4
         it <= match tk {
             with @Valid(t) => t->endp
@@ -1340,7 +1380,7 @@ mod UsbTokenRouter {
     //> clock-enable logic.  The pid/endp fields are separately
     //> registered (tk_pid_r/tk_endp_r) so the per-endpoint decodes
     //> one clock later read from flip-flops.
-    reg tok_v_r : Bit on clock {
+    reg tok_v_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1358,7 +1398,7 @@ mod UsbTokenRouter {
     //> times = 8 clks).  ROUTING: pid 13w4 (SETUP) and 9w4 (IN) and
     //> 1w4 (OUT) at endp 0w4 go to ep0; IN/OUT at endp 1w4 go to
     //> serial; IN/OUT at endp 2w4 only feed ep2's NAK.
-    outgoing reg ep0_tk_setup_r : Bit on clock {
+    outgoing reg ep0_tk_setup_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1366,7 +1406,7 @@ mod UsbTokenRouter {
         }
     }
     //> 1-clock strobe: a valid IN token reached EP0 (endp 0).
-    outgoing reg ep0_tk_in_r : Bit on clock {
+    outgoing reg ep0_tk_in_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1374,7 +1414,7 @@ mod UsbTokenRouter {
         }
     }
     //> 1-clock strobe: a valid OUT token reached EP0 (endp 0).
-    outgoing reg ep0_tk_out_r : Bit on clock {
+    outgoing reg ep0_tk_out_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1383,7 +1423,7 @@ mod UsbTokenRouter {
     }
     //> 1-clock strobe: a valid IN token reached the serial endpoint
     //> (endp 1).
-    outgoing reg ser_tk_in_r : Bit on clock {
+    outgoing reg ser_tk_in_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1392,7 +1432,7 @@ mod UsbTokenRouter {
     }
     //> 1-clock strobe: a valid OUT token reached the serial endpoint
     //> (endp 1).
-    outgoing reg ser_tk_out_r : Bit on clock {
+    outgoing reg ser_tk_out_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1401,7 +1441,7 @@ mod UsbTokenRouter {
     }
     //> 1-clock strobe: a valid IN token reached the notif endpoint
     //> (endp 2; the arbiter NAKs it).
-    outgoing reg ep2_tk_in_r : Bit on clock {
+    outgoing reg ep2_tk_in_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1410,7 +1450,7 @@ mod UsbTokenRouter {
     }
     //> 1-clock strobe: a valid OUT token reached the notif endpoint
     //> (endp 2; the arbiter NAKs it).
-    outgoing reg ep2_tk_out_r : Bit on clock {
+    outgoing reg ep2_tk_out_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1425,7 +1465,7 @@ mod UsbTokenRouter {
     //> ignored.  The token precedes its data packet back-to-back, so
     //> this register is stable across the data packet; the next token
     //> re-evaluates it.
-    reg last_out_ep0 : Bit on clock {
+    reg last_out_ep0 : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1456,7 +1496,7 @@ mod UsbTokenRouter {
     //> 1-clock strobe: a data packet was routed to EP0 (registered
     //> one clock after the pulsed data arrival; the fields hold, so
     //> the delayed read is bit-identical).
-    outgoing reg ep0_dt_valid_r : Bit on clock {
+    outgoing reg ep0_dt_valid_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1522,7 +1562,7 @@ mod UsbArbiter {
 
     //> Notif EP (EP2): the host polls it, the core never arms it --
     //> every token gets a NAK.
-    reg ep2_nak_req : Bit on clock {
+    reg ep2_nak_req : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -1538,7 +1578,7 @@ mod UsbArbiter {
     }
     //> In-flight response owner: 0 none, 1 ep0, 2 serial, 3 ep2
     //> (ep2 is the registered NAK, the else arm of the start mux).
-    outgoing reg tx_owner : Word[2] on clock {
+    outgoing reg tx_owner : Word[2] {
         initial it <= 0w2
         it <= if {
             when reset => 0w2
@@ -1631,7 +1671,7 @@ mod UsbSnapshotLoader {
     }
     //> The load-in-flight run flag (drives the tx FIFO's pop -- see
     //> the tx FIFO banner for why the pop decision is registered).
-    outgoing reg load_run : Bit on clock {
+    outgoing reg load_run : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1641,7 +1681,7 @@ mod UsbSnapshotLoader {
         }
     }
     //> The snapshot write index.
-    reg li : Word[7] on clock {
+    reg li : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset || bus_reset => 0w7
@@ -1652,7 +1692,7 @@ mod UsbSnapshotLoader {
     }
     //> The load countdown (termination test any(rem[7..1]) in
     //> load_run's D).
-    reg rem : Word[7] on clock {
+    reg rem : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset || bus_reset => 0w7
@@ -1777,7 +1817,7 @@ mod UsbByteStream {
     //> hold slot), so no push can land inside the 1-clock staleness
     //> window; the txfifo_wr_d gate re-checks !full at the registered
     //> edge as belt-and-braces.
-    reg tx_ready : Bit on clock {
+    reg tx_ready : Bit {
         initial it <= false
         it <= !txfifo.full
         tx.ready := it
@@ -1799,7 +1839,7 @@ mod UsbByteStream {
         }
     }
     //> The REGISTERED txfifo write gate (see the banner).
-    reg txfifo_wr_d : Bit on clock {
+    reg txfifo_wr_d : Bit {
         initial it <= false
         it <= tx_push && !txfifo.full
     }
@@ -1807,7 +1847,7 @@ mod UsbByteStream {
     //> captured, then held until the next push, so the write edge one
     //> clock later stores the SAME byte the strobe carried (the Valid
     //> payload's bits are not held past the push cycle).
-    reg tx_byte_d : Word[8] on clock {
+    reg tx_byte_d : Word[8] {
         initial it <= 0w8
         it <= if {
             when tx_push => tx_byte
@@ -1842,7 +1882,7 @@ mod UsbByteStream {
     //> FIFO fills, the serial endpoint NAKs bulk-OUT, the host
     //> retries: no byte loss).  The pipelined pair takes the
     //> empty/full decode off the single-cycle paths.
-    reg rx_pop_d : Bit on clock {
+    reg rx_pop_d : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1861,7 +1901,7 @@ mod UsbByteStream {
                 && (txfifo.count < 13w7) && rx.ready
         }
     }
-    reg rx_valid_r : Bit on clock {
+    reg rx_valid_r : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1870,7 +1910,7 @@ mod UsbByteStream {
     }
     //> The popped byte (rxfifo.rd_data holds it from one clock after
     //> rx_pop_d).  NO reset: holds.
-    reg rx_data : Word[8] on clock {
+    reg rx_data : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset || bus_reset => it
@@ -1879,7 +1919,7 @@ mod UsbByteStream {
     }
     //> 1-clock strobe per received byte (= the pop, +2 clocks).  The
     //> consumer latches the byte on it.
-    reg rx_valid : Bit on clock {
+    reg rx_valid : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1912,7 +1952,7 @@ mod UsbByteStream {
     //> last byte, so run drops at N's edge with the last byte
     //> written (push_i visits one extra index in the trailing
     //> cycle; that read is discarded -- run_d is 0 by then).
-    reg rx_push_run : Bit on clock {
+    reg rx_push_run : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1921,7 +1961,7 @@ mod UsbByteStream {
             else => it
         }
     }
-    reg rx_push_run_d : Bit on clock {
+    reg rx_push_run_d : Bit {
         initial it <= false
         it <= if {
             when reset || bus_reset => false
@@ -1930,7 +1970,7 @@ mod UsbByteStream {
     }
     //> The packet payload RAM's read index: the rx push streams the
     //> accepted payload out through the RAM's registered read port.
-    outgoing reg push_i : Word[7] on clock {
+    outgoing reg push_i : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset || bus_reset => 0w7
@@ -1939,7 +1979,7 @@ mod UsbByteStream {
             else => it
         }
     }
-    reg push_rem : Word[7] on clock {
+    reg push_rem : Word[7] {
         initial it <= 0w7
         it <= if {
             when reset || bus_reset => 0w7
@@ -1967,7 +2007,7 @@ mod UsbByteStream {
     //> stretched to ~175 ms (the 1-clock strobes are far too fast to
     //> see).  Self-contained counters -- deliberately outside every
     //> USB engine path, NO reset (power-on zero, count down to rest).
-    reg rx_led_count : Word[23] on clock {
+    reg rx_led_count : Word[23] {
         initial it <= 0w23
         it <= if {
             when rx_valid    => 0x7f_ffffw23
@@ -1975,7 +2015,7 @@ mod UsbByteStream {
             else => it
         }
     }
-    reg tx_led_count : Word[23] on clock {
+    reg tx_led_count : Word[23] {
         initial it <= 0w23
         it <= if {
             when tx_push     => 0x7f_ffffw23
@@ -2178,7 +2218,7 @@ mod UsbUart {
     //> (USB 2.0 §9.1.1.5): edge detect on ep0.configured.  The
     //> delayed copy is reset by reset ONLY (survives bus resets until
     //> reconfigured).
-    reg configured_d : Bit on clock {
+    reg configured_d : Bit {
         initial it <= false
         it <= if {
             when reset => false
@@ -2196,7 +2236,7 @@ mod UsbUart {
     //> registers live inside the ext bodies).  The producer mux below feeds the PHY from
     //> registered sources only; the PHY's tx_byte register is a
     //> further stage.
-    reg byte_rd_addr : Word[7] on clock {
+    reg byte_rd_addr : Word[7] {
         initial it <= 0w7
         it <= usbphy.tx_addr_next
     }
@@ -2213,7 +2253,7 @@ mod UsbUart {
     }
     //> The latched EP0 response base: page start + transfer offset,
     //> latched at arm.  Reset by reset ONLY, not usbphy.bus_reset.
-    reg rom_base_r : Word[8] on clock {
+    reg rom_base_r : Word[8] {
         initial it <= 0w8
         it <= if {
             when reset => 0w8
@@ -2223,7 +2263,7 @@ mod UsbUart {
     }
     //> The ROM read address, one stage behind the base (free-running
     //> adder; only the latched-at-arm base matters).
-    reg rom_addr_r : Word[8] on clock {
+    reg rom_addr_r : Word[8] {
         initial it <= 0w8
         it <= rom_base_r + word(0w1, byte_rd_addr)
     }
@@ -2268,7 +2308,7 @@ pub mod UsbController {
     outgoing txing : Bit
 
     //> the core reset persists until a cycle after the power-on reset is complete
-    reg core_reset : Bit on clock {
+    reg core_reset : Bit {
         initial it <= true
         it <= !por_done
     }

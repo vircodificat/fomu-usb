@@ -26,7 +26,7 @@ pub mod Crc5 {
     //> which is what remains after a good token stream incl. its received CRC bits.
     //> Next state = {crc[3:0], inv} with the x^2 tap XORed into bit 2.
     //> seeds to 0x1F.
-    outgoing reg crc : Word[5] on clock {
+    outgoing reg crc : Word[5] {
         initial it <= 31w5
         it <= if {
             when reset => 31w5
@@ -64,7 +64,7 @@ pub mod Crc16 {
     //> The 16-bit shift register.  Next state = {crc[14:0], inv} with
     //> the x^15 tap XORed into bit 15 and the x^2 tap into bit 2;
     //> seeds to 0xFFFF.
-    outgoing reg crc : Word[16] on clock {
+    outgoing reg crc : Word[16] {
         initial it <= 65535w16
         it <= if {
             when reset => 65535w16

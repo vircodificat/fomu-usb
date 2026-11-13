@@ -50,7 +50,7 @@
 //>                  in src/echo.vir) registers `data` on that same
 //>                  edge.  The stop bit's level is not checked -- the
 //>                  Stop phase is a plain 417-cycle wait.
-
+//>
 //> FSM states shared by UartSender and UartReceiver.
 enum type UartFsmState {
     Idle  = 0b00w2
@@ -87,11 +87,11 @@ pub mod UartSender {
         it := baud_counter == 416w10
     }
 
-    reg state : UartFsmState on clock {
+    reg state : UartFsmState {
         initial it <= #Idle
     }
 
-    reg baud_counter : Word[10] on clock {
+    reg baud_counter : Word[10] {
         initial it <= 0w10
         it <= if {
             when state == #Idle => 0w10
@@ -100,11 +100,11 @@ pub mod UartSender {
         }
     }
 
-    reg bit_idx : Word[3] on clock {
+    reg bit_idx : Word[3] {
         initial it <= 0w3
     }
 
-    reg data_buf : Word[8] on clock {
+    reg data_buf : Word[8] {
         initial it <= 0w8
         it <= if {
             when data_valid && sender_idle => data
@@ -149,7 +149,7 @@ pub mod UartReceiver {
     // UART sends LSB first) keeps shifting right and after eight
     // captures the byte sits with its LSB in data[0].  The byte then
     // holds through the Stop phase, which is when data_valid pulses.
-    outgoing reg data : Word[8] on clock {
+    outgoing reg data : Word[8] {
         initial it <= 0w8
         it <= if {
             when state == #Data && bit_time_done => word(uart_rx, it[8..1])
@@ -172,7 +172,7 @@ pub mod UartReceiver {
         it := baud_counter == 0w10
     }
 
-    reg state : UartFsmState on clock {
+    reg state : UartFsmState {
         initial it <= #Idle
         it <= if {
             else match it {
@@ -215,7 +215,7 @@ pub mod UartReceiver {
     // All periods assume uart_rx is in the same clock domain as clock
     // -- true on the top-level loopback wire in src/top.vir; there is
     // no resynchronization for an external source.
-    reg baud_counter : Word[10] on clock {
+    reg baud_counter : Word[10] {
         initial it <= 0w10
         it <= if {
             else match state {
@@ -239,7 +239,7 @@ pub mod UartReceiver {
         }
     }
 
-    reg bit_idx : Word[3] on clock {
+    reg bit_idx : Word[3] {
         initial it <= 0w3
         it <= if {
             when state == #Start && bit_time_done => 0w3
